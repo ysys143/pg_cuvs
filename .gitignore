@@ -1,0 +1,14 @@
+.cwf
+.omc
+.venv
+.env
+node_modules/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+.idea/
+.vscode/
+dist/
+build/
+*.egg-info/
