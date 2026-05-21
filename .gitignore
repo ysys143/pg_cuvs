@@ -2,6 +2,8 @@
 .omc
 .venv
 .env
+.env.gpu
+.env.local
 node_modules/
 __pycache__/
 *.pyc
@@ -12,3 +14,22 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# PGXS / CUDA build artifacts
+*.o
+*.so
+*.bc
+src/*.o
+test/results/
+test/regression.diffs
+test/regression.out
+results/
+regression.diffs
+regression.out
+
+# Conda
+miniforge3/
+.conda/
+
+# Benchmark output (kept in design/ folder)
+design/bench_*.log

@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 /* ----------------------------------------------------------------
  * GPU availability check
