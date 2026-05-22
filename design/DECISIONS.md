@@ -128,3 +128,141 @@
 **결정**: pg_cuvs는 pgvector와 **동일한 operator class 이름**(`vector_cosine_ops`)을 다른 AM(`cagra`)에 등록. pg_aidb는 GPU 환경에서만 `USING cagra` 인덱스를 추가 생성하면 됨 — `ai.search` SQL 코드는 변경 없음.
 
 **참조**: `pg_aidb/design/GPU_STRATEGY.md` §3 (쿼리 패턴별 가속 효과)
+
+---
+
+## ADR-008 — IPC 프로토콜: Unix Domain Socket + shm zero-copy
+
+**날짜**: 2026-05-23
+
+**문제**: `cuvs_ipc.c`에 IPC 프로토콜이 결정되지 않은 채 스캐폴드만 존재한다. PLAN.md는 "shm_open으로 핸들만 주고받는 방식"을 언급했지만 시그널링 메커니즘이 미결이었다.
+
+**조사**: PG-Strom 소스 및 문서 확인 결과, PG-Strom은 POSIX shm+세마포어가 아닌 **Unix Domain Socket**을 주 IPC로 사용한다. shm은 GPU Cache REDO 로그 버퍼에만 한정적으로 사용.
+
+**결정**: 커맨드(JSON 프레임)는 UDS로 전달. 실제 벡터 데이터(쿼리 벡터, 결과 TID 배열)는 `shm_open` 공유 메모리로 zero-copy 전달. 소켓은 핸들 참조만 전송.
+
+**결과**:
+- 다중 백엔드 동시 처리가 `accept()` 루프로 자연스럽게 처리됨
+- 디버깅 시 `nc -U /tmp/.s.pg_cuvs.<pid>`로 직접 테스트 가능
+- Phase 2 `pg_stat_gpu` 통계 쿼리를 동일 소켓으로 확장 가능
+- `cuvs.socket_path` GUC 미설정 시 기본값: `/tmp/.s.pg_cuvs.<postmaster_pid>`
+
+**대안**: POSIX shm + 세마포어. 거부 — 다중 백엔드 큐 관리를 직접 구현해야 하고, 운영 디버깅이 어려움. 레이턴시 차이(수 마이크로초)는 CAGRA 검색 ms 대비 무시 가능.
+
+---
+
+## ADR-009 — 인덱스 영속화: GUC cuvs.index_dir
+
+**날짜**: 2026-05-23
+
+**문제**: CAGRA 인덱스는 VRAM 상주 인메모리 구조다. 데몬 재시작 시 인덱스가 사라지면 매번 전체 재빌드가 필요하다.
+
+**결정**: `cuvs.index_dir` GUC로 직렬화 경로를 설정. 미설정 시 기본값 `$PGDATA/cuvs_indexes/`. cuVS 네이티브 serialize/deserialize API 사용.
+
+**결과**:
+- Phase 2 NVMe tiered caching과 자연스럽게 연결 — index_dir을 NVMe 마운트 포인트로 설정 가능
+- Phase 3 S3 연동 시 동일 경로 추상화 재사용 가능
+- SIGTERM 수신 시 모든 VRAM 상주 인덱스를 직렬화 후 종료
+- 시작 시 `pg_catalog.pg_index`에 존재하는 OID와 대조해 유효한 인덱스만 로드
+
+**대안**: `$PGDATA` 고정 경로. 거부 — CAGRA 인덱스는 수 GB 단위라 $PGDATA를 급속히 팽창시키며, NVMe 분리 마운트 불가.
+
+---
+
+## ADR-010 — VRAM OOM 정책: 3계층
+
+**날짜**: 2026-05-23
+
+**문제**: cuVS는 VRAM 초과 시 CUDA OOM 에러를 반환한다. pg_cuvs가 이를 그대로 사용자에게 전파하면 운영 안정성이 떨어진다.
+
+**결정**: 3계층 OOM 정책 적용.
+
+```
+레이어 1 — 사전 예방: 인덱스 로드 전 VRAM 여유 공간 사전 계산
+레이어 2 — LRU 에비션: 공간 부족 시 최근 미사용 인덱스를 cuvs.index_dir에 직렬화 후 VRAM 해제, 재시도
+레이어 3 — CPU fallback: 전체 에비션 후에도 공간 부족 시 pgvector HNSW로 라우팅 + WARNING 로그
+```
+
+**결과**:
+- 사용자 쿼리는 OOM 상황에서도 성공 (성능 저하만 발생)
+- LRU 에비션이 Phase 2 tiered caching의 기반 구현이 됨
+- `cuvs.max_vram_mb` GUC로 물리 VRAM 미만의 예산 제한 가능
+
+**대안**: Fail-fast(에러 전파). 거부 — 사용자가 인덱스 수를 명시적으로 관리해야 하며 운영 부담이 큼.
+
+---
+
+## ADR-011 — CPU fallback 트리거: 4가지 조건
+
+**날짜**: 2026-05-23
+
+**문제**: GPU 경로가 비활성화되어야 하는 조건이 여러 가지이며, 각각 다른 검출 메커니즘이 필요하다.
+
+**결정**: 다음 4가지 조건에서 pgvector HNSW로 자동 전환.
+
+| 트리거 | 메커니즘 |
+|--------|---------|
+| 코스트 모델 | `cuvsamcostestimate`가 GPU 경로 비용 > CPU 경로 비용으로 산출 시 planner가 자동 선택 |
+| GUC 수동 전환 | `enable_cuvs = off` 설정 시 pg_cuvs_server 미접촉 |
+| 데몬 장애 | `connect()` ECONNREFUSED/ETIMEDOUT 시 자동 fallback + WARNING (세션당 1회) |
+| Circuit breaker | 연속 GPU 에러 n회(`cuvs.circuit_breaker_threshold`, 기본 3) 초과 시 자동 비활성화, `pg_cuvs_reset_circuit()` 함수로 재활성 |
+
+**결과**: 모든 실패 모드에서 사용자 쿼리가 성공. GPU 서비스는 PostgreSQL 가용성에 영향을 주지 않음 (ADR-002 sidecar 원칙 강화).
+
+---
+
+## ADR-012 — Phase 2 DiskANN: cuVS Vamana 네이티브 방식
+
+**날짜**: 2026-05-23
+
+**문제**: PLAN.md는 "CAGRA로 GPU 빌드 후 HNSW 포맷으로 변환"을 Phase 2 DiskANN 방식으로 언급했다. 그러나 cuVS에 더 직접적인 경로가 있는지 확인이 필요했다.
+
+**조사**: cuVS에 `cuvs.neighbors.vamana`가 존재하며, DiskANN 바이너리 포맷으로 직접 저장/로드 가능(`vamana.save()` / `vamana.load()`). CAGRA→HNSW 변환 레이어 불필요.
+
+**결정**: Phase 2 DiskANN은 두 경로를 모두 지원.
+
+```
+CAGRA build(GPU) → HNSW format → CPU HNSW search   (중간 규모, RAM 상주)
+Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
+```
+
+공통 원칙: **빌드만 GPU 가속, 검색은 CPU**. 디스크 기반 검색은 I/O가 병목이라 GPU 전송 오버헤드가 이득을 상쇄.
+
+**결과**: PLAN.md의 CAGRA→HNSW 변환 방식은 cuVS `from_cagra()` API로 대체. 단, CAGRA→HNSW 경로도 CPU fallback용으로 병행 지원 가능 (`cuvs.export_hnsw = on` GUC).
+
+**대안**: pgvectorscale DiskANN 재사용. 보류 — 라이선스 확인 필요, cuVS Vamana가 더 직접적 경로.
+
+---
+
+## ADR-013 — Phase 3 S3: Derived Data + S3 Source of Truth 방향
+
+**날짜**: 2026-05-23
+
+**문제**: 수십억 규모 인덱스를 어떻게 저장하고 멀티노드에서 공유할지 결정이 필요하다.
+
+**결정**: 두 단계로 전환.
+
+- **Phase 3 MVP**: 인덱스를 derived data로 취급 (WAL 제외). S3 스냅샷은 재빌드 시간 절약용 캐시로 사용. 장애 시 테이블에서 재빌드 가능.
+- **Phase 3 v2**: S3를 Source of Truth로 전환. 로컬 NVMe는 io_uring 비동기 프리페치 캐시. 인스턴스 교체 또는 읽기 전용 레플리카가 S3에서 직접 로드.
+
+**결과**:
+- MVP 단계에서 구현 복잡도 최소화
+- 멀티노드 공유 필요 시 S3 SoT 전환으로 자연스럽게 진화
+- 인덱스 파일은 `pg_basebackup` WAL 스트림에서 제외 (`SPEC.md S3-03` 참조)
+
+---
+
+## ADR-014 — 쓰기 처리: AUTOVACUUM 연동 Lazy Rebuild
+
+**날짜**: 2026-05-23
+
+**문제**: CAGRA는 정적 그래프 인덱스라 INSERT/UPDATE/DELETE 시 실시간 업데이트가 불가능하다.
+
+**결정**: pgvector HNSW와 동일한 접근 방식 채택. INSERT/UPDATE/DELETE 시 영향받은 TID를 인메모리 pending-delta set에 기록. AUTOVACUUM 또는 수동 VACUUM 시 pg_cuvs_server가 현재 heap 상태로 인덱스를 재빌드하고 VRAM을 원자적으로 교체.
+
+**결과**:
+- 별도 스케줄러 없이 PostgreSQL 기존 유지보수 사이클 재활용
+- delta 비율이 `cuvs.rebuild_threshold`(기본 10%) 초과 시 VACUUM 권고 WARNING 발생
+- VACUUM 전까지 stale 인덱스 허용 — recall 저하는 있으나 정확도(exact match)는 heap recheck로 보장
+
+**대안**: Background Worker 주기적 재빌드. 보류 — AUTOVACUUM 연동이 더 단순하며 PG 생태계 관례와 일치. 필요 시 Phase 2에서 워밍업 Background Worker 추가 가능.
