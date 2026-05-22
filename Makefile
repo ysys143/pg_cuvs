@@ -33,7 +33,10 @@ CUVS_INCLUDE  ?= $(CUVS_PREFIX)/include
 CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I./src
-SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -lstdc++
+# -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
+# without LD_LIBRARY_PATH being set (ADR-007).
+SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -lstdc++ \
+                 -Wl,-rpath,$(CUVS_LIB) -lrt
 
 PG_CONFIG     ?= pg_config
 PGXS         := $(shell $(PG_CONFIG) --pgxs)
@@ -43,6 +46,39 @@ include $(PGXS)
 # default for this specific file since .cu needs nvcc, not gcc.
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h
 	$(NVCC) $(NVCC_FLAGS) -I$(CUVS_INCLUDE) -I./src -c $< -o $@
+
+# ---- pg_cuvs_server binary -----------------------------------------------
+# Standalone GPU daemon — NOT a PostgreSQL extension, no PGXS involvement.
+# Links against libcuvs + libcudart + libpthread + librt.
+SERVER_SRCS    = src/pg_cuvs_server.c src/cuvs_ipc.c
+SERVER_OBJS    = src/pg_cuvs_server.o src/cuvs_ipc.o
+SERVER_BIN     = pg_cuvs_server
+
+CC             ?= gcc
+SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
+                 -I$(CUVS_INCLUDE) -std=c11
+SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lcudart -lstdc++ \
+                 -Wl,-rpath,$(CUVS_LIB) \
+                 -lpthread -lrt
+
+# server .c → .o (not via PGXS — separate rule with no PG headers)
+src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_wrapper.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
+# cuvs_ipc.o for server (same source, no PG headers needed)
+# Note: PGXS also builds cuvs_ipc.o for the .so; use a separate target.
+src/cuvs_ipc_server.o: src/cuvs_ipc.c src/cuvs_ipc.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_wrapper.o
+	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
+
+server: $(SERVER_BIN)
+
+install-server: server
+	install -m 755 $(SERVER_BIN) $(shell $(PG_CONFIG) --bindir)/
+
+.PHONY: server install-server
 
 # ---- GCP remote orchestration ------------------------------------------
 # Load .env.gpu (gitignored) for GCP_VM, GCP_INSTANCE, GCP_ZONE, etc.
@@ -87,6 +123,17 @@ gpu-test:
 	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make installcheck"
+
+gpu-server:
+	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		make server && sudo make install-server"
+
+gpu-server-start:
+	ssh -tt $(GCP_VM) "pg_cuvs_server \
+		--socket /tmp/.s.pg_cuvs \
+		--index-dir \$$(psql -t -c 'SHOW data_directory' | tr -d ' ')/cuvs_indexes \
+		--max-vram-mb 20480 &"
 
 gpu-bench:
 	@mkdir -p design

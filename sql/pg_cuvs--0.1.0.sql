@@ -18,8 +18,7 @@ COMMENT ON ACCESS METHOD cagra IS
   'GPU-accelerated CAGRA index for pgvector vector type (pg_cuvs)';
 
 -- ----------------------------------------------------------------
--- Operator classes — reuse pgvector's operators, expose them via
--- our AM so users can write USING cagra (embedding vector_cosine_ops).
+-- Operator classes — reuse pgvector operators via the cagra AM
 -- ----------------------------------------------------------------
 CREATE OPERATOR CLASS vector_l2_ops
 DEFAULT FOR TYPE vector USING cagra AS
@@ -35,3 +34,16 @@ CREATE OPERATOR CLASS vector_ip_ops
 FOR TYPE vector USING cagra AS
     OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
     FUNCTION 1 vector_negative_inner_product(vector, vector);
+
+-- ----------------------------------------------------------------
+-- pg_cuvs_reset_circuit(index_name text)
+-- Re-enables GPU routing after circuit breaker trips (FALLBACK-04).
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_reset_circuit(index_name text)
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_reset_circuit'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_reset_circuit(text) IS
+  'Reset circuit breaker for a cagra index to re-enable GPU routing. '
+  'Use after repeated GPU errors have been resolved.';

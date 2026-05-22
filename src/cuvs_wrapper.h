@@ -60,6 +60,16 @@ int cuvs_cagra_search(
 
 void cuvs_cagra_free(CuvsCagraIndex index);
 
+/*
+ * cuvs_cagra_serialize / cuvs_cagra_deserialize
+ * Persist/restore a CAGRA index to/from a file path using cuVS native format.
+ */
+int            cuvs_cagra_serialize(CuvsCagraIndex index, const char *path);
+CuvsCagraIndex cuvs_cagra_deserialize(const char *path, int dim);
+
+/* VRAM query — returns free VRAM bytes on the current CUDA device. */
+size_t cuvs_vram_free_bytes(void);
+
 /* GPU availability check — returns 1 if CUDA device is accessible. */
 int cuvs_gpu_available(void);
 

@@ -1,26 +1,394 @@
 /*
- * cuvs_ipc.c — Shared Memory IPC stub.
+ * cuvs_ipc.c — UDS client for pg_cuvs_server communication.
  *
- * Phase 1: always returns CUVS_IPC_UNAVAIL so pg_cuvs falls back to
- * the in-process GPU call (cuvs_brute_force_search) or the CPU path.
+ * Protocol: send CuvsCmdFrame over UDS, vector payload via shm_open,
+ * receive CuvsReplyHeader + n×CuvsResult over UDS.
  *
- * Phase 2: implement pg_cuvs_server daemon connection via shm_open,
- * semaphores, and a request/response ring buffer.
+ * Called from PostgreSQL backend process context. All paths that fail
+ * to reach the daemon return an error code — pg_cuvs.c converts that
+ * to a CPU fallback without crashing the backend.
  */
 
 #include "cuvs_ipc.h"
 
-CuvsIpcStatus
-cuvs_ipc_search(const CuvsIpcRequest *req,
-                CuvsIpcResponse      *resp,
-                int                   timeout_ms)
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
+
+/* ----------------------------------------------------------------
+ * Circuit breaker state (process-local)
+ * ---------------------------------------------------------------- */
+CuvsCircuitBreaker cuvs_circuit_breakers[CUVS_MAX_TRACKED_INDEXES];
+int                cuvs_n_circuit_breakers = 0;
+
+static CuvsCircuitBreaker *
+find_or_create_breaker(uint32_t index_oid)
 {
-    /* TODO Phase 2: connect to pg_cuvs_server via shared memory */
-    (void) req;
-    (void) timeout_ms;
+    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
+        if (cuvs_circuit_breakers[i].index_oid == index_oid)
+            return &cuvs_circuit_breakers[i];
 
-    resp->status    = CUVS_IPC_UNAVAIL;
-    resp->n_results = 0;
+    if (cuvs_n_circuit_breakers < CUVS_MAX_TRACKED_INDEXES)
+    {
+        CuvsCircuitBreaker *b = &cuvs_circuit_breakers[cuvs_n_circuit_breakers++];
+        b->index_oid        = index_oid;
+        b->consecutive_errors = 0;
+        b->open             = 0;
+        return b;
+    }
+    return NULL;
+}
 
-    return CUVS_IPC_UNAVAIL;
+void
+cuvs_circuit_record_error(uint32_t index_oid, int threshold)
+{
+    CuvsCircuitBreaker *b = find_or_create_breaker(index_oid);
+    if (!b)
+        return;
+    b->consecutive_errors++;
+    if (b->consecutive_errors >= threshold)
+        b->open = 1;
+}
+
+void
+cuvs_circuit_record_success(uint32_t index_oid)
+{
+    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
+        if (cuvs_circuit_breakers[i].index_oid == index_oid)
+        {
+            cuvs_circuit_breakers[i].consecutive_errors = 0;
+            return;
+        }
+}
+
+void
+cuvs_circuit_reset(uint32_t index_oid)
+{
+    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
+    {
+        if (cuvs_circuit_breakers[i].index_oid == index_oid)
+        {
+            cuvs_circuit_breakers[i].consecutive_errors = 0;
+            cuvs_circuit_breakers[i].open = 0;
+            return;
+        }
+    }
+}
+
+int
+cuvs_circuit_is_open(uint32_t index_oid)
+{
+    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
+        if (cuvs_circuit_breakers[i].index_oid == index_oid)
+            return cuvs_circuit_breakers[i].open;
+    return 0;
+}
+
+/* ----------------------------------------------------------------
+ * Socket helpers
+ * ---------------------------------------------------------------- */
+
+/* Open a UDS connection. Returns fd on success, -1 on failure. */
+static int
+uds_connect(const char *socket_path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    /* Short timeout: if daemon is down, fail fast and use CPU path. */
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int
+send_all(int fd, const void *buf, size_t len)
+{
+    const char *p = buf;
+    size_t sent = 0;
+    while (sent < len)
+    {
+        ssize_t n = write(fd, p + sent, len - sent);
+        if (n <= 0)
+            return -1;
+        sent += n;
+    }
+    return 0;
+}
+
+static int
+recv_all(int fd, void *buf, size_t len)
+{
+    char *p = buf;
+    size_t received = 0;
+    while (received < len)
+    {
+        ssize_t n = read(fd, p + received, len - received);
+        if (n <= 0)
+            return -1;
+        received += n;
+    }
+    return 0;
+}
+
+/* ----------------------------------------------------------------
+ * shm helpers
+ * ---------------------------------------------------------------- */
+
+/* Build a unique shm key from pid + sequence counter. */
+static void
+make_shm_key(char *key, size_t keylen)
+{
+    static int seq = 0;
+    snprintf(key, keylen, "/pg_cuvs_%d_%d", (int)getpid(), seq++);
+}
+
+/* Write vectors + TIDs into a new shm segment. Returns shm fd or -1. */
+static int
+shm_write_build_payload(const char   *shm_key,
+                        const float  *vecs,
+                        const uint64_t *tids,
+                        int64_t       n_vecs,
+                        int           dim)
+{
+    size_t vec_bytes = (size_t)n_vecs * dim * sizeof(float);
+    size_t tid_bytes = (size_t)n_vecs * sizeof(uint64_t);
+    size_t total     = vec_bytes + tid_bytes;
+
+    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0600);
+    if (fd < 0)
+        return -1;
+
+    if (ftruncate(fd, (off_t)total) < 0)
+    {
+        shm_unlink(shm_key);
+        close(fd);
+        return -1;
+    }
+
+    void *mem = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED)
+    {
+        shm_unlink(shm_key);
+        close(fd);
+        return -1;
+    }
+
+    memcpy(mem, vecs, vec_bytes);
+    memcpy((char *)mem + vec_bytes, tids, tid_bytes);
+
+    munmap(mem, total);
+    return fd;
+}
+
+/* Write query vector into a new shm segment. Returns shm fd or -1. */
+static int
+shm_write_query(const char *shm_key, const float *query_vec, int dim)
+{
+    size_t vec_bytes = (size_t)dim * sizeof(float);
+
+    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0600);
+    if (fd < 0)
+        return -1;
+
+    if (ftruncate(fd, (off_t)vec_bytes) < 0)
+    {
+        shm_unlink(shm_key);
+        close(fd);
+        return -1;
+    }
+
+    void *mem = mmap(NULL, vec_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED)
+    {
+        shm_unlink(shm_key);
+        close(fd);
+        return -1;
+    }
+
+    memcpy(mem, query_vec, vec_bytes);
+    munmap(mem, vec_bytes);
+    return fd;
+}
+
+/* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_search
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_search(
+    const char   *socket_path,
+    uint32_t      db_oid,
+    uint32_t      index_oid,
+    const float  *query_vec,
+    int           dim,
+    int           k,
+    uint32_t      metric,
+    uint64_t     *tids_out,
+    float        *dist_out,
+    int          *n_out)
+{
+    char shm_key[64];
+    int  shm_fd = -1;
+    int  sock   = -1;
+    int  rc     = CUVS_STATUS_ERROR;
+
+    make_shm_key(shm_key, sizeof(shm_key));
+
+    shm_fd = shm_write_query(shm_key, query_vec, dim);
+    if (shm_fd < 0)
+        goto cleanup;
+
+    sock = uds_connect(socket_path);
+    if (sock < 0)
+        goto cleanup;
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_SEARCH,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+        .k         = (uint32_t)k,
+        .metric    = metric,
+        .dim       = (uint32_t)dim,
+        .n_vecs    = 0,
+    };
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+
+    if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
+    {
+        int n = (int)hdr.n_results;
+        CuvsResult *results = malloc(n * sizeof(CuvsResult));
+        if (!results)
+        {
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+
+        if (recv_all(sock, results, n * sizeof(CuvsResult)) < 0)
+        {
+            free(results);
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            tids_out[i] = results[i].tid;
+            dist_out[i] = results[i].distance;
+        }
+        *n_out = n;
+        free(results);
+    }
+    else
+    {
+        *n_out = 0;
+    }
+
+cleanup:
+    if (sock >= 0)
+        close(sock);
+    if (shm_fd >= 0)
+        close(shm_fd);
+    shm_unlink(shm_key);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_build
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_build(
+    const char    *socket_path,
+    uint32_t       db_oid,
+    uint32_t       index_oid,
+    const float   *vecs,
+    const uint64_t *tids,
+    int64_t        n_vecs,
+    int            dim,
+    uint32_t       metric,
+    const char    *index_dir)
+{
+    char shm_key[64];
+    int  shm_fd = -1;
+    int  sock   = -1;
+    int  rc     = CUVS_STATUS_ERROR;
+
+    make_shm_key(shm_key, sizeof(shm_key));
+
+    shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
+    if (shm_fd < 0)
+        goto cleanup;
+
+    sock = uds_connect(socket_path);
+    if (sock < 0)
+        goto cleanup;
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_BUILD,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+        .k         = 0,
+        .metric    = metric,
+        .dim       = (uint32_t)dim,
+        .n_vecs    = n_vecs,
+    };
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
+
+    /*
+     * Pack index_dir into the reserved area of the command. We reuse
+     * the shm_key field convention: append a second null-terminated
+     * string immediately after CuvsCmdFrame in a wrapper struct.
+     */
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    /* Send index_dir as a fixed 256-byte field. */
+    char dir_buf[256] = {0};
+    if (index_dir)
+        strncpy(dir_buf, index_dir, sizeof(dir_buf) - 1);
+    if (send_all(sock, dir_buf, sizeof(dir_buf)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+
+cleanup:
+    if (sock >= 0)
+        close(sock);
+    if (shm_fd >= 0)
+        close(shm_fd);
+    shm_unlink(shm_key);
+    return rc;
 }
