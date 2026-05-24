@@ -20,6 +20,7 @@
 #include <sys/un.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <time.h>
 
@@ -176,7 +177,7 @@ shm_write_build_payload(const char   *shm_key,
     size_t tid_bytes = (size_t)n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
-    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0600);
+    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
     if (fd < 0)
         return -1;
 
@@ -208,7 +209,7 @@ shm_write_query(const char *shm_key, const float *query_vec, int dim)
 {
     size_t vec_bytes = (size_t)dim * sizeof(float);
 
-    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0600);
+    int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
     if (fd < 0)
         return -1;
 

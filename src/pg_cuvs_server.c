@@ -135,7 +135,7 @@ save_index(IndexEntry *e)
     fclose(f);
 
     fprintf(stderr, "pg_cuvs_server: saved index %u/%u (%lld vecs)\n",
-            e->db_oid, e->index_oid, e->n_vecs);
+            e->db_oid, e->index_oid, (long long)e->n_vecs);
     return 0;
 }
 
@@ -211,7 +211,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->valid       = 1;
 
     fprintf(stderr, "pg_cuvs_server: loaded index %u/%u (%lld vecs, %zu MB VRAM)\n",
-            db_oid, index_oid, n_vecs, needed / (1024*1024));
+            db_oid, index_oid, (long long)n_vecs, needed / (1024*1024));
     return 0;
 }
 
@@ -599,7 +599,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     pthread_mutex_unlock(&g_index_mutex);
 
     fprintf(stderr, "pg_cuvs_server: built index %u/%u (%lld vecs, %zu MB VRAM)\n",
-            cmd->db_oid, cmd->index_oid, cmd->n_vecs, needed / (1024*1024));
+            cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, needed / (1024*1024));
 
     CuvsReplyHeader hdr = {0};
     hdr.status = CUVS_STATUS_OK;

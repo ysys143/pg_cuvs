@@ -38,7 +38,8 @@ CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
-SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -lstdc++ \
+SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart \
+                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic \
                  -Wl,-rpath,$(CUVS_LIB) -lrt
 
 PG_CONFIG     ?= pg_config
@@ -67,8 +68,9 @@ SERVER_BIN     = pg_cuvs_server
 
 CC             ?= gcc
 SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
-                 -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -std=c11
-SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lcudart -lstdc++ \
+                 -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -std=gnu11 \
+                 -D_POSIX_C_SOURCE=200809L
+SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -lstdc++ \
                  -Wl,-rpath,$(CUVS_LIB) \
                  -lpthread -lrt
 
