@@ -97,9 +97,11 @@ cuvs_circuit_is_open(uint32_t index_oid)
  * Socket helpers
  * ---------------------------------------------------------------- */
 
-/* Open a UDS connection. Returns fd on success, -1 on failure. */
+/* Open a UDS connection. Returns fd on success, -1 on failure.
+ * connect_timeout_ms: short for fail-fast on missing daemon
+ * recv_timeout_sec: longer for receiving daemon response (build can be slow) */
 static int
-uds_connect(const char *socket_path)
+uds_connect_ex(const char *socket_path, int recv_timeout_sec)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
@@ -110,8 +112,7 @@ uds_connect(const char *socket_path)
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-    /* Short timeout: if daemon is down, fail fast and use CPU path. */
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    struct timeval tv = {.tv_sec = recv_timeout_sec, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -121,6 +122,12 @@ uds_connect(const char *socket_path)
         return -1;
     }
     return fd;
+}
+
+static int
+uds_connect(const char *socket_path)
+{
+    return uds_connect_ex(socket_path, 30); /* default 30s for SEARCH */
 }
 
 static int
@@ -181,6 +188,9 @@ shm_write_build_payload(const char   *shm_key,
     if (fd < 0)
         return -1;
 
+    /* Override umask: ensure other users (daemon) can read the shm segment */
+    fchmod(fd, 0666);
+
     if (ftruncate(fd, (off_t)total) < 0)
     {
         shm_unlink(shm_key);
@@ -212,6 +222,9 @@ shm_write_query(const char *shm_key, const float *query_vec, int dim)
     int fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
     if (fd < 0)
         return -1;
+
+    /* Override umask: ensure other users (daemon) can read the shm segment */
+    fchmod(fd, 0666);
 
     if (ftruncate(fd, (off_t)vec_bytes) < 0)
     {
@@ -344,14 +357,23 @@ cuvs_ipc_build(
     int  rc     = CUVS_STATUS_ERROR;
 
     make_shm_key(shm_key, sizeof(shm_key));
+    fprintf(stderr, "[cuvs_ipc_build] shm_key=%s socket=%s n_vecs=%lld dim=%d\n",
+            shm_key, socket_path, (long long)n_vecs, dim);
+    fflush(stderr);
 
     shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
-    if (shm_fd < 0)
+    if (shm_fd < 0) {
+        fprintf(stderr, "[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n", errno, strerror(errno));
+        fflush(stderr);
         goto cleanup;
+    }
 
-    sock = uds_connect(socket_path);
-    if (sock < 0)
+    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
+    if (sock < 0) {
+        fprintf(stderr, "[cuvs_ipc_build] uds_connect FAILED errno=%d (%s)\n", errno, strerror(errno));
+        fflush(stderr);
         goto cleanup;
+    }
 
     CuvsCmdFrame cmd = {
         .op        = CUVS_OP_BUILD,

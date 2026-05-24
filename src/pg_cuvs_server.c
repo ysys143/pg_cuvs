@@ -480,24 +480,30 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
 {
+    fprintf(stderr, "[handle_build] reading index_dir...\n"); fflush(stderr);
     /* Read index_dir from socket */
     char index_dir[256] = {0};
     if (recv_all(client_fd, index_dir, sizeof(index_dir)) < 0)
     {
+        fprintf(stderr, "[handle_build] recv index_dir FAILED errno=%d\n", errno); fflush(stderr);
         send_error(client_fd, "recv index_dir failed");
         return;
     }
+    fprintf(stderr, "[handle_build] got index_dir=%s\n", index_dir); fflush(stderr);
 
     size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
     size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
 
+    fprintf(stderr, "[handle_build] shm_open(%s)...\n", cmd->shm_key); fflush(stderr);
     int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
     if (shm_fd < 0)
     {
+        fprintf(stderr, "[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno)); fflush(stderr);
         send_error(client_fd, "shm_open failed");
         return;
     }
+    fprintf(stderr, "[handle_build] shm_open OK fd=%d\n", shm_fd); fflush(stderr);
 
     void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
@@ -537,14 +543,18 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    fprintf(stderr, "[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u...\n",
+            (long long)cmd->n_vecs, cmd->dim); fflush(stderr);
     CuvsCagraIndex handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim);
     if (!handle)
     {
+        fprintf(stderr, "[handle_build] cuvs_cagra_build returned NULL\n"); fflush(stderr);
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error(client_fd, "cuvs_cagra_build failed");
         return;
     }
+    fprintf(stderr, "[handle_build] cuvs_cagra_build OK\n"); fflush(stderr);
 
     /* Store TID mapping */
     uint64_t *my_tids = malloc(tid_bytes);
@@ -559,6 +569,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     memcpy(my_tids, tids, tid_bytes);
     munmap(mem, total);
 
+    fprintf(stderr, "[handle_build] storing tids and IndexEntry...\n"); fflush(stderr);
     if (g_n_indexes >= MAX_INDEXES)
     {
         evict_lru();
@@ -584,7 +595,10 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     index_file_path(idx_path, sizeof(idx_path), save_dir, e->db_oid, e->index_oid);
     tids_file_path(tids_path, sizeof(tids_path), save_dir, e->db_oid, e->index_oid);
 
-    cuvs_cagra_serialize(handle, idx_path);
+    /* TODO Phase 1.5: cuvs::neighbors::cagra::serialize hangs in cuVS 26.04 — investigate.
+     * For Phase 1 demo, skip serialization (no SIGTERM persistence). */
+    fprintf(stderr, "[handle_build] skipping serialize (Phase 1 demo)\n"); fflush(stderr);
+    (void)idx_path;
 
     FILE *f = fopen(tids_path, "wb");
     if (f)
@@ -594,9 +608,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         fwrite(&e->metric, sizeof(uint32_t), 1, f);
         fwrite(e->tids, sizeof(uint64_t), (size_t)e->n_vecs, f);
         fclose(f);
+        fprintf(stderr, "[handle_build] tids written to %s\n", tids_path); fflush(stderr);
+    } else {
+        fprintf(stderr, "[handle_build] fopen tids FAILED errno=%d (%s)\n", errno, strerror(errno)); fflush(stderr);
     }
 
     pthread_mutex_unlock(&g_index_mutex);
+    fprintf(stderr, "[handle_build] sending OK reply\n"); fflush(stderr);
 
     fprintf(stderr, "pg_cuvs_server: built index %u/%u (%lld vecs, %zu MB VRAM)\n",
             cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, needed / (1024*1024));
@@ -615,12 +633,21 @@ connection_thread(void *arg)
     int client_fd = *(int *)arg;
     free(arg);
 
+    fprintf(stderr, "pg_cuvs_server: client connected (fd=%d)\n", client_fd);
+    fflush(stderr);
+
     CuvsCmdFrame cmd;
     if (recv_all(client_fd, &cmd, sizeof(cmd)) < 0)
     {
+        fprintf(stderr, "pg_cuvs_server: recv_all CMD failed (errno=%d)\n", errno);
+        fflush(stderr);
         close(client_fd);
         return NULL;
     }
+
+    fprintf(stderr, "pg_cuvs_server: received cmd op=%u db=%u idx=%u dim=%u n_vecs=%lld shm=%s\n",
+            cmd.op, cmd.db_oid, cmd.index_oid, cmd.dim, (long long)cmd.n_vecs, cmd.shm_key);
+    fflush(stderr);
 
     switch (cmd.op)
     {

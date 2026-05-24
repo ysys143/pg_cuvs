@@ -205,10 +205,15 @@ cuvs_cagra_serialize(CuvsCagraIndex index, const char *path)
     try {
         CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
         raft::device_resources res;
-        cuvs::neighbors::cagra::serialize(res, path, impl->idx);
+        /* include_dataset=true so the index is self-contained */
+        cuvs::neighbors::cagra::serialize(res, std::string(path), impl->idx, true);
         res.sync_stream();
         return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_cagra_serialize] exception: %s\n", e.what());
+        return 1;
     } catch (...) {
+        fprintf(stderr, "[cuvs_cagra_serialize] unknown exception\n");
         return 1;
     }
 }
