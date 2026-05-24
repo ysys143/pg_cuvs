@@ -54,11 +54,11 @@ rm /tmp/miniforge.sh
 source ~/miniforge3/bin/activate
 
 # cuVS dev environment via rapidsai channel
-# libcuvs + libcuvs-dev needed for both runtime and header files
+# libcuvs is the unified C/C++ package (headers bundled with libs in 25.x+)
 ~/miniforge3/bin/conda create -n cuvs_dev -y \
     -c rapidsai -c conda-forge -c nvidia \
-    libcuvs=24.12 libcuvs-dev=24.12 \
-    cuda-toolkit=12.4 \
+    libcuvs=26.04 \
+    cuda-toolkit=12.* \
     python=3.11
 
 echo "cuvs_dev env created"
