@@ -39,11 +39,12 @@ FOR TYPE vector USING cagra AS
 -- pg_cuvs_reset_circuit(index_name text)
 -- Re-enables GPU routing after circuit breaker trips (FALLBACK-04).
 -- ----------------------------------------------------------------
-CREATE FUNCTION pg_cuvs_reset_circuit(index_name text)
+CREATE FUNCTION pg_cuvs_reset_circuit(index_oid regclass)
 RETURNS void
 AS '$libdir/pg_cuvs', 'pg_cuvs_reset_circuit'
 LANGUAGE C STRICT;
 
-COMMENT ON FUNCTION pg_cuvs_reset_circuit(text) IS
+COMMENT ON FUNCTION pg_cuvs_reset_circuit(regclass) IS
   'Reset circuit breaker for a cagra index to re-enable GPU routing. '
-  'Use after repeated GPU errors have been resolved.';
+  'Use after repeated GPU errors have been resolved. '
+  'Example: SELECT pg_cuvs_reset_circuit(''my_schema.cagra_idx''::regclass);';

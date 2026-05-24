@@ -21,8 +21,10 @@
 #include "access/heapam.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/cost.h"
 #include "storage/bufmgr.h"
 #include "storage/itemptr.h"
 
@@ -115,20 +117,18 @@ get_index_dir(void)
 #define CUVS_STARTUP_COST      1000.0
 #define CUVS_PER_TUPLE_COST    0.0001
 
-PG_FUNCTION_INFO_V1(cuvsamcostestimate);
-Datum
-cuvsamcostestimate(PG_FUNCTION_ARGS)
+/* PG16 amcostestimate is a direct C function pointer, not a SQL function. */
+static void
+cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+                   Cost *indexStartupCost, Cost *indexTotalCost,
+                   Selectivity *indexSelectivity, double *indexCorrelation,
+                   double *indexPages)
 {
-    IndexPath  *path              = (IndexPath *)     PG_GETARG_POINTER(1);
-    double     *indexStartupCost  = (double *)        PG_GETARG_POINTER(4);
-    double     *indexTotalCost    = (double *)        PG_GETARG_POINTER(5);
-    double     *indexCorrelation  = (double *)        PG_GETARG_POINTER(7);
-    double     *indexPages        = (double *)        PG_GETARG_POINTER(8);
+    double rows = path->path.rows;
+    Oid    index_oid = path->indexinfo->indexoid;
 
-    double      rows              = path->path.rows;
-
-    /* Force CPU path if disabled, circuit-tripped, or GPU unavailable */
-    Oid index_oid = path->indexinfo->indexoid;
+    (void) root;
+    (void) loop_count;
 
     if (!enable_cuvs
         || !cuvs_gpu_available()
@@ -139,15 +139,13 @@ cuvsamcostestimate(PG_FUNCTION_ARGS)
     }
     else
     {
-        /* Scale startup_cost by relative vector size vs 1536-dim baseline */
         *indexStartupCost = CUVS_STARTUP_COST;
         *indexTotalCost   = CUVS_STARTUP_COST + CUVS_PER_TUPLE_COST * rows;
     }
 
+    *indexSelectivity = 1.0;
     *indexCorrelation = 0.0;
     *indexPages       = 0.0;
-
-    PG_RETURN_VOID();
 }
 
 /* ----------------------------------------------------------------
@@ -432,8 +430,6 @@ cuvsamhandler(PG_FUNCTION_ARGS)
     amroutine->amsupport         = 1;
     amroutine->amcanmulticol     = false;
     amroutine->amsearcharray     = false;
-    amroutine->amhasgettuple     = true;
-    amroutine->amhasgetbitmap    = false;
     amroutine->amcanorderbyop    = true;
     amroutine->amoptionalkey     = true;
 
@@ -460,21 +456,13 @@ PG_FUNCTION_INFO_V1(pg_cuvs_reset_circuit);
 Datum
 pg_cuvs_reset_circuit(PG_FUNCTION_ARGS)
 {
-    text *index_name_text = PG_GETARG_TEXT_PP(0);
-    char *index_name      = text_to_cstring(index_name_text);
-
-    /* Resolve index name to OID */
-    Oid index_oid = RelnameGetRelid(index_name);
-    if (!OidIsValid(index_oid))
-        ereport(ERROR,
-                (errcode(ERRCODE_UNDEFINED_TABLE),
-                 errmsg("index \"%s\" does not exist", index_name)));
+    Oid index_oid = PG_GETARG_OID(0);
 
     cuvs_circuit_reset((uint32_t)index_oid);
 
     ereport(NOTICE,
-            (errmsg("pg_cuvs: circuit breaker reset for index \"%s\" (oid %u)",
-                    index_name, index_oid)));
+            (errmsg("pg_cuvs: circuit breaker reset for index oid %u",
+                    index_oid)));
 
     PG_RETURN_VOID();
 }

@@ -13,8 +13,7 @@
 #include "cuvs_wrapper.h"
 
 #include <cuvs/neighbors/brute_force.hpp>
-#include <cuvs/neighbors/cagra.hpp>
-#include <cuvs/neighbors/cagra_serialize.hpp>
+#include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include <raft/core/device_resources.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
@@ -26,15 +25,14 @@
 #include <fstream>
 #include <stdexcept>
 
-/* Opaque CAGRA index wrapper */
+/* Opaque CAGRA index wrapper.
+ * raft::device_resources has a deleted move constructor in cuVS 25.x+,
+ * so we hold it via unique_ptr and create a fresh one per operation. */
 struct CuvsCagraIndexImpl {
     cuvs::neighbors::cagra::index<float, uint32_t> idx;
-    raft::device_resources                          res;
 
-    CuvsCagraIndexImpl(
-        cuvs::neighbors::cagra::index<float, uint32_t> &&idx_,
-        raft::device_resources                          &&res_)
-        : idx(std::move(idx_)), res(std::move(res_))
+    explicit CuvsCagraIndexImpl(cuvs::neighbors::cagra::index<float, uint32_t> &&idx_)
+        : idx(std::move(idx_))
     {}
 };
 
@@ -140,7 +138,7 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
 
         res.sync_stream();
 
-        return new CuvsCagraIndexImpl(std::move(idx), std::move(res));
+        return new CuvsCagraIndexImpl(std::move(idx));
     } catch (...) {
         return nullptr;
     }
@@ -162,7 +160,7 @@ cuvs_cagra_search(
 
     try {
         CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
-        raft::device_resources &res = impl->res;
+        raft::device_resources res;
 
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
@@ -206,8 +204,9 @@ cuvs_cagra_serialize(CuvsCagraIndex index, const char *path)
 
     try {
         CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
-        cuvs::neighbors::cagra::serialize(impl->res, path, impl->idx);
-        impl->res.sync_stream();
+        raft::device_resources res;
+        cuvs::neighbors::cagra::serialize(res, path, impl->idx);
+        res.sync_stream();
         return 0;
     } catch (...) {
         return 1;
@@ -223,7 +222,7 @@ cuvs_cagra_deserialize(const char *path, int dim)
         cuvs::neighbors::cagra::deserialize(res, path, &idx);
         res.sync_stream();
         (void)dim;  /* dim is encoded in the serialized index */
-        return new CuvsCagraIndexImpl(std::move(idx), std::move(res));
+        return new CuvsCagraIndexImpl(std::move(idx));
     } catch (...) {
         return nullptr;
     }

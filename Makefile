@@ -25,14 +25,17 @@ OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_wrapper.o
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
 CUDA_ARCH     ?= sm_80
-NVCC_FLAGS    ?= -O3 --compiler-options '-fPIC' -arch=$(CUDA_ARCH) -std=c++17
+NVCC_FLAGS    ?= -O3 --compiler-options '-fPIC' -arch=$(CUDA_ARCH) -std=c++17 \
+                 -DRAFT_SYSTEM_LITTLE_ENDIAN=1
 
 # cuVS / RAPIDS install root (conda env activates default)
 CUVS_PREFIX   ?= $(CONDA_PREFIX)
 CUVS_INCLUDE  ?= $(CUVS_PREFIX)/include
+# cuVS 25.x+ ships bundled libcudacxx under include/rapids/
+CUVS_RAPIDS_INCLUDE ?= $(CUVS_PREFIX)/include/rapids
 CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 
-PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I./src
+PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
 SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -lstdc++ \
@@ -45,7 +48,15 @@ include $(PGXS)
 # Build CUDA object before linking the .so. Pattern rule overrides PGXS
 # default for this specific file since .cu needs nvcc, not gcc.
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h
-	$(NVCC) $(NVCC_FLAGS) -I$(CUVS_INCLUDE) -I./src -c $< -o $@
+	$(NVCC) $(NVCC_FLAGS) -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src -c $< -o $@
+
+# PGXS generates LLVM bitcode (.bc) from .c sources for JIT. The .cu file
+# has no PG-callable functions, so emit a stub bitcode so PGXS doesn't fail.
+src/cuvs_wrapper.bc: src/cuvs_wrapper.cu
+	@echo 'void cuvs_wrapper_jit_stub(void){}' > /tmp/_cuvs_stub.c
+	@clang-15 -emit-llvm -c /tmp/_cuvs_stub.c -o $@ 2>/dev/null \
+		|| clang -emit-llvm -c /tmp/_cuvs_stub.c -o $@
+	@rm /tmp/_cuvs_stub.c
 
 # ---- pg_cuvs_server binary -----------------------------------------------
 # Standalone GPU daemon — NOT a PostgreSQL extension, no PGXS involvement.
@@ -56,7 +67,7 @@ SERVER_BIN     = pg_cuvs_server
 
 CC             ?= gcc
 SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
-                 -I$(CUVS_INCLUDE) -std=c11
+                 -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -std=c11
 SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lcudart -lstdc++ \
                  -Wl,-rpath,$(CUVS_LIB) \
                  -lpthread -lrt
