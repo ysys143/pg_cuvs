@@ -132,6 +132,37 @@ ssh $(GCP_VM) "sudo systemctl start postgresql"
 **원인**: rsync --delete가 VM의 올바른 .o를 삭제
 **해결**: Makefile의 sync 타깃 확인 — `--exclude 'src/*.o'` 포함됨
 
+### G-1. 절대 하지 말 것: conda lib을 ldconfig에 등록
+**증상**: VM 재부팅 후 sshd/dbus가 죽어서 VM 자체에 접근 불가
+**원인**:
+```bash
+# 이렇게 하면 안 됨
+echo "$CONDA_PREFIX/lib" | sudo tee /etc/ld.so.conf.d/cuvs.conf
+sudo ldconfig
+```
+conda env의 lib 디렉터리에는 `libcuvs.so` 외에도 `libssl.so.3`, `libdbus-1.so.3` 같은 시스템 라이브러리가 들어있다. ldconfig에 등록하면 시스템 sshd/dbus가 conda의 (다른 버전) 라이브러리를 잡고 ABI 충돌로 죽음.
+
+**올바른 방법**:
+- `-Wl,-rpath,$(CUVS_LIB)` 만 사용 (현재 Makefile에 적용됨)
+- postgres가 conda 경로를 traverse할 수 있게 `chmod o+x /home/<user>`만 풀어주면 충분
+- 만약 시스템 등록이 꼭 필요하면 특정 .so 파일만 심볼릭 링크:
+  ```bash
+  sudo ln -s $CONDA_PREFIX/lib/libcuvs.so /usr/local/lib/
+  sudo ldconfig
+  ```
+
+**복구 방법** (이미 망가졌을 때):
+1. VM stop → boot disk detach
+2. rescue VM 생성, 망가진 디스크 attach
+3. mount + chroot로 ldconfig 캐시 재빌드:
+   ```bash
+   sudo rm /mnt/broken/etc/ld.so.conf.d/cuvs.conf
+   sudo rm /mnt/broken/etc/ld.so.cache
+   sudo mount --bind /dev /mnt/broken/dev  # 등
+   sudo chroot /mnt/broken ldconfig
+   ```
+4. disk 분리 → 원래 VM에 boot으로 재attach → start
+
 ### G. startup script가 아직 실행 중인데 SSH 접속
 **증상**: `sudo make install` 시 `dpkg: error: dpkg status database is locked`
 **원인**: apt-get이 백그라운드에서 아직 실행 중
