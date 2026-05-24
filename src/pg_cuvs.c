@@ -144,7 +144,16 @@ get_index_dir(void)
 #define CUVS_STARTUP_COST      1000.0
 #define CUVS_PER_TUPLE_COST    0.0001
 
-/* PG16 amcostestimate is a direct C function pointer, not a SQL function. */
+/* PG16 amcostestimate is a direct C function pointer, not a SQL function.
+ *
+ * IMPORTANT: This runs in the planner on every query — once per candidate
+ * index path. It must NOT touch the CUDA runtime: cudaGetDeviceCount() etc.
+ * lazily initialize the CUDA context per backend, which costs ~100ms the
+ * first time and inflates Planning Time. Daemon availability is checked at
+ * runtime by cuvs_ipc_search; if the daemon is down, gettuple returns
+ * CUVS_STATUS_UNAVAILABLE and the executor falls back to CPU with a
+ * WARNING. The cost path only needs to short-circuit when the GPU route is
+ * explicitly off (enable_cuvs / circuit breaker). */
 static void
 cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                    Cost *indexStartupCost, Cost *indexTotalCost,
@@ -158,7 +167,6 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     (void) loop_count;
 
     if (!enable_cuvs
-        || !cuvs_gpu_available()
         || cuvs_circuit_is_open((uint32_t)index_oid))
     {
         *indexStartupCost = 1e9;
