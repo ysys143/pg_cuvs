@@ -4,15 +4,15 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "GCP region"
+  description = "GCP region (asia-east1 = closest L4 region to Korea)"
   type        = string
-  default     = "asia-northeast3"
+  default     = "asia-east1"
 }
 
 variable "zone" {
   description = "GCP zone (L4 availability)"
   type        = string
-  default     = "asia-northeast3-b"
+  default     = "asia-east1-a"
 }
 
 variable "instance_name" {
@@ -22,9 +22,15 @@ variable "instance_name" {
 }
 
 variable "machine_type" {
-  description = "Machine type — g2-standard-4 has 1x L4 + 4 vCPU + 16GB RAM"
+  description = "Machine type — a2-highgpu-1g has 1x A100-40GB + 12 vCPU + 85GB RAM"
   type        = string
-  default     = "g2-standard-4"
+  default     = "a2-highgpu-1g"
+}
+
+variable "accelerator_type" {
+  description = "GPU accelerator type (nvidia-tesla-a100 for A100-40GB, nvidia-a100-80gb, nvidia-h100-80gb, nvidia-l4)"
+  type        = string
+  default     = "nvidia-tesla-a100"
 }
 
 variable "disk_size_gb" {

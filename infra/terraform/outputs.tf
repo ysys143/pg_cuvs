@@ -19,6 +19,6 @@ output "env_gpu_snippet" {
     GCP_ZONE=${google_compute_instance.pg_cuvs_dev.zone}
     GCP_PROJECT=${var.project_id}
     CONDA_ENV=cuvs_dev
-    CUDA_ARCH=sm_89
+    CUDA_ARCH=sm_80
   EOT
 }

@@ -39,9 +39,9 @@ resource "google_compute_instance" "pg_cuvs_dev" {
   machine_type = var.machine_type
   tags         = ["pg-cuvs-dev"]
 
-  # L4 GPU
+  # GPU (A100 default; see variables.tf accelerator_type)
   guest_accelerator {
-    type  = "nvidia-l4"
+    type  = var.accelerator_type
     count = 1
   }
 
