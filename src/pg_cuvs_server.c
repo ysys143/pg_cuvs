@@ -502,7 +502,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     char index_dir[256] = {0};
     if (recv_all(client_fd, index_dir, sizeof(index_dir)) < 0)
     {
-        DBG("[handle_build] recv index_dir FAILED errno=%d\n", errno);
+        fprintf(stderr, "[handle_build] recv index_dir FAILED errno=%d\n", errno);
         send_error(client_fd, "recv index_dir failed");
         return;
     }
@@ -516,7 +516,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
     if (shm_fd < 0)
     {
-        DBG("[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno));
+        fprintf(stderr, "[handle_build] shm_open FAILED errno=%d (%s)\n", errno, strerror(errno));
         send_error(client_fd, "shm_open failed");
         return;
     }
@@ -565,7 +565,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     CuvsCagraIndex handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim);
     if (!handle)
     {
-        DBG("[handle_build] cuvs_cagra_build returned NULL\n");
+        fprintf(stderr, "[handle_build] cuvs_cagra_build returned NULL\n");
         pthread_mutex_unlock(&g_index_mutex);
         munmap(mem, total);
         send_error(client_fd, "cuvs_cagra_build failed");
@@ -626,7 +626,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         fclose(f);
         DBG("[handle_build] tids written to %s\n", tids_path);
     } else {
-        DBG("[handle_build] fopen tids FAILED errno=%d (%s)\n", errno, strerror(errno));
+        fprintf(stderr, "[handle_build] fopen tids FAILED errno=%d (%s)\n", errno, strerror(errno));
     }
 
     pthread_mutex_unlock(&g_index_mutex);
