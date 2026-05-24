@@ -76,44 +76,38 @@ ssh ubuntu@$IP "sudo tail -3 /var/log/pg_cuvs_setup.log"
 - PostgreSQL 16 (PGDG repo) + postgresql-server-dev-16
 - pgvector 0.8.0 (소스 빌드 + install)
 
-## 5. PG role + 권한 설정
-
-```bash
-ssh ubuntu@$IP "
-sudo -u postgres createuser -s ubuntu
-sudo -u postgres createdb ubuntu
-sudo chmod o+x /home/ubuntu
-sudo chmod o+x /home/ubuntu/miniforge3
-sudo chmod o+x /home/ubuntu/miniforge3/envs
-sudo chmod o+x /home/ubuntu/miniforge3/envs/cuvs_dev
-sudo chmod o+x /home/ubuntu/miniforge3/envs/cuvs_dev/lib
-"
-```
-
-postgres 유저가 conda env까지 traverse 가능해야 .so 로드 시 rpath가 동작함.
-
-## 6. libstdc++ + libgcc_s 심볼릭 링크 (핵심)
-
-```bash
-ssh ubuntu@$IP "
-sudo ln -sf /home/ubuntu/miniforge3/envs/cuvs_dev/lib/libstdc++.so.6 /usr/local/lib/libstdc++.so.6
-sudo ln -sf /home/ubuntu/miniforge3/envs/cuvs_dev/lib/libgcc_s.so.1 /usr/local/lib/libgcc_s.so.1
-sudo ldconfig
-sudo systemctl restart postgresql
-"
-```
-
-**중요**: 이 두 파일만 링크하라. 디렉터리 전체를 ldconfig에 등록하면 VM이 망가진다 (troubleshooting.md의 "ldconfig 사고" 참조).
-
-## 7. 빌드 + 설치 + 검증
+## 5. 빌드 + 설치
 
 ```bash
 make sync         # 로컬 → VM rsync
 make gpu-build    # nvcc + PGXS 빌드
 make gpu-install  # sudo make install
 make gpu-server   # 데몬 바이너리 빌드 + 설치
+```
 
-# 검증
+## 6. Post-install 설정 (한 번에)
+
+```bash
+make gpu-postinstall
+```
+
+`infra/scripts/postinstall.sh`를 VM에서 idempotent하게 실행한다. 내용:
+- PG role/db 생성 (ubuntu superuser)
+- conda env까지 `chmod o+x` traverse 권한 (postgres 유저가 .so rpath 따라가야 함)
+- `libstdc++.so.6` + `libgcc_s.so.1`만 `/usr/local/lib`에 심볼릭 링크 후 ldconfig
+- **`shared_preload_libraries = 'pg_cuvs'` 설정** (첫 쿼리 planning 95ms -> 0.4ms, ADR-018)
+- postgresql restart
+
+**중요**: libstdc++/libgcc_s 두 파일만 링크하라. conda env lib 디렉터리 전체를 ldconfig에 등록하면 VM이 망가진다 (troubleshooting.md의 "ldconfig 사고" 참조). postinstall.sh는 이 두 파일만 건드린다.
+
+**왜 shared_preload_libraries인가**: libcuvs.so는 812MB라 백엔드가 처음 dlopen할 때 planning이 ~95ms 걸린다. postmaster가 시작 시 한 번 로드하면 모든 백엔드가 fork로 매핑을 상속해 첫 쿼리부터 pgvector 수준(<1ms)이 된다 (PG-Strom과 동일 패턴).
+
+## 7. 검증
+
+```bash
+ssh ubuntu@$IP "psql -d postgres -c 'SHOW shared_preload_libraries;'"
+# pg_cuvs 출력 확인
+
 ssh ubuntu@$IP "psql -d postgres -c 'CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION pg_cuvs; SELECT amname FROM pg_am WHERE amname=\\\$\\\$cagra\\\$\\\$;'"
 # cagra 출력되면 OK
 ```

@@ -144,36 +144,11 @@ gpu-server:
 
 # Idempotent post-install: home traversal perms, libstdc++ symlinks,
 # PG role, and shared_preload_libraries setup. Run once after gpu-install.
+# The script is piped over stdin (bash -s) rather than inlined to avoid
+# fragile nested quoting; plain ssh (no -tt) since it needs no remote TTY.
 gpu-postinstall:
-	ssh -tt $(GCP_VM) '\
-		set -e; \
-		echo "--- chmod traversal (postgres -> conda env) ---"; \
-		sudo chmod o+x /home/ubuntu /home/ubuntu/miniforge3 \
-			/home/ubuntu/miniforge3/envs /home/ubuntu/miniforge3/envs/$(CONDA_ENV) \
-			/home/ubuntu/miniforge3/envs/$(CONDA_ENV)/lib; \
-		echo "--- libstdc++ + libgcc_s symlinks (system-wide) ---"; \
-		sudo ln -sf /home/ubuntu/miniforge3/envs/$(CONDA_ENV)/lib/libstdc++.so.6 \
-			/usr/local/lib/libstdc++.so.6; \
-		sudo ln -sf /home/ubuntu/miniforge3/envs/$(CONDA_ENV)/lib/libgcc_s.so.1 \
-			/usr/local/lib/libgcc_s.so.1; \
-		sudo ldconfig; \
-		echo "--- PG role + db for ubuntu user ---"; \
-		sudo -u postgres createuser -s ubuntu 2>/dev/null || true; \
-		sudo -u postgres createdb ubuntu 2>/dev/null || true; \
-		echo "--- shared_preload_libraries = pg_cuvs ---"; \
-		PG_CONF=$$(sudo -u postgres find /etc/postgresql/16 -name postgresql.conf); \
-		if ! sudo grep -qE "^shared_preload_libraries\s*=\s*.*pg_cuvs" $$PG_CONF; then \
-			sudo sed -i "/^#\?shared_preload_libraries/d" $$PG_CONF; \
-			echo "shared_preload_libraries = '"'"'pg_cuvs'"'"'" | sudo tee -a $$PG_CONF >/dev/null; \
-			echo "Added shared_preload_libraries to $$PG_CONF"; \
-		else \
-			echo "shared_preload_libraries already set"; \
-		fi; \
-		echo "--- restart PostgreSQL ---"; \
-		sudo systemctl restart postgresql; \
-		echo "--- verify ---"; \
-		psql -d postgres -c "SHOW shared_preload_libraries;" || true; \
-		echo "DONE"'
+	CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" \
+		< infra/scripts/postinstall.sh
 
 gpu-server-start:
 	ssh -tt $(GCP_VM) "pg_cuvs_server \
