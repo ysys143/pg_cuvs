@@ -355,6 +355,17 @@ cuvs_beginscan(Relation rel, int nkeys, int norderbys)
     IndexScanDesc scan = RelationGetIndexScan(rel, nkeys, norderbys);
     CuvsScanState *ss  = palloc0(sizeof(CuvsScanState));
     scan->opaque = ss;
+
+    /* RelationGetIndexScan does NOT allocate xs_orderbyvals/xs_orderbynulls;
+     * an amcanorderbyop AM must allocate them itself (as pgvector does). The
+     * executor's ORDER BY reorder path reads these arrays, so leaving them
+     * uninitialized makes it dereference garbage -- a non-deterministic
+     * segfault (it may survive one scan and crash the next). */
+    if (scan->numberOfOrderBys > 0)
+    {
+        scan->xs_orderbyvals  = palloc0(sizeof(Datum) * scan->numberOfOrderBys);
+        scan->xs_orderbynulls = palloc0(sizeof(bool) * scan->numberOfOrderBys);
+    }
     return scan;
 }
 

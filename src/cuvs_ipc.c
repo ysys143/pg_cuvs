@@ -261,7 +261,6 @@ cuvs_ipc_search(
     if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
     {
         int n = (int)hdr.n_results;
-        fprintf(stderr, "[ipcsearch-dbg] hdr.n_results=%d requested_k=%d\n", n, k);
         /* Defensive: never write more than the caller's k-sized buffers. */
         int n_write = (n > k) ? k : n;
         CuvsResult *results = malloc(n * sizeof(CuvsResult));
