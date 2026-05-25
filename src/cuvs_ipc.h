@@ -130,22 +130,4 @@ int cuvs_ipc_build(
     const char    *index_dir   /* daemon saves index here */
 );
 
-/* ----------------------------------------------------------------
- * Circuit breaker state (per index, process-local)
- * ---------------------------------------------------------------- */
-#define CUVS_MAX_TRACKED_INDEXES 64
-
-typedef struct CuvsCircuitBreaker {
-    uint32_t index_oid;
-    int      consecutive_errors;
-    int      open;              /* 1 = tripped, routing to CPU */
-} CuvsCircuitBreaker;
-
-/* Defined in cuvs_ipc.c */
-extern CuvsCircuitBreaker cuvs_circuit_breakers[CUVS_MAX_TRACKED_INDEXES];
-extern int                cuvs_n_circuit_breakers;
-
-void cuvs_circuit_record_error(uint32_t index_oid, int threshold);
-void cuvs_circuit_record_success(uint32_t index_oid); /* reset consecutive_errors */
-void cuvs_circuit_reset(uint32_t index_oid);          /* also clears open flag */
-int  cuvs_circuit_is_open(uint32_t index_oid);
+/* Circuit breaker state machine moved to cuvs_util.h (structural commit). */

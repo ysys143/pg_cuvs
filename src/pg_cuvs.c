@@ -30,6 +30,7 @@
 
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"
+#include "cuvs_util.h"
 
 PG_MODULE_MAGIC;
 
@@ -246,8 +247,8 @@ cuvs_build_callback(Relation index,
 
     /* Encode TID as block<<16|offset */
     bs->tids[bs->n_vecs] =
-        ((uint64_t)ItemPointerGetBlockNumber(tid) << 16) |
-        (uint64_t)ItemPointerGetOffsetNumber(tid);
+        cuvs_tid_encode(ItemPointerGetBlockNumber(tid),
+                        ItemPointerGetOffsetNumber(tid));
 
     bs->n_vecs++;
 }
@@ -495,8 +496,9 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         return false;
 
     uint64_t tid     = ss->tids[ss->cur];
-    uint32_t blk     = (uint32_t)(tid >> 16);
-    uint16_t offset  = (uint16_t)(tid & 0xFFFF);
+    uint32_t blk;
+    uint16_t offset;
+    cuvs_tid_decode(tid, &blk, &offset);
     ss->cur++;
 
     ItemPointerSet(&scan->xs_heaptid, blk, offset);

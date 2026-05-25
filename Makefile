@@ -20,7 +20,7 @@ REGRESS_OPTS   = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_wrapper.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -62,8 +62,8 @@ src/cuvs_wrapper.bc: src/cuvs_wrapper.cu
 # ---- pg_cuvs_server binary -----------------------------------------------
 # Standalone GPU daemon — NOT a PostgreSQL extension, no PGXS involvement.
 # Links against libcuvs + libcudart + libpthread + librt.
-SERVER_SRCS    = src/pg_cuvs_server.c src/cuvs_ipc.c
-SERVER_OBJS    = src/pg_cuvs_server.o src/cuvs_ipc.o
+SERVER_SRCS    = src/pg_cuvs_server.c src/cuvs_ipc.c src/cuvs_util.c
+SERVER_OBJS    = src/pg_cuvs_server.o src/cuvs_ipc.o src/cuvs_util.o
 SERVER_BIN     = pg_cuvs_server
 
 CC             ?= gcc
@@ -75,7 +75,7 @@ SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -lstdc++ \
                  -lpthread -lrt
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
-src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_wrapper.h
+src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
 # cuvs_ipc.o for server (same source, no PG headers needed)
@@ -83,7 +83,12 @@ src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_wrapper.h
 src/cuvs_ipc_server.o: src/cuvs_ipc.c src/cuvs_ipc.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_wrapper.o
+# cuvs_util.o for server (same source, no PG headers needed)
+# Note: PGXS also builds cuvs_util.o for the .so; use a separate target.
+src/cuvs_util_server.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_wrapper.o
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -92,6 +97,17 @@ install-server: server
 	install -m 755 $(SERVER_BIN) $(shell $(PG_CONFIG) --bindir)/
 
 .PHONY: server install-server
+
+# ---- Local unit tests ----------------------------------------------------
+# No-framework unit tests for the dependency-free helpers in cuvs_util.c.
+# Deliberately independent of PGXS/pg_config/CUDA so it runs on a laptop.
+# librt exists on Linux (CI/VM) but not macOS — link it only where present.
+TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
+test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
+	$(CC) -I src -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
+	./test-unit
+
+.PHONY: test-unit
 
 # ---- GCP remote orchestration ------------------------------------------
 # Load .env.gpu (gitignored) for GCP_VM, GCP_INSTANCE, GCP_ZONE, etc.

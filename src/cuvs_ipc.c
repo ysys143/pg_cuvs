@@ -31,74 +31,7 @@
 #include <fcntl.h>
 #include <time.h>
 
-/* ----------------------------------------------------------------
- * Circuit breaker state (process-local)
- * ---------------------------------------------------------------- */
-CuvsCircuitBreaker cuvs_circuit_breakers[CUVS_MAX_TRACKED_INDEXES];
-int                cuvs_n_circuit_breakers = 0;
-
-static CuvsCircuitBreaker *
-find_or_create_breaker(uint32_t index_oid)
-{
-    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
-        if (cuvs_circuit_breakers[i].index_oid == index_oid)
-            return &cuvs_circuit_breakers[i];
-
-    if (cuvs_n_circuit_breakers < CUVS_MAX_TRACKED_INDEXES)
-    {
-        CuvsCircuitBreaker *b = &cuvs_circuit_breakers[cuvs_n_circuit_breakers++];
-        b->index_oid        = index_oid;
-        b->consecutive_errors = 0;
-        b->open             = 0;
-        return b;
-    }
-    return NULL;
-}
-
-void
-cuvs_circuit_record_error(uint32_t index_oid, int threshold)
-{
-    CuvsCircuitBreaker *b = find_or_create_breaker(index_oid);
-    if (!b)
-        return;
-    b->consecutive_errors++;
-    if (b->consecutive_errors >= threshold)
-        b->open = 1;
-}
-
-void
-cuvs_circuit_record_success(uint32_t index_oid)
-{
-    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
-        if (cuvs_circuit_breakers[i].index_oid == index_oid)
-        {
-            cuvs_circuit_breakers[i].consecutive_errors = 0;
-            return;
-        }
-}
-
-void
-cuvs_circuit_reset(uint32_t index_oid)
-{
-    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
-    {
-        if (cuvs_circuit_breakers[i].index_oid == index_oid)
-        {
-            cuvs_circuit_breakers[i].consecutive_errors = 0;
-            cuvs_circuit_breakers[i].open = 0;
-            return;
-        }
-    }
-}
-
-int
-cuvs_circuit_is_open(uint32_t index_oid)
-{
-    for (int i = 0; i < cuvs_n_circuit_breakers; i++)
-        if (cuvs_circuit_breakers[i].index_oid == index_oid)
-            return cuvs_circuit_breakers[i].open;
-    return 0;
-}
+/* Circuit breaker state machine moved to cuvs_util.c (structural commit). */
 
 /* ----------------------------------------------------------------
  * Socket helpers

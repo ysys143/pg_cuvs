@@ -17,6 +17,7 @@
  */
 
 #include "cuvs_ipc.h"
+#include "cuvs_util.h"
 #include "cuvs_wrapper.h"
 
 #include <stdio.h>
@@ -261,15 +262,9 @@ startup_load_indexes(void)
     while ((ent = readdir(dir)) != NULL)
     {
         uint32_t db_oid, index_oid;
-        /* Parse filenames of the form "<db_oid>_<index_oid>.cagra".
-         * sscanf returns conversion count regardless of literal match — must
-         * also verify suffix to avoid double-loading on .tids files. */
-        size_t namelen = strlen(ent->d_name);
-        const char *suffix = ".cagra";
-        size_t suflen = strlen(suffix);
-        if (namelen <= suflen) continue;
-        if (strcmp(ent->d_name + namelen - suflen, suffix) != 0) continue;
-        if (sscanf(ent->d_name, "%u_%u.cagra", &db_oid, &index_oid) == 2)
+        /* Parse filenames of the form "<db_oid>_<index_oid>.cagra" (also
+         * rejects .tids files). See cuvs_parse_index_filename. */
+        if (cuvs_parse_index_filename(ent->d_name, &db_oid, &index_oid) == 0)
             load_index(db_oid, index_oid);
     }
     closedir(dir);

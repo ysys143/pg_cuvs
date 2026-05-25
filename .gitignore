@@ -20,6 +20,9 @@ build/
 *.so
 *.bc
 src/*.o
+
+# Local unit-test binary
+/test-unit
 test/results/
 test/regression.diffs
 test/regression.out
