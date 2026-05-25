@@ -1,0 +1,228 @@
+-- edge_cases.sql — adversarial edge cases for the cagra AM.
+--
+-- Philosophy (why these assertions): CAGRA is an APPROXIMATE index, so the
+-- exact id ordering of a GPU scan is not guaranteed even on tiny inputs (note
+-- smoke.sql only asserts ids via the CPU fallback, never the GPU path). So this
+-- suite asserts:
+--   * crash-safety   -> COUNT(*) of a bounded result (deterministic row count),
+--   * error paths    -> the exact error message,
+--   * fallback ids   -> with enable_cuvs=off (CPU exact, deterministic).
+-- GPU recall is the benchmark's job, not this suite's.
+--
+-- NO \set ON_ERROR_STOP: several cases intentionally raise errors that must be
+-- captured in the expected output while the script continues. Requires a
+-- running pg_cuvs_server and a daemon-writable cuvs.index_dir.
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- ============================================================================
+-- Base table + cagra index. Force the GPU path for the COUNT cases by turning
+-- off seqscan/bitmapscan so the planner must use the cagra ordering index.
+-- ============================================================================
+CREATE TABLE ec (id bigint, embedding vector(4));
+INSERT INTO ec VALUES
+    (1, '[1,0,0,0]'),   (2, '[0,1,0,0]'),
+    (3, '[0,0,1,0]'),   (4, '[0,0,0,1]'),
+    (5, '[1,1,0,0]'),   (6, '[1,0,1,0]'),
+    (7, '[1,1,1,0]'),   (8, '[1,1,1,1]');
+CREATE INDEX ec_cagra ON ec USING cagra (embedding vector_l2_ops);
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+-- ---- NULL query vector: must NOT crash. gettuple returns false -> 0 rows. ----
+SELECT count(*) AS null_query_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> NULL::vector LIMIT 5) s;
+
+-- ---- Zero-norm query vector: valid L2 distances, returns neighbors. ----
+SELECT count(*) AS zero_query_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,0,0,0]'::vector LIMIT 5) s;
+
+-- ---- NaN / Inf query components: must NOT crash; lock the row count. ----
+SELECT count(*) AS nan_query_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> 'NaN,NaN,NaN,NaN'::vector LIMIT 5) s;
+SELECT count(*) AS inf_query_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> 'Infinity,0,0,0'::vector LIMIT 5) s;
+
+-- ---- LIMIT boundaries ----
+SELECT count(*) AS limit0_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 0) s;
+SELECT count(*) AS limit1_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1) s;
+-- k > N: only 8 rows exist, asking for 50 returns 8.
+SELECT count(*) AS k_gt_n_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 50) s;
+-- No LIMIT: full scan returns all rows the GPU top-k produced.
+SELECT count(*) AS no_limit_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector) s;
+
+-- ---- Dimension mismatch: query dim != index dim -> clear ERROR. ----
+SELECT id FROM ec ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 3;
+
+-- ---- Multiple ORDER BY distance keys: must not crash. ----
+SELECT count(*) AS multi_orderby_rows
+FROM (SELECT id FROM ec
+      ORDER BY embedding <-> '[1,0,0,0]'::vector, embedding <-> '[0,0,0,1]'::vector
+      LIMIT 4) s;
+
+-- ---- Rescan via LATERAL join: inner cagra scan is re-executed per outer row.
+--      This exercises cuvs_rescan (state reset between scans). ----
+SELECT v.qid, count(*) AS per_query_rows
+FROM (VALUES (1, '[1,0,0,0]'::vector), (2, '[0,0,0,1]'::vector)) AS v(qid, q)
+CROSS JOIN LATERAL (SELECT id FROM ec ORDER BY embedding <-> v.q LIMIT 3) s
+GROUP BY v.qid ORDER BY v.qid;
+
+-- ---- Same scan re-run many times in one session (segfault regression: the
+--      original crash hit the 2nd scan in a backend). ----
+SELECT count(*) FROM (SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5) s;
+SELECT count(*) FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,1,0,0]'::vector LIMIT 5) s;
+SELECT count(*) FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,0,1,0]'::vector LIMIT 5) s;
+SELECT count(*) FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,0,0,1]'::vector LIMIT 5) s;
+
+-- ---- Scrollable cursor: FETCH forward + backward must not crash. ----
+BEGIN;
+DECLARE c SCROLL CURSOR FOR
+    SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 6;
+FETCH 3 FROM c;
+FETCH BACKWARD 2 FROM c;
+FETCH 3 FROM c;
+CLOSE c;
+COMMIT;
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- ============================================================================
+-- k=100 cap (KNOWN LIMITATION): the GPU search hardcodes k=100, so even a
+-- larger LIMIT returns at most 100 rows. This test LOCKS that behavior.
+-- ============================================================================
+CREATE TABLE ec_big (id bigint, embedding vector(4));
+INSERT INTO ec_big
+SELECT g, ('[' || g || ',' || (g%7) || ',' || (g%5) || ',' || (g%3) || ']')::vector
+FROM generate_series(1, 300) g;
+CREATE INDEX ec_big_cagra ON ec_big USING cagra (embedding vector_l2_ops);
+
+SET enable_seqscan = off;
+-- LIMIT 250 but k is capped at 100 internally -> at most 100 rows.
+SELECT count(*) AS k_cap_rows
+FROM (SELECT id FROM ec_big ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 250) s;
+RESET enable_seqscan;
+
+-- ============================================================================
+-- Empty table and single-row table.
+-- ============================================================================
+CREATE TABLE ec_empty (id bigint, embedding vector(4));
+-- CREATE INDEX on an empty table: backend short-circuits (no daemon build),
+-- producing an empty index. Must succeed.
+CREATE INDEX ec_empty_cagra ON ec_empty USING cagra (embedding vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS empty_table_rows
+FROM (SELECT id FROM ec_empty ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5) s;
+RESET enable_seqscan;
+
+CREATE TABLE ec_one (id bigint, embedding vector(4));
+INSERT INTO ec_one VALUES (1, '[1,0,0,0]');
+CREATE INDEX ec_one_cagra ON ec_one USING cagra (embedding vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS single_row_rows
+FROM (SELECT id FROM ec_one ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5) s;
+RESET enable_seqscan;
+
+-- ============================================================================
+-- Extreme dimensions: minimum vector(1) and high vector(2000).
+-- ============================================================================
+CREATE TABLE ec_d1 (id bigint, embedding vector(1));
+INSERT INTO ec_d1 VALUES (1, '[1]'), (2, '[5]'), (3, '[9]');
+CREATE INDEX ec_d1_cagra ON ec_d1 USING cagra (embedding vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS dim1_rows
+FROM (SELECT id FROM ec_d1 ORDER BY embedding <-> '[4]'::vector LIMIT 3) s;
+RESET enable_seqscan;
+
+CREATE TABLE ec_d2000 (id bigint, embedding vector(2000));
+INSERT INTO ec_d2000
+SELECT g, (SELECT '[' || string_agg((((g+i)%10))::text, ',') || ']'
+           FROM generate_series(1, 2000) i)::vector
+FROM generate_series(1, 20) g;
+CREATE INDEX ec_d2000_cagra ON ec_d2000 USING cagra (embedding vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS dim2000_rows
+FROM (SELECT id FROM ec_d2000
+      ORDER BY embedding <-> (SELECT '[' || string_agg('5', ',') || ']' FROM generate_series(1,2000))::vector
+      LIMIT 5) s;
+RESET enable_seqscan;
+
+-- ============================================================================
+-- Pathological data: duplicate vectors and NULL embeddings.
+-- ============================================================================
+CREATE TABLE ec_dup (id bigint, embedding vector(4));
+INSERT INTO ec_dup SELECT g, '[1,0,0,0]'::vector FROM generate_series(1, 20) g;
+INSERT INTO ec_dup VALUES (99, '[0,0,0,1]');
+CREATE INDEX ec_dup_cagra ON ec_dup USING cagra (embedding vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS dup_rows
+FROM (SELECT id FROM ec_dup ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 10) s;
+RESET enable_seqscan;
+
+-- NULL embeddings in the indexed column (build skips NULLs).
+CREATE TABLE ec_null (id bigint, embedding vector(4));
+INSERT INTO ec_null VALUES (1, '[1,0,0,0]'), (2, NULL), (3, '[0,1,0,0]'), (4, NULL);
+CREATE INDEX ec_null_cagra ON ec_null USING cagra (embedding vector_l2_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS null_embedding_rows
+FROM (SELECT id FROM ec_null ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5) s;
+RESET enable_seqscan;
+
+-- ============================================================================
+-- Operator class / metric coverage: cosine (<=>) and inner product (<#>).
+-- Locks that build+query on these opclasses do not crash (metric caveat:
+-- build hardcodes L2; on normalized data L2 ranking == cosine ranking).
+-- ============================================================================
+CREATE TABLE ec_cos (id bigint, embedding vector(4));
+INSERT INTO ec_cos VALUES
+    (1, '[1,0,0,0]'), (2, '[0,1,0,0]'), (3, '[0,0,1,0]'), (4, '[0,0,0,1]');
+CREATE INDEX ec_cos_cagra ON ec_cos USING cagra (embedding vector_cosine_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS cosine_rows
+FROM (SELECT id FROM ec_cos ORDER BY embedding <=> '[1,0,0,0]'::vector LIMIT 3) s;
+RESET enable_seqscan;
+
+CREATE TABLE ec_ip (id bigint, embedding vector(4));
+INSERT INTO ec_ip VALUES
+    (1, '[1,0,0,0]'), (2, '[0,1,0,0]'), (3, '[0,0,1,0]'), (4, '[0,0,0,1]');
+CREATE INDEX ec_ip_cagra ON ec_ip USING cagra (embedding vector_ip_ops);
+SET enable_seqscan = off;
+SELECT count(*) AS ip_rows
+FROM (SELECT id FROM ec_ip ORDER BY embedding <#> '[1,0,0,0]'::vector LIMIT 3) s;
+RESET enable_seqscan;
+
+-- ============================================================================
+-- DDL churn: DROP INDEX, REINDEX, VACUUM, enable_cuvs toggle. All must keep
+-- queries working (via the cagra path or the CPU fallback).
+-- ============================================================================
+-- DROP INDEX -> query now uses seqscan (CPU exact). Deterministic top-1.
+DROP INDEX ec_cagra;
+SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
+-- Recreate, then REINDEX (rebuilds via daemon).
+CREATE INDEX ec_cagra ON ec USING cagra (embedding vector_l2_ops);
+REINDEX INDEX ec_cagra;
+VACUUM ANALYZE ec;
+SET enable_seqscan = off;
+SELECT count(*) AS after_reindex_rows
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5) s;
+RESET enable_seqscan;
+
+-- enable_cuvs toggle: off forces the CPU path (cost 1e9 on the cagra index).
+-- CPU exact gives a deterministic top-1 = id 1 for query [1,0.1,0,0].
+SET enable_cuvs = off;
+SELECT id FROM ec ORDER BY embedding <-> '[1,0.1,0,0]'::vector LIMIT 1;
+SET enable_cuvs = on;
+
+-- ============================================================================
+-- Cleanup
+-- ============================================================================
+DROP TABLE ec, ec_big, ec_empty, ec_one, ec_d1, ec_d2000, ec_dup, ec_null,
+           ec_cos, ec_ip;
+DROP EXTENSION pg_cuvs;

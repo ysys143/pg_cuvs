@@ -381,6 +381,16 @@ cuvs_rescan(IndexScanDesc scan, ScanKey keys, int nkeys,
     if (ss->tids)      { pfree(ss->tids);      ss->tids      = NULL; }
     if (ss->distances) { pfree(ss->distances);  ss->distances = NULL; }
 
+    /* Clear the ORDER BY output arrays so a rescan (cursor MOVE/re-FETCH)
+     * never reads distances left over from the previous scan. gettuple
+     * re-seeds [0] before any read, but resetting here keeps the invariant
+     * explicit. */
+    if (scan->numberOfOrderBys > 0 && scan->xs_orderbyvals != NULL)
+    {
+        memset(scan->xs_orderbyvals, 0, sizeof(Datum) * scan->numberOfOrderBys);
+        memset(scan->xs_orderbynulls, 0, sizeof(bool) * scan->numberOfOrderBys);
+    }
+
     if (keys && scan->numberOfKeys > 0)
         memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
     if (orderbys && scan->numberOfOrderBys > 0)
@@ -413,10 +423,27 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
             return false;
 
+        /* A NULL query vector (e.g. `embedding <-> NULL`) has no neighbors.
+         * Returning false routes the scan to the CPU fallback instead of
+         * dereferencing a NULL Datum in DatumGetPgVector below (crash). */
+        if (scan->orderByData[0].sk_flags & SK_ISNULL)
+            return false;
+
         Datum query_datum = scan->orderByData[0].sk_argument;
         PgVector *qvec    = DatumGetPgVector(query_datum);
         int       dim     = (int)qvec->dim;
         int       k       = 100;  /* default top-k; TODO: planner hint */
+
+        /* Dimension mismatch between query and index is a user error; report
+         * it clearly here rather than letting the daemon fail with a generic
+         * status. The index column's declared vector(N) dimension is carried
+         * in its atttypmod (-1 when unknown -> skip the check). */
+        int idx_dim = TupleDescAttr(RelationGetDescr(scan->indexRelation), 0)->atttypmod;
+        if (idx_dim > 0 && dim != idx_dim)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_EXCEPTION),
+                     errmsg("pg_cuvs: query vector dim %d does not match index dim %d",
+                            dim, idx_dim)));
 
         ss->tids      = palloc(k * sizeof(uint64_t));
         ss->distances = palloc(k * sizeof(float));
@@ -532,6 +559,13 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
          * are monotonic with the true <-> distance, so ordering (and recall)
          * is correct without paying a per-tuple recompute. */
         scan->xs_recheckorderby  = false;
+
+        /* We only produce a distance for the first ORDER BY key. If a query
+         * supplies more than one (e.g. two <-> operators on this column), mark
+         * the rest NULL rather than leaving them holding stale/zero Datums that
+         * the executor's reorder comparison would read. */
+        for (int i = 1; i < scan->numberOfOrderBys; i++)
+            scan->xs_orderbynulls[i] = true;
     }
     ss->cur++;
 

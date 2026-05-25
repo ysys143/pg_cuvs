@@ -622,6 +622,27 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     }
     LOG_DEBUG("[handle_build] got index_dir=%s\n", index_dir);
 
+    /* Reject degenerate or overflowing payload sizes before any allocation.
+     * n_vecs*dim*4 can wrap size_t on a 32-bit-ish product (e.g. n_vecs ~2^31,
+     * dim ~2^20), producing a tiny mmap that the build then reads past. */
+    if (cmd->n_vecs <= 0 || cmd->dim == 0)
+    {
+        LOG_ERROR("[handle_build] invalid payload n_vecs=%lld dim=%u\n",
+                  (long long)cmd->n_vecs, cmd->dim);
+        send_error(client_fd, "invalid build payload (empty n_vecs/dim)");
+        return;
+    }
+    {
+        size_t per_vec = (size_t)cmd->dim * sizeof(float) + sizeof(uint64_t);
+        if ((size_t)cmd->n_vecs > SIZE_MAX / per_vec)
+        {
+            LOG_ERROR("[handle_build] payload size overflow n_vecs=%lld dim=%u\n",
+                      (long long)cmd->n_vecs, cmd->dim);
+            send_error(client_fd, "build payload size overflow");
+            return;
+        }
+    }
+
     size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
     size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
     size_t total     = vec_bytes + tid_bytes;
