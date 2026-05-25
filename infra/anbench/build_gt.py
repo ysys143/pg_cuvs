@@ -31,8 +31,8 @@ def main():
     ap.add_argument("--n", type=int, required=True, help="use first N corpus rows")
     ap.add_argument("--k", type=int, default=100)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--tile", type=int, default=1_000_000)
-    ap.add_argument("--qbatch", type=int, default=2000)
+    ap.add_argument("--tile", type=int, default=250_000)
+    ap.add_argument("--qbatch", type=int, default=1000)
     args = ap.parse_args()
 
     if os.path.exists(args.out):
@@ -63,10 +63,12 @@ def main():
             sims = q_gpu[qs:qe] @ tile_gpu.T         # (qb, T) dot == similarity
             qb = qe - qs
             kk = min(k, te - ts)
-            # top-kk per row within this tile
-            part = cp.argpartition(-sims, kk - 1, axis=1)[:, :kk]
+            # top-kk LARGEST per row, in-place on sims (no -sims 8GB copy):
+            # argpartition puts the kk largest at the end.
+            part = cp.argpartition(sims, sims.shape[1] - kk, axis=1)[:, -kk:]
             cand_sim = cp.take_along_axis(sims, part, axis=1)
             cand_id = (part + ts).astype(cp.int64)
+            del sims
             # merge with running best: concat then re-top-k
             msim = cp.concatenate([best_sim[qs:qe], cand_sim], axis=1)
             mid = cp.concatenate([best_id[qs:qe], cand_id], axis=1)
