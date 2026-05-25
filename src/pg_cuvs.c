@@ -434,17 +434,6 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         int       dim     = (int)qvec->dim;
         int       k       = 100;  /* default top-k; TODO: planner hint */
 
-        /* Dimension mismatch between query and index is a user error; report
-         * it clearly here rather than letting the daemon fail with a generic
-         * status. The index column's declared vector(N) dimension is carried
-         * in its atttypmod (-1 when unknown -> skip the check). */
-        int idx_dim = TupleDescAttr(RelationGetDescr(scan->indexRelation), 0)->atttypmod;
-        if (idx_dim > 0 && dim != idx_dim)
-            ereport(ERROR,
-                    (errcode(ERRCODE_DATA_EXCEPTION),
-                     errmsg("pg_cuvs: query vector dim %d does not match index dim %d",
-                            dim, idx_dim)));
-
         ss->tids      = palloc(k * sizeof(uint64_t));
         ss->distances = palloc(k * sizeof(float));
 
@@ -474,14 +463,24 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
 
         if (rc != CUVS_STATUS_OK)
         {
-            /* Record error for circuit breaker. UNAVAILABLE is not an
-             * index-specific failure, so don't count it toward the breaker. */
-            if (rc != CUVS_STATUS_UNAVAILABLE)
+            /* Record error for circuit breaker. UNAVAILABLE (daemon down) and
+             * DIM_MISMATCH (user error) are not index-specific GPU failures,
+             * so don't count them toward the breaker. */
+            if (rc != CUVS_STATUS_UNAVAILABLE && rc != CUVS_STATUS_DIM_MISMATCH)
                 cuvs_circuit_record_error((uint32_t)index_oid,
                                           cuvs_circuit_breaker_threshold);
 
             switch (rc)
             {
+                case CUVS_STATUS_DIM_MISMATCH:
+                    /* User error: query/index dimension differ. Fail loudly
+                     * like pgvector does, rather than silently returning no
+                     * rows via the CPU fallback. */
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_EXCEPTION),
+                             errmsg("pg_cuvs: query vector dimension %d does not "
+                                    "match the cagra index dimension", dim)));
+                    break;
                 case CUVS_STATUS_UNAVAILABLE:
                     ereport(WARNING,
                             (errmsg("pg_cuvs: pg_cuvs_server unreachable, "

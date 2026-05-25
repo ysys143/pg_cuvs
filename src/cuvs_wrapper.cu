@@ -65,13 +65,20 @@ void release_res(std::unique_ptr<raft::device_resources> r)
     g_res_pool.push_back(std::move(r));
 }
 
-/* RAII: borrow on construction, return to the pool on destruction (incl.
- * exception unwinding). Use `auto& res = pr.get();`. */
+/* RAII: borrow on construction, return to the pool on destruction. If a cuVS
+ * call threw, the stream/handles may carry a sticky error; reusing such a
+ * resource from the pool can abort a later, unrelated request (the whole
+ * daemon, since one process serves every backend). poison() makes the
+ * destructor DESTROY the resource instead of pooling it, so a failed request
+ * cannot corrupt healthy ones. Declare PooledRes OUTSIDE the try block and
+ * call poison() in the catch so it is still alive when the catch runs. */
 struct PooledRes {
     std::unique_ptr<raft::device_resources> r;
+    bool poisoned = false;
     PooledRes() : r(acquire_res()) {}
-    ~PooledRes() { if (r) release_res(std::move(r)); }
+    ~PooledRes() { if (r && !poisoned) release_res(std::move(r)); }
     raft::device_resources &get() { return *r; }
+    void poison() { poisoned = true; }
 };
 
 } // namespace
@@ -133,8 +140,9 @@ cuvs_brute_force_search(
     int               top_k,
     CuvsSearchResult *results)
 {
+    PooledRes _pr;
     try {
-        PooledRes _pr; raft::device_resources &res = _pr.get();
+        raft::device_resources &res = _pr.get();
 
         auto d_corpus = raft::make_device_matrix<float, int64_t>(res, n_corpus, (int64_t)dim);
         raft::copy(d_corpus.data_handle(), corpus_vecs, n_corpus * dim, res.get_stream());
@@ -170,6 +178,7 @@ cuvs_brute_force_search(
         }
         return 0;
     } catch (...) {
+        _pr.poison();
         return 1;
     }
 }
@@ -180,8 +189,9 @@ cuvs_brute_force_search(
 extern "C" CuvsCagraIndex
 cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
 {
+    PooledRes _pr;
     try {
-        PooledRes _pr; raft::device_resources &res = _pr.get();
+        raft::device_resources &res = _pr.get();
 
         /* Upload corpus to device. d_corpus will be moved into the impl
          * struct below so its memory stays alive for the index's lifetime. */
@@ -207,9 +217,11 @@ cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim)
         return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx));
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_build] exception: %s\n", e.what());
+        _pr.poison();
         return nullptr;
     } catch (...) {
         fprintf(stderr, "[cuvs_cagra_build] unknown exception\n");
+        _pr.poison();
         return nullptr;
     }
 }
@@ -228,9 +240,22 @@ cuvs_cagra_search(
     if (!index)
         return 1;
 
+    CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
+
+    /* Guard: a query whose dimension differs from the index dimension makes
+     * cuVS throw a RAFT failure mid-search, and the resulting sticky CUDA
+     * error has aborted the entire daemon (SIGABRT). Refuse it here, before
+     * touching the GPU. Return 2 = dimension mismatch (distinct from 1). */
+    if ((int64_t)dim != impl->idx.dim()) {
+        fprintf(stderr,
+                "[cuvs_cagra_search] dim mismatch: query=%d index=%lld; refusing\n",
+                dim, (long long)impl->idx.dim());
+        return 2;
+    }
+
+    PooledRes _pr;
     try {
-        CuvsCagraIndexImpl *impl = static_cast<CuvsCagraIndexImpl *>(index);
-        PooledRes _pr; raft::device_resources &res = _pr.get();
+        raft::device_resources &res = _pr.get();
 
         auto d_queries = raft::make_device_matrix<float, int64_t>(res, (int64_t)1, (int64_t)dim);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
@@ -269,9 +294,11 @@ cuvs_cagra_search(
         return 0;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_search] exception: %s\n", e.what());
+        _pr.poison();
         return 1;
     } catch (...) {
         fprintf(stderr, "[cuvs_cagra_search] unknown exception\n");
+        _pr.poison();
         return 1;
     }
 }

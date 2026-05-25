@@ -40,6 +40,7 @@
 #define CUVS_STATUS_UNAVAILABLE  4   /* daemon unreachable (connect failed) */
 #define CUVS_STATUS_BUILD_FAILED   5   /* GPU index build failed */
 #define CUVS_STATUS_PERSIST_FAILED 6   /* build OK, disk persist failed */
+#define CUVS_STATUS_DIM_MISMATCH   7   /* query dim != index dim → user error */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)

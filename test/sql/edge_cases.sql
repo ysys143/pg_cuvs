@@ -37,14 +37,10 @@ SELECT count(*) AS null_query_rows
 FROM (SELECT id FROM ec ORDER BY embedding <-> NULL::vector LIMIT 5) s;
 
 -- ---- Zero-norm query vector: valid L2 distances, returns neighbors. ----
+-- (NaN/Inf vectors are rejected by pgvector's input parser before they ever
+-- reach pg_cuvs, so there is nothing for this suite to assert about them.)
 SELECT count(*) AS zero_query_rows
 FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,0,0,0]'::vector LIMIT 5) s;
-
--- ---- NaN / Inf query components: must NOT crash; lock the row count. ----
-SELECT count(*) AS nan_query_rows
-FROM (SELECT id FROM ec ORDER BY embedding <-> 'NaN,NaN,NaN,NaN'::vector LIMIT 5) s;
-SELECT count(*) AS inf_query_rows
-FROM (SELECT id FROM ec ORDER BY embedding <-> 'Infinity,0,0,0'::vector LIMIT 5) s;
 
 -- ---- LIMIT boundaries ----
 SELECT count(*) AS limit0_rows

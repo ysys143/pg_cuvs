@@ -472,6 +472,22 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* Reject a dimension-mismatched query BEFORE it reaches cuVS. cuVS throws
+     * a RAFT failure on mismatch, and the resulting sticky CUDA error has
+     * aborted the entire daemon (SIGABRT), taking down every backend. This is
+     * a user error: distinct status, no CPU fallback. */
+    if (cmd->dim != e->dim)
+    {
+        munmap(query, vec_bytes);
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_DIM_MISMATCH;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "query dim %u does not match index dim %u", cmd->dim, e->dim);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
     int k = (int)cmd->k;
     CuvsSearchResult *raw = malloc(k * sizeof(CuvsSearchResult));
     if (!raw)
@@ -493,8 +509,13 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         free(raw);
         pthread_mutex_unlock(&g_index_mutex);
         CuvsReplyHeader hdr = {0};
-        hdr.status = CUVS_STATUS_OOM_FALLBACK;
-        strncpy(hdr.error, "CAGRA search failed", sizeof(hdr.error) - 1);
+        /* ret==2 is the wrapper's own dim-mismatch guard (defense in depth in
+         * case the pre-check above is ever bypassed). Everything else maps to
+         * OOM_FALLBACK so the backend retries on CPU. */
+        hdr.status = (ret == 2) ? CUVS_STATUS_DIM_MISMATCH : CUVS_STATUS_OOM_FALLBACK;
+        strncpy(hdr.error,
+                (ret == 2) ? "query dim != index dim" : "CAGRA search failed",
+                sizeof(hdr.error) - 1);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
