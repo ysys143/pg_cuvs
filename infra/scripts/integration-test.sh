@@ -458,7 +458,8 @@ SELECT index_name||'|'||metric||'|'||(p99_latency_us >= p50_latency_us)
   FROM pg_stat_gpu_search WHERE index_oid='it_cagra'::regclass;
 SQL
 )
-if echo "$ROW" | grep -q "^it_cagra|l2|t$"; then
+# NB: boolean concatenated via || renders as 'true'/'false' (not the tabular t/f).
+if echo "$ROW" | grep -q "^it_cagra|l2|true$"; then
     pass "stats: view row has index_name=it_cagra, metric=l2, p99>=p50"
 else
     fail "stats: unexpected view row: '$ROW'"
