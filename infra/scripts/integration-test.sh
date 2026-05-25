@@ -14,6 +14,10 @@
 #                       no stray .cagra/.tids left in the test index dir.
 #   3. TIDS_WRITE fault -> same contract as #2.
 #   4. clean run     -> CREATE INDEX succeeds, NN search ordered correctly.
+#   5. registry-full eviction-save -> the 65th CREATE INDEX ERRORs (PERSIST):
+#                       registry is full (MAX_INDEXES=64 resident), evict_lru's
+#                       save_index is forced to fail (CUVS_FAULT_SAVE_INDEX),
+#                       so no slot frees and the build rolls back its persist.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -76,6 +80,7 @@ cleanup() {
     stop_test_daemon
     rm -rf "$TEST_IDX"
     psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
+    psql -d "$DB" -c "DROP TABLE IF EXISTS rf_items;" >/dev/null 2>&1 || true
     echo "[it] restart production pg-cuvs-server"
     sudo systemctl start pg-cuvs-server 2>/dev/null || true
 }
@@ -228,6 +233,119 @@ else
     fail "clean: search errored: $OUT"
 fi
 stop_test_daemon
+
+# --- Scenario 5: registry-full eviction-save -> PERSIST_FAILED ----------
+# Fill the registry to MAX_INDEXES=64 with a clean daemon, then RESTART the
+# daemon with CUVS_FAULT_SAVE_INDEX=1 so it reloads the 64 persisted indexes
+# (registry full again). The 65th CREATE INDEX persists, hits registry-full,
+# calls evict_lru -> save_index -> forced fail -> slot not freed -> the build
+# rolls back its own persist and returns PERSIST_FAILED.
+echo "[it] --- scenario 5: registry-full eviction-save -> PERSIST_FAILED ---"
+MAXI=64
+
+# Fresh test index dir + table dedicated to this scenario (64 tiny indexes on
+# one column => 64 distinct index OIDs => 64 registry slots; VRAM negligible so
+# only the registry-full path can fire, never ensure_vram eviction).
+rm -rf "$TEST_IDX"
+mkdir -p "$TEST_IDX"
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS rf_items;
+CREATE TABLE rf_items (id bigint, embedding vector(4));
+INSERT INTO rf_items VALUES
+  (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,'[0,0,1,0]'),(4,'[0,0,0,1]');
+SQL
+
+# Count *.cagra pairs persisted in the test index dir (one per resident index).
+count_cagra_files() {
+    find "$TEST_IDX" -maxdepth 1 -name '*.cagra' 2>/dev/null | wc -l | tr -d ' '
+}
+# Count rf_idx_* cagra indexes in the catalog.
+count_rf_catalog() {
+    psql -d "$DB" -At -c \
+        "SELECT count(*) FROM pg_class c JOIN pg_am a ON a.oid = c.relam \
+         WHERE a.amname = 'cagra' AND c.relname LIKE 'rf_idx_%';" \
+        2>/dev/null || echo "ERR"
+}
+# True if a named index exists in the catalog.
+rf_index_exists() {
+    local n
+    n=$(psql -d "$DB" -At -c \
+        "SELECT count(*) FROM pg_class WHERE relname = '$1';" 2>/dev/null || echo 0)
+    [ "$n" = "1" ]
+}
+
+# (a) Clean daemon, fill the registry to MAX_INDEXES.
+start_test_daemon
+rf_build_ok=1
+for i in $(seq 1 "$MAXI"); do
+    if ! run_sql "CREATE INDEX rf_idx_$i ON rf_items USING cagra (embedding vector_l2_ops);"; then
+        echo "[it] registry-full: CREATE INDEX rf_idx_$i errored unexpectedly: $OUT"
+        rf_build_ok=0
+        break
+    fi
+done
+if [ "$rf_build_ok" = "1" ] && [ "$(count_rf_catalog)" = "$MAXI" ]; then
+    pass "registry-full: built $MAXI cagra indexes (catalog)"
+else
+    fail "registry-full: expected $MAXI cagra indexes, found $(count_rf_catalog)"
+fi
+# Durability: each succeeded CREATE INDEX persisted a .cagra so the restart can
+# reload it. Require >= MAXI persisted so the reload refills the registry.
+n_persist=$(count_cagra_files)
+if [ "$n_persist" -ge "$MAXI" ]; then
+    pass "registry-full: $n_persist .cagra files persisted (>= $MAXI, restart will refill)"
+else
+    fail "registry-full: only $n_persist .cagra files persisted, need >= $MAXI"
+fi
+stop_test_daemon
+
+# (b) Restart with the fault set. The daemon reloads the persisted indexes,
+# refilling the registry to (at least) MAXI. getenv is read at process start,
+# so the fault MUST be injected at daemon startup -> restart-with-env required.
+start_test_daemon CUVS_FAULT_SAVE_INDEX=1
+n_reloaded=$(count_cagra_files)
+if [ "$n_reloaded" -ge "$MAXI" ]; then
+    pass "registry-full: $n_reloaded indexes resident after fault restart (>= $MAXI)"
+else
+    fail "registry-full: only $n_reloaded resident after restart, need >= $MAXI"
+fi
+
+# (c) The 65th build: persists, registry full, evict_lru -> save_index forced
+# fail -> no slot freed -> rollback -> PERSIST_FAILED.
+if run_sql "CREATE INDEX rf_idx_65 ON rf_items USING cagra (embedding vector_l2_ops);"; then
+    fail "registry-full: 65th CREATE INDEX unexpectedly succeeded"
+else
+    if echo "$OUT" | grep -q "BUILD failed (status 6"; then
+        pass "registry-full: 65th CREATE INDEX ERRORed with status 6 (PERSIST)"
+    elif echo "$OUT" | grep -q "BUILD failed (status"; then
+        fail "registry-full: 65th errored but not status 6 (persist): $OUT"
+    else
+        fail "registry-full: 65th error text unexpected: $OUT"
+    fi
+fi
+# Catalog rolled back: rf_idx_65 must be absent.
+if rf_index_exists rf_idx_65; then
+    fail "registry-full: rf_idx_65 left in catalog (rollback failed)"
+else
+    pass "registry-full: catalog rolled back (rf_idx_65 absent from pg_index)"
+fi
+# Rollback unlinked the 65th's just-persisted artifacts: no rf_idx_65 file pair.
+# (Files are named by OID, so assert the resident count did not grow past the
+# reloaded set — the 65th left nothing behind.)
+n_after=$(count_cagra_files)
+if [ "$n_after" -le "$n_reloaded" ]; then
+    pass "registry-full: 65th left no extra .cagra/.tids ($n_after <= $n_reloaded)"
+else
+    fail "registry-full: stray artifacts after rollback ($n_after > $n_reloaded)"
+fi
+stop_test_daemon
+
+# Cleanup scenario 5: drop the table and purge the 64+ test index files so they
+# do not accumulate. The EXIT trap still restores the production daemon.
+psql -d "$DB" -c "DROP TABLE IF EXISTS rf_items;" >/dev/null 2>&1 || true
+rm -rf "$TEST_IDX"
 
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then

@@ -107,6 +107,9 @@ ls /tmp/cuvs_indexes/*.tmp 2>/dev/null
 sudo journalctl -u pg-cuvs-server --no-pager | grep 'registry full'
 ```
 
+원인 중 하나: registry full (MAX_INDEXES=64 slot이 모두 resident이고 LRU eviction이
+slot을 하나도 비우지 못함 — 예: eviction 대상의 save_index가 실패).
+
 registry full(최대 64개):
 ```sql
 -- 사용하지 않는 cagra 인덱스 조회

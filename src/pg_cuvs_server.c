@@ -127,6 +127,13 @@ static int fsync_path(const char *path);
 static int
 save_index(IndexEntry *e)
 {
+#ifdef CUVS_TEST_HOOKS
+    if (cuvs_fault("CUVS_FAULT_SAVE_INDEX")) {
+        LOG_ERROR("save_index: CUVS_FAULT_SAVE_INDEX -> forced failure for %u/%u\n",
+                e->db_oid, e->index_oid);
+        return -1;
+    }
+#endif
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
     index_file_path(idx_final,  sizeof(idx_final),  g_index_dir, e->db_oid, e->index_oid);
