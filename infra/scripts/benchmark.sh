@@ -28,12 +28,18 @@ RELOAD_TIMEOUT=${RELOAD_TIMEOUT:-120}   # seconds to wait for index requeryable
 
 echo "[bench] params N=$N DIM=$DIM K=$K M=$M IDX_DIR=$IDX_DIR DB=$DB"
 
-# psql wrapper: index_dir GUC set on every connection, stop on error.
+# Set cuvs.index_dir at connection startup via PGOPTIONS instead of an
+# in-band "SET ...;" so it never emits a "SET" status line that would
+# pollute -At captures (e.g. the random query vector). Requires the GUC to
+# be defined at startup, which shared_preload_libraries='pg_cuvs' ensures.
+export PGOPTIONS="-c cuvs.index_dir=$IDX_DIR"
+
+# psql wrapper: stop on error.
 PSQL="psql -d $DB -v ON_ERROR_STOP=1"
 
-# Run a one-shot SQL query (index_dir prefixed), tuples-only unaligned.
+# Run a one-shot SQL query, tuples-only unaligned.
 q() {
-    $PSQL -At -c "SET cuvs.index_dir='$IDX_DIR'; $1"
+    $PSQL -At -c "$1"
 }
 
 # epoch with sub-second resolution; falls back to whole seconds.
@@ -49,7 +55,6 @@ elapsed() { awk "BEGIN{printf \"%.3f\", $2 - $1}"; }
 echo "[bench] generating $N x $DIM random vectors server-side"
 GEN_START=$(now)
 $PSQL >/dev/null <<SQL
-SET cuvs.index_dir='$IDX_DIR';
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 DROP TABLE IF EXISTS bench_items;
@@ -77,7 +82,6 @@ echo "vram_used_mb_before_build: $VRAM_BEFORE"
 echo "[bench] building cagra index"
 BUILD_START=$(now)
 $PSQL >/dev/null <<SQL
-SET cuvs.index_dir='$IDX_DIR';
 CREATE INDEX bench_cagra ON bench_items USING cagra (embedding vector_l2_ops);
 SQL
 BUILD_END=$(now)
@@ -103,23 +107,26 @@ echo "cagra_bytes: $CAGRA_BYTES"
 echo "tids_artifact: ${TIDS_FILE:-NA}"
 echo "tids_bytes: $TIDS_BYTES"
 
-# ---- helper: a random query vector literal of dimension DIM --------------
-# Generated server-side; returns a bracketed vector literal string.
-rand_qvec() {
-    q "SELECT (SELECT array_agg(random()::float4)::vector($DIM) FROM generate_series(1,$DIM))::text;"
-}
-
-QVEC=$(rand_qvec)
+# Inline SQL expression that produces a random DIM-dimensional vector.
+# Used directly inside EXPLAIN/EXPLAIN ANALYZE rather than capturing a
+# giant literal (~4000 chars for dim=384) into the shell, which was the
+# root cause of the degenerate percentile results: the outer subquery call
+# in rand_qvec() was prone to quoting / newline issues in the heredoc and
+# interpolation, causing psql to silently fail and produce only one real
+# Execution Time reading. Embedding the expression inline guarantees a fresh
+# random vector per query without any client-side capture or interpolation.
+RAND_VEC_EXPR="(SELECT array_agg(random()::float4)::vector($DIM) FROM generate_series(1,$DIM))"
 
 # ---- c. cold vs warm planning time --------------------------------------
-# Cold = first EXPLAIN (no analyze) on a fresh connection. Warm = second
-# EXPLAIN reusing the same connection (cached plan/relcache). Capture the
-# "Planning Time" line from each.
+# Use EXPLAIN (SUMMARY ON) to get "Planning Time:" without executing the
+# query. Plain EXPLAIN does NOT emit a Planning Time line; ANALYZE does but
+# runs the query. SUMMARY ON gives planning cost only.
+# Cold = first statement on a fresh connection; warm = second on the same
+# connection (plan cached in relcache).
 echo "[bench] planning time cold/warm"
 PLAN_OUT=$($PSQL -X <<SQL
-SET cuvs.index_dir='$IDX_DIR';
-EXPLAIN SELECT id FROM bench_items ORDER BY embedding <-> '$QVEC'::vector LIMIT $K;
-EXPLAIN SELECT id FROM bench_items ORDER BY embedding <-> '$QVEC'::vector LIMIT $K;
+EXPLAIN (SUMMARY ON) SELECT id FROM bench_items ORDER BY embedding <-> $RAND_VEC_EXPR LIMIT $K;
+EXPLAIN (SUMMARY ON) SELECT id FROM bench_items ORDER BY embedding <-> $RAND_VEC_EXPR LIMIT $K;
 SQL
 )
 COLD_PLAN=$(echo "$PLAN_OUT" | grep -i "Planning Time" | sed -n '1p' | grep -oE '[0-9.]+' | head -1)
@@ -128,42 +135,56 @@ echo "cold_planning_ms: ${COLD_PLAN:-NA}"
 echo "warm_planning_ms: ${WARM_PLAN:-NA}"
 
 # ---- d. execution latency percentiles + JIT + fallbacks ------------------
-# Run M EXPLAIN (ANALYZE) queries with a fresh random vector each time.
-# Parse "Execution Time" per query into a list, then compute p50/p95/p99 in
-# awk. Detect JIT section (grep '^ *JIT:') from the first plan. Count
-# "falling back" WARNINGs emitted on psql stderr across the sample.
+# Run M EXPLAIN (ANALYZE) queries, each with a fresh inline random vector.
+# The vector is generated server-side inside the SQL (RAND_VEC_EXPR), so no
+# client-side literal interpolation or rand_qvec() capture is needed.
+# Detect JIT section from the first plan. Count "falling back" WARNINGs on
+# psql stderr per iteration. If an iteration produces no Execution Time (psql
+# error), print a WARN with the output so failures are visible rather than
+# silently discarded (|| true was masking them).
 echo "[bench] running $M analyze queries (percentiles, jit, fallbacks)"
 LATENCIES=""
+SAMPLE_COUNT=0
 JIT_SECTION=no
 FALLBACKS=0
 FIRST=1
 for i in $(seq 1 "$M"); do
-    QV=$(rand_qvec)
-    # stderr captured separately so we can count fallback WARNINGs.
-    OUT=$($PSQL -X 2>/tmp/bench_stderr.$$ <<SQL || true
-SET cuvs.index_dir='$IDX_DIR';
-EXPLAIN (ANALYZE) SELECT id FROM bench_items ORDER BY embedding <-> '$QV'::vector LIMIT $K;
+    # stderr to a temp file so we can count fallback WARNINGs.
+    OUT=$($PSQL -X 2>/tmp/bench_stderr.$$ <<SQL
+EXPLAIN (ANALYZE) SELECT id FROM bench_items ORDER BY embedding <-> $RAND_VEC_EXPR LIMIT $K;
 SQL
 )
+    PSQL_EXIT=$?
     ET=$(echo "$OUT" | grep -i "Execution Time" | grep -oE '[0-9.]+' | head -1)
     if [ -n "$ET" ]; then
         LATENCIES="$LATENCIES$ET
 "
+        SAMPLE_COUNT=$((SAMPLE_COUNT + 1))
+    else
+        # Surface the failure so a degenerate sample is immediately visible.
+        echo "[bench] WARN: iteration $i produced no Execution Time (psql exit $PSQL_EXIT)"
+        echo "[bench] WARN: psql stdout: $(echo "$OUT" | head -5)"
     fi
-    # JIT detection on the first query's plan is sufficient (plan is stable).
-    if [ "$FIRST" = "1" ]; then
+    # JIT detection on the first successful plan.
+    if [ "$FIRST" = "1" ] && [ -n "$ET" ]; then
         if echo "$OUT" | grep -qE '^ *JIT:'; then
             JIT_SECTION=yes
         fi
         FIRST=0
     fi
-    # Count fallback warnings from this query's stderr.
     FB=$(grep -ic "falling back" /tmp/bench_stderr.$$ 2>/dev/null || echo 0)
     FALLBACKS=$((FALLBACKS + FB))
 done
 rm -f /tmp/bench_stderr.$$
 
-# percentiles via awk (nearest-rank on sorted ascending list)
+echo "sample_count: $SAMPLE_COUNT (of $M requested)"
+if [ "$SAMPLE_COUNT" -lt "$M" ]; then
+    echo "[bench] WARN: only $SAMPLE_COUNT of $M iterations produced Execution Time"
+fi
+
+# Percentiles via awk (nearest-rank on sorted ascending list).
+# Reports NA if sample is empty; includes sample_count in SUMMARY so a
+# degenerate run (all identical or too few) is obvious.
 pctl() {
     local p=$1
     echo "$LATENCIES" | grep -E '[0-9]' | sort -g | awk -v p="$p" '
@@ -202,10 +223,10 @@ echo "[bench] restart daemon and measure reload time"
 sudo systemctl restart pg-cuvs-server
 RELOAD_START=$(now)
 RELOAD_TIME=NA
-RQV=$(echo "$QVEC")
 deadline=$(awk "BEGIN{print $RELOAD_START + $RELOAD_TIMEOUT}")
 while :; do
-    if q "SELECT id FROM bench_items ORDER BY embedding <-> '$RQV'::vector LIMIT $K;" >/dev/null 2>&1; then
+    # Use inline vector expression so no stale literal variable is needed.
+    if $PSQL -At -c "SELECT id FROM bench_items ORDER BY embedding <-> $RAND_VEC_EXPR LIMIT $K;" >/dev/null 2>&1; then
         RELOAD_END=$(now)
         RELOAD_TIME=$(elapsed "$RELOAD_START" "$RELOAD_END")
         break
@@ -226,6 +247,7 @@ echo "n: $N"
 echo "dim: $DIM"
 echo "k: $K"
 echo "query_sample_m: $M"
+echo "sample_count: $SAMPLE_COUNT"
 echo "data_generation_time_s: $GEN_TIME"
 echo "build_time_s: $BUILD_TIME"
 echo "cagra_bytes: $CAGRA_BYTES"
