@@ -52,6 +52,7 @@ cuvs_status_str(int status)
         case CUVS_STATUS_UNAVAILABLE:  return "unavailable";
         case CUVS_STATUS_BUILD_FAILED:   return "build_failed";
         case CUVS_STATUS_PERSIST_FAILED: return "persist_failed";
+        case CUVS_STATUS_DIM_MISMATCH:   return "dim_mismatch";
         default:                       return "unknown";
     }
 }

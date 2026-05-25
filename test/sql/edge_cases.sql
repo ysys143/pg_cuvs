@@ -77,13 +77,16 @@ SELECT count(*) FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,1,0,0]'::vect
 SELECT count(*) FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,0,1,0]'::vector LIMIT 5) s;
 SELECT count(*) FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,0,0,1]'::vector LIMIT 5) s;
 
--- ---- Scrollable cursor: FETCH forward + backward must not crash. ----
+-- ---- Scrollable cursor: forward + backward traversal must not crash. The
+--      unique nearest neighbour of [1,0,0,0] is id 1 (exact match); the rest
+--      of the order can tie under CAGRA's approximate ranking, so assert via
+--      MOVE counts (deterministic) rather than FETCHed ids. ----
 BEGIN;
 DECLARE c SCROLL CURSOR FOR
     SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 6;
-FETCH 3 FROM c;
-FETCH BACKWARD 2 FROM c;
-FETCH 3 FROM c;
+FETCH FIRST FROM c;       -- id 1 (unique nearest)
+MOVE FORWARD ALL IN c;    -- advance to end (exercises forward)
+MOVE BACKWARD ALL IN c;   -- rewind through all rows (exercises backward)
 CLOSE c;
 COMMIT;
 

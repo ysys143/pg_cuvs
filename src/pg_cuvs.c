@@ -581,6 +581,18 @@ cuvs_endscan(IndexScanDesc scan)
     scan->opaque = NULL;
 }
 
+/* VACUUM calls amvacuumcleanup once per index. A CAGRA index is an immutable
+ * GPU snapshot (rebuilt only by REINDEX), so there is nothing to clean up —
+ * but the handler must exist, otherwise VACUUM (and autovacuum) ERROR with
+ * "function amvacuumcleanup is not defined" on any table that has a cagra
+ * index. Return stats unchanged (NULL when no ambulkdelete ran). */
+static IndexBulkDeleteResult *
+cuvs_amvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
+{
+    (void) info;
+    return stats;
+}
+
 /* ----------------------------------------------------------------
  * Index AM handler
  * ---------------------------------------------------------------- */
@@ -601,7 +613,7 @@ cuvsamhandler(PG_FUNCTION_ARGS)
     amroutine->ambuildempty      = cuvs_ambuildempty;
     amroutine->aminsert          = NULL;    /* lazy rebuild via AUTOVACUUM */
     amroutine->ambulkdelete      = NULL;
-    amroutine->amvacuumcleanup   = NULL;
+    amroutine->amvacuumcleanup   = cuvs_amvacuumcleanup;
 
     amroutine->ambeginscan       = cuvs_beginscan;
     amroutine->amrescan          = cuvs_rescan;

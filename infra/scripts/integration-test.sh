@@ -347,6 +347,65 @@ stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS rf_items;" >/dev/null 2>&1 || true
 rm -rf "$TEST_IDX"
 
+# --- Scenario 6: dim-mismatch search must NOT crash the daemon ----------
+# A query whose dimension differs from the index used to ABORT the daemon
+# (cuVS RAFT failure -> sticky CUDA error -> SIGABRT), taking down every
+# backend. The daemon now rejects it before cuVS. Assert: clear error AND the
+# daemon is still alive afterwards.
+echo "[it] --- scenario 6: dim-mismatch search keeps daemon alive ---"
+fresh_fixture
+start_test_daemon
+run_sql "CREATE INDEX it_cagra ON it_items USING cagra (embedding vector_l2_ops);" || \
+    fail "dim-mismatch: setup CREATE INDEX errored: $OUT"
+# Force the cagra path so the daemon (not pgvector seqscan) handles the query.
+run_sql "SET enable_seqscan = off; SELECT id FROM it_items ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 3;" || true
+if echo "$OUT" | grep -qi "does not match"; then
+    pass "dim-mismatch: query ERRORed with a clear dimension message"
+else
+    fail "dim-mismatch: expected a dimension-mismatch error, got: $OUT"
+fi
+if kill -0 "$DAEMON_PID" 2>/dev/null; then
+    pass "dim-mismatch: daemon still alive after the bad query"
+else
+    fail "dim-mismatch: daemon DIED on a dim-mismatch query (crash regression)"
+fi
+if run_sql "SELECT id FROM it_items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 3;"; then
+    pass "dim-mismatch: a valid search still works afterwards"
+else
+    fail "dim-mismatch: valid search failed after the bad one: $OUT"
+fi
+stop_test_daemon
+
+# --- Scenario 7: single-row build -> clean error, daemon survives -------
+# CAGRA cannot build a graph from one point; cuVS used to ABORT the daemon.
+# The daemon now rejects n_vecs < 2 cleanly. Assert: clean error AND survival.
+echo "[it] --- scenario 7: single-row build keeps daemon alive ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS it_one;
+CREATE TABLE it_one (id bigint, embedding vector(4));
+INSERT INTO it_one VALUES (1, '[1,0,0,0]');
+SQL
+start_test_daemon
+if run_sql "CREATE INDEX it_one_cagra ON it_one USING cagra (embedding vector_l2_ops);"; then
+    fail "single-row: CREATE INDEX unexpectedly succeeded"
+else
+    if echo "$OUT" | grep -q "BUILD failed (status"; then
+        pass "single-row: CREATE INDEX ERRORed cleanly"
+    else
+        fail "single-row: error text unexpected: $OUT"
+    fi
+fi
+if kill -0 "$DAEMON_PID" 2>/dev/null; then
+    pass "single-row: daemon still alive after the n=1 build"
+else
+    fail "single-row: daemon DIED on a single-row build (crash regression)"
+fi
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS it_one;" >/dev/null 2>&1 || true
+
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then
     echo "[PASS] all integration scenarios passed"

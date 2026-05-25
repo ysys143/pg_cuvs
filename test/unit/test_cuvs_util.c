@@ -77,6 +77,20 @@ test_parse_index_filename(void)
     ASSERT(cuvs_parse_index_filename("16384_24576.cagra.bak", &db, &ix) == -1,
            "trailing extension");
     ASSERT(cuvs_parse_index_filename("", &db, &ix) == -1, "empty string");
+
+    /* More adversarial separators / missing fields */
+    ASSERT(cuvs_parse_index_filename("16384__24576.cagra", &db, &ix) == -1,
+           "double underscore");
+    ASSERT(cuvs_parse_index_filename("16384_.cagra", &db, &ix) == -1,
+           "missing second oid");
+    ASSERT(cuvs_parse_index_filename("_24576.cagra", &db, &ix) == -1,
+           "missing first oid");
+
+    /* Boundary: 0_0 is a structurally valid name (OID 0 never occurs in
+     * practice, but the parser must not special-case it). */
+    db = ix = 999;
+    ASSERT(cuvs_parse_index_filename("0_0.cagra", &db, &ix) == 0, "zero oids parse");
+    ASSERT(db == 0 && ix == 0, "zero oids values");
 }
 
 static void
@@ -94,6 +108,8 @@ test_status_str(void)
            "status build_failed");
     ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_PERSIST_FAILED), "persist_failed") == 0,
            "status persist_failed");
+    ASSERT(strcmp(cuvs_status_str(CUVS_STATUS_DIM_MISMATCH), "dim_mismatch") == 0,
+           "status dim_mismatch");
     ASSERT(strcmp(cuvs_status_str(42), "unknown") == 0, "status out-of-range");
     ASSERT(strcmp(cuvs_status_str(-1), "unknown") == 0, "status negative");
 }
