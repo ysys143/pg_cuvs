@@ -14,10 +14,22 @@ set -e
 
 IDX_DIR=/tmp/cuvs_indexes
 DB=postgres
+SOCK=/tmp/.s.pg_cuvs
+
+# Wait for the daemon to bind its socket. The daemon listens only AFTER GPU
+# init + warm-up (now including a CAGRA build), so a fixed sleep races the
+# first request. Poll the UDS instead.
+wait_daemon_ready() {
+    for _ in $(seq 1 60); do
+        [ -S "$SOCK" ] && return 0
+        sleep 0.5
+    done
+    echo "[e2e] FAIL: daemon socket $SOCK never appeared"; return 1
+}
 
 echo "[e2e] restart daemon"
 sudo systemctl restart pg-cuvs-server
-sleep 2
+wait_daemon_ready
 sudo systemctl is-active pg-cuvs-server
 
 echo "[e2e] setup + build three cagra indexes (l2, cosine, ip opclasses)"
@@ -70,7 +82,7 @@ fi
 
 echo "[e2e] restart daemon -> reload persisted index"
 sudo systemctl restart pg-cuvs-server
-sleep 2
+wait_daemon_ready
 sudo journalctl -u pg-cuvs-server -n 20 --no-pager | grep -iE "load|reload" || echo "[e2e] (no load line matched)"
 
 echo "[e2e] search AFTER restart (served from reloaded indexes, no heap rebuild)"

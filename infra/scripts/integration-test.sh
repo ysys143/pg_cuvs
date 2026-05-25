@@ -57,9 +57,20 @@ start_test_daemon() {
         --max-vram-mb 20480 \
         >/tmp/pg_cuvs_test_daemon.log 2>&1 &
     DAEMON_PID=$!
-    sleep 2
-    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-        echo "[it] test daemon failed to start; log:"
+    # Wait for readiness by polling for the UDS, which the daemon binds only
+    # AFTER GPU init + warm-up. A fixed sleep races the warm-up (which now
+    # includes a CAGRA build), causing the first request to hit UNAVAILABLE.
+    for _ in $(seq 1 60); do
+        [ -S "$TEST_SOCK" ] && break
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            echo "[it] test daemon died during startup; log:"
+            cat /tmp/pg_cuvs_test_daemon.log || true
+            return 1
+        fi
+        sleep 0.5
+    done
+    if [ ! -S "$TEST_SOCK" ]; then
+        echo "[it] test daemon socket never appeared; log:"
         cat /tmp/pg_cuvs_test_daemon.log || true
         return 1
     fi
