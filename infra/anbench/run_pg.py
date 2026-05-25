@@ -182,6 +182,9 @@ def main():
     ap.add_argument("--pgcuvs-queries", type=int, default=2000,
                     help="query count for pg_cuvs (one fresh connection each, "
                          "since it segfaults on a 2nd query per connection)")
+    ap.add_argument("--max-queries", type=int, default=2000,
+                    help="cap per-query SQL count for hnsw/ivfflat sweeps "
+                         "(2000 is plenty for a stable recall@k estimate)")
     args = ap.parse_args()
 
     import psycopg
@@ -237,7 +240,11 @@ def main():
             sweeps = [(f"SET ivfflat.probes={v}", f"probes={v}")
                       for v in (1, 4, 8, 16, 32, 64, 128)]
             set_prefix, sysname, note = None, "pgvector-ivfflat", ""
-        qset, gtset, n_rep = queries, gt, nq
+        if args.system in ("hnsw", "ivfflat"):
+            qcap = min(args.max_queries, nq)
+            qset, gtset, n_rep = queries[:qcap], gt[:qcap], qcap
+        else:  # pg_cuvs: per-conn loop caps to --pgcuvs-queries itself
+            qset, gtset, n_rep = queries, gt, nq
 
     for set_sql, label in sweeps:
         full_set = "; ".join(x for x in (set_prefix, set_sql) if x)
