@@ -501,6 +501,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
     cuvs_tid_decode(tid, &blk, &offset);
     ss->cur++;
 
+    fprintf(stderr, "[gtdbg] cur=%d/%d tid=%llu blk=%u off=%u\n",
+            ss->cur - 1, ss->n_results, (unsigned long long)tid, blk, offset);
     ItemPointerSet(&scan->xs_heaptid, blk, offset);
     scan->xs_recheck = true;   /* recheck predicate on heap tuple */
 
