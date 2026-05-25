@@ -105,6 +105,10 @@ def main():
         # IVFPQ (m subquantizers divide d; 1024/16=64)
         m_pq = 64 if d % 64 == 0 else 8
         cfgp = faiss.GpuIndexIVFPQConfig()
+        # m=64 subquantizers @ 8 bits needs 64 KB of PQ lookup tables in shared
+        # memory, over the A100's 48 KB/block limit. fp16 tables halve that to
+        # 32 KB so the search kernel fits.
+        cfgp.useFloat16LookupTables = True
         ivfpq = faiss.GpuIndexIVFPQ(res, d, nlist, m_pq, 8, faiss.METRIC_L2, cfgp)
         t0 = time.perf_counter(); ivfpq.train(corpus); ivfpq.add(corpus)
         bt = time.perf_counter() - t0
