@@ -348,12 +348,21 @@ extern "C" void
 cuvs_warmup(void)
 {
     try {
-        const int n = 64, dim = 16, k = 8;
+        const int n = 512, dim = 16, k = 8;
         std::vector<float> corpus((size_t)n * dim), query(dim, 0.1f);
         for (size_t i = 0; i < corpus.size(); i++)
-            corpus[i] = (float)(i % 7) * 0.1f;
+            corpus[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
         CuvsSearchResult out[8];
+        /* brute force warms CUDA context / RMM / cuBLAS (gemm) */
         (void)cuvs_brute_force_search(corpus.data(), query.data(), n, dim, k, out);
+        /* cagra build+search warms the CAGRA-specific kernels so the first
+         * real cagra query on a freshly booted daemon is not the one that
+         * pays kernel load (~100 ms). */
+        CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim);
+        if (idx) {
+            (void)cuvs_cagra_search(idx, query.data(), dim, k, out);
+            cuvs_cagra_free(idx);
+        }
     } catch (...) {
         /* warm-up is best-effort; a failure here must not stop the daemon */
     }
