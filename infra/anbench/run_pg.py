@@ -160,7 +160,12 @@ def main():
     dim = read_fbin(args.corpus, count=1).shape[1]
     nq = len(queries)
 
-    conn = psycopg.connect(dbname=args.dbname, autocommit=False)
+    # autocommit from the start: building the cagra index inside an explicit
+    # transaction block corrupts the backend so subsequent cagra searches crash
+    # the connection. Autocommit (index build + each query as its own txn) is
+    # both the working path and the realistic app pattern. (commit() is a no-op
+    # under autocommit, so the helpers' commit() calls are harmless.)
+    conn = psycopg.connect(dbname=args.dbname, autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     if args.system == "pg_cuvs":
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
@@ -198,12 +203,6 @@ def main():
                       for v in (1, 4, 8, 16, 32, 64, 128)]
             set_prefix, sysname, note = None, "pgvector-ivfflat", ""
         qset, gtset, n_rep = queries, gt, nq
-
-    # Query in autocommit mode: pg_cuvs's cagra scan crashes the backend when a
-    # search runs inside an open transaction block (autocommit=False). Each
-    # query as its own transaction is also the realistic app pattern.
-    conn.commit()
-    conn.autocommit = True
 
     for set_sql, label in sweeps:
         full_set = "; ".join(x for x in (set_prefix, set_sql) if x)
