@@ -515,7 +515,12 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
     {
         scan->xs_orderbyvals[0]  = Float8GetDatum((double) ss->distances[ss->cur]);
         scan->xs_orderbynulls[0] = false;
-        scan->xs_recheckorderby  = true;
+        /* false: trust the daemon's distance + CAGRA's sorted order (like
+         * pgvector). The executor then does NOT recompute via
+         * EvalOrderByExpressions; results stay in distance order. The values
+         * are monotonic with the true <-> distance, so ordering (and recall)
+         * is correct without paying a per-tuple recompute. */
+        scan->xs_recheckorderby  = false;
     }
     ss->cur++;
 
