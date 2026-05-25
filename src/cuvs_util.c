@@ -122,6 +122,10 @@ cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
         return -1;
     if (hdr.n_vecs <= 0 || hdr.n_vecs > CUVS_TIDS_MAX_VECS)
         return -1;
+    /* reserved must be 0 (forward-compat: a future format may use it, so a
+     * v1 reader must reject files that set it rather than silently accept). */
+    if (hdr.reserved != 0)
+        return -1;
 
     body_bytes = (size_t)hdr.n_vecs * sizeof(uint64_t);
     tids = malloc(body_bytes);

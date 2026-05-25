@@ -280,6 +280,22 @@ test_tids_rejections(void)
         ASSERT(o == NULL, "crc mismatch frees alloc");
         fclose(f);
     }
+
+    /* reserved != 0: valid otherwise, but the reserved field is set */
+    {
+        FILE *f = tmpfile();
+        CuvsTidsHeader h;
+        h.magic = CUVS_TIDS_MAGIC; h.version = CUVS_TIDS_VERSION;
+        h.n_vecs = n; h.dim = dim; h.metric = metric;
+        h.body_crc32 = cuvs_crc32(tids, sizeof(tids)); h.reserved = 1;
+        fwrite(&h, sizeof(h), 1, f);
+        fwrite(tids, sizeof(uint64_t), (size_t)n, f);
+        rewind(f);
+        CuvsTidsHeader hr; uint64_t *o = NULL;
+        ASSERT(cuvs_tids_read(f, &hr, &o) == -1, "reject reserved != 0");
+        ASSERT(o == NULL, "reserved!=0 leaves out NULL");
+        fclose(f);
+    }
 }
 
 #ifdef CUVS_TEST_HOOKS
