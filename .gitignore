@@ -4,6 +4,10 @@
 .env
 .env.gpu
 .env.local
+
+# Local-only access/runbook notes (connection info; never commit)
+VM_ACCESS.local.md
+*.local.md
 node_modules/
 __pycache__/
 *.pyc
