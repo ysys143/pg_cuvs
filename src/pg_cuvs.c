@@ -12,11 +12,15 @@
 
 #include "postgres.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/timestamp.h"
+#include "utils/tuplestore.h"
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/tableam.h"
@@ -701,4 +705,118 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
         default:                 name = "unknown"; break;
     }
     PG_RETURN_TEXT_P(cstring_to_text(name));
+}
+
+/* ----------------------------------------------------------------
+ * pg_cuvs_gpu_search_stats() — set-returning backing function for the
+ * pg_stat_gpu_search view. Queries the sidecar daemon (the cross-backend
+ * source of truth) for per-index search stats in the current database.
+ *
+ * Daemon-down policy: if the daemon is unreachable, return ZERO rows (not
+ * an error). pg_stat_* views are polled by monitoring on tight loops, so
+ * the view must stay queryable while the daemon restarts. (See plan: a
+ * future liveness column can distinguish "down" from "idle".)
+ * ---------------------------------------------------------------- */
+#define GPU_STATS_NCOLS 17
+
+static const char *
+cuvs_metric_name(uint32_t metric)
+{
+    switch (metric)
+    {
+        case CUVS_METRIC_L2:     return "l2";
+        case CUVS_METRIC_COSINE: return "cosine";
+        case CUVS_METRIC_IP:     return "ip";
+        default:                 return "unknown";
+    }
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_gpu_search_stats);
+Datum
+pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc       tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext   per_query_ctx;
+    MemoryContext   oldcontext;
+    CuvsIndexStats  stats[CUVS_MAX_TRACKED_INDEXES];
+    int             n = 0;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    /* index_oid == 0 -> all resident indexes for this database. A daemon-down
+     * result (UNAVAILABLE) leaves n == 0, producing an empty (not failed) set. */
+    cuvs_ipc_stats(cuvs_socket_path, (uint32_t) MyDatabaseId, 0,
+                   stats, CUVS_MAX_TRACKED_INDEXES, &n);
+
+    for (int i = 0; i < n; i++)
+    {
+        CuvsIndexStats *s = &stats[i];
+        Datum   values[GPU_STATS_NCOLS];
+        bool    nulls[GPU_STATS_NCOLS];
+        char   *relname;
+        double  avg_us;
+
+        memset(nulls, 0, sizeof(nulls));
+
+        values[0] = ObjectIdGetDatum((Oid) s->db_oid);
+        values[1] = ObjectIdGetDatum((Oid) s->index_oid);
+
+        relname = get_rel_name((Oid) s->index_oid);
+        if (relname)
+            values[2] = CStringGetTextDatum(relname);
+        else
+            nulls[2] = true;   /* index dropped since the daemon loaded it */
+
+        values[3] = Int32GetDatum((int32) s->dim);
+        values[4] = CStringGetTextDatum(cuvs_metric_name(s->metric));
+        values[5] = Int64GetDatum(s->n_vecs);
+        values[6] = Int64GetDatum((int64) s->vram_bytes);
+        values[7] = BoolGetDatum(s->resident != 0);
+        values[8] = Int64GetDatum((int64) s->search_count);
+        values[9] = Int64GetDatum((int64) s->error_count);
+
+        avg_us = (s->search_count > 0)
+            ? (double) s->total_latency_us / (double) s->search_count
+            : 0.0;
+        values[10] = Float8GetDatum(avg_us);
+        values[11] = Int32GetDatum((int32) s->p50_us);
+        values[12] = Int32GetDatum((int32) s->p95_us);
+        values[13] = Int32GetDatum((int32) s->p99_us);
+        values[14] = CStringGetTextDatum(cuvs_status_str((int) s->last_status));
+
+        if (s->last_error[0] != '\0')
+            values[15] = CStringGetTextDatum(s->last_error);
+        else
+            nulls[15] = true;
+
+        if (s->last_search_at != 0)
+            values[16] = TimestampTzGetDatum(time_t_to_timestamptz((pg_time_t) s->last_search_at));
+        else
+            nulls[16] = true;
+
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
+
+    return (Datum) 0;
 }

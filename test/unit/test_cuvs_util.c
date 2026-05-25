@@ -326,6 +326,50 @@ test_fault_hook(void)
 }
 #endif
 
+static void
+test_lat_histogram(void)
+{
+    /* Bucket boundaries: 0->0, [2^(k-1),2^k)->k. */
+    ASSERT(cuvs_lat_bucket_index(0) == 0, "bucket 0 us -> 0");
+    ASSERT(cuvs_lat_bucket_index(1) == 1, "bucket 1 us -> 1");
+    ASSERT(cuvs_lat_bucket_index(2) == 2, "bucket 2 us -> 2");
+    ASSERT(cuvs_lat_bucket_index(3) == 2, "bucket 3 us -> 2 ([2,4))");
+    ASSERT(cuvs_lat_bucket_index(4) == 3, "bucket 4 us -> 3");
+    ASSERT(cuvs_lat_bucket_index(1000) == 10, "bucket 1000 us -> 10 ([512,1024))");
+    /* Huge latency clamps to the last bucket, never overruns the array. */
+    ASSERT(cuvs_lat_bucket_index(0xFFFFFFFFu) == CUVS_LAT_BUCKETS - 1,
+           "bucket UINT32_MAX clamps to last");
+
+    uint32_t hist[CUVS_LAT_BUCKETS];
+
+    /* Empty histogram -> 0 for every quantile. */
+    memset(hist, 0, sizeof(hist));
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.50) == 0, "empty p50 -> 0");
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.99) == 0, "empty p99 -> 0");
+
+    /* Single sample in bucket 5 -> upper edge 2^5 = 32. */
+    memset(hist, 0, sizeof(hist));
+    hist[5] = 1;
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.50) == 32u, "single p50 -> 32");
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.99) == 32u, "single p99 -> 32");
+
+    /* 100 samples all in bucket 10 -> every quantile is the bucket upper (1024). */
+    memset(hist, 0, sizeof(hist));
+    hist[10] = 100;
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.50) == 1024u, "uniform p50 -> 1024");
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.95) == 1024u, "uniform p95 -> 1024");
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.99) == 1024u, "uniform p99 -> 1024");
+
+    /* Skewed: 90 fast (bucket 3 -> 8us), 10 slow (bucket 10 -> 1024us).
+     * p50 falls in the fast bulk; p95/p99 cross into the slow tail. */
+    memset(hist, 0, sizeof(hist));
+    hist[3] = 90;
+    hist[10] = 10;
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.50) == 8u, "skewed p50 -> 8");
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.95) == 1024u, "skewed p95 -> 1024 (tail)");
+    ASSERT(cuvs_lat_percentile(hist, CUVS_LAT_BUCKETS, 0.99) == 1024u, "skewed p99 -> 1024 (tail)");
+}
+
 int
 main(void)
 {
@@ -336,6 +380,7 @@ main(void)
     test_crc32();
     test_tids_roundtrip();
     test_tids_rejections();
+    test_lat_histogram();
 #ifdef CUVS_TEST_HOOKS
     test_fault_hook();
 #endif

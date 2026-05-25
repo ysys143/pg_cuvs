@@ -21,7 +21,7 @@
  * ---------------------------------------------------------------- */
 #define CUVS_OP_SEARCH    1
 #define CUVS_OP_BUILD     2
-#define CUVS_OP_STATUS    3
+#define CUVS_OP_STATUS    3   /* per-index search stats; index_oid==0 = all in db */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -83,6 +83,33 @@ typedef struct CuvsResult {
 } CuvsResult;
 
 /* ----------------------------------------------------------------
+ * STATS reply payload (CUVS_OP_STATUS).
+ *
+ * Reply is the standard CuvsReplyHeader (status=OK, n_results = number of
+ * index entries) followed by n_results × CuvsIndexStats. The daemon owns
+ * the per-index latency histogram and sends pre-computed percentiles, so
+ * the bucket count is not part of the wire ABI.
+ * ---------------------------------------------------------------- */
+typedef struct CuvsIndexStats {
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t dim;
+    uint32_t metric;            /* CUVS_METRIC_* */
+    int64_t  n_vecs;
+    uint64_t vram_bytes;
+    uint32_t resident;          /* 1 if currently VRAM-resident (IndexEntry.valid) */
+    uint32_t last_status;       /* CUVS_STATUS_* of the most recent search */
+    uint64_t search_count;      /* successful (CUVS_STATUS_OK) searches */
+    uint64_t error_count;       /* searches that ended non-OK and were attributable */
+    uint64_t total_latency_us;  /* avg = total_latency_us / search_count */
+    uint32_t p50_us;
+    uint32_t p95_us;
+    uint32_t p99_us;
+    int64_t  last_search_at;    /* epoch seconds; 0 if never searched */
+    char     last_error[128];
+} CuvsIndexStats;
+
+/* ----------------------------------------------------------------
  * Client API (used by pg_cuvs.c)
  * ---------------------------------------------------------------- */
 
@@ -131,6 +158,26 @@ int cuvs_ipc_build(
     int            dim,
     uint32_t       metric,
     const char    *index_dir   /* daemon saves index here */
+);
+
+/*
+ * cuvs_ipc_stats — fetch per-index search statistics (CUVS_OP_STATUS).
+ *
+ * index_oid == 0 requests every resident index in db_oid; otherwise just
+ * that one. Fills up to `max` CuvsIndexStats into `out` and sets *n_out.
+ *
+ * Returns CUVS_STATUS_OK on success (including zero rows). Returns
+ * CUVS_STATUS_UNAVAILABLE if the daemon is unreachable — callers (e.g. the
+ * pg_stat_gpu_search view) should treat that as an empty result, never an
+ * error, so monitoring keeps working while the daemon restarts.
+ */
+int cuvs_ipc_stats(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    uint32_t        index_oid,
+    CuvsIndexStats *out,
+    int             max,
+    int            *n_out
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */

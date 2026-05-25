@@ -82,3 +82,46 @@ LANGUAGE C;
 COMMENT ON FUNCTION pg_cuvs_last_search_latency_us() IS
   'Daemon-reported wall-clock latency in microseconds for the most '
   'recent successful cagra index scan in this backend. NULL if none.';
+
+-- ----------------------------------------------------------------
+-- pg_stat_gpu_search — server-wide per-index GPU search statistics.
+-- Source of truth is the sidecar daemon (cross-backend, but reset on
+-- index rebuild/reload). Returns zero rows when the daemon is down so
+-- monitoring stays queryable. Column order must match the SRF in
+-- src/pg_cuvs.c (pg_cuvs_gpu_search_stats).
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_gpu_search_stats(
+    OUT database_oid    oid,
+    OUT index_oid       oid,
+    OUT index_name      text,
+    OUT dim             integer,
+    OUT metric          text,
+    OUT n_vecs          bigint,
+    OUT vram_bytes      bigint,
+    OUT resident        boolean,
+    OUT search_count    bigint,
+    OUT error_count     bigint,
+    OUT avg_latency_us  double precision,
+    OUT p50_latency_us  integer,
+    OUT p95_latency_us  integer,
+    OUT p99_latency_us  integer,
+    OUT last_status     text,
+    OUT last_error      text,
+    OUT last_search_at  timestamptz
+)
+RETURNS SETOF record
+AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'
+LANGUAGE C;
+
+COMMENT ON FUNCTION pg_cuvs_gpu_search_stats() IS
+  'Per-index GPU search statistics from the pg_cuvs sidecar daemon for the '
+  'current database. Backs the pg_stat_gpu_search view. Empty when the '
+  'daemon is unavailable.';
+
+CREATE VIEW pg_stat_gpu_search AS
+  SELECT * FROM pg_cuvs_gpu_search_stats();
+
+COMMENT ON VIEW pg_stat_gpu_search IS
+  'GPU CAGRA per-index search stats: counts, fallbacks/errors, and '
+  'approximate p50/p95/p99 latency. Counters reset on index rebuild or '
+  'daemon restart; empty while the daemon is down.';

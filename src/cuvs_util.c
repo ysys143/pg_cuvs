@@ -58,6 +58,64 @@ cuvs_status_str(int status)
 }
 
 /* ----------------------------------------------------------------
+ * Latency histogram: log2-spaced buckets + approximate percentiles.
+ * ---------------------------------------------------------------- */
+uint32_t
+cuvs_lat_bucket_index(uint32_t us)
+{
+    uint32_t idx = 0;
+    /* bucket 0 = {0}; bucket k>=1 covers [2^(k-1), 2^k). */
+    while (us > 0 && idx < CUVS_LAT_BUCKETS - 1)
+    {
+        us >>= 1;
+        idx++;
+    }
+    return idx;
+}
+
+/* Upper-edge latency (us) represented by a bucket: bucket 0 -> 0,
+ * bucket k>=1 -> 2^k. Clamped index never exceeds CUVS_LAT_BUCKETS-1. */
+static uint32_t
+lat_bucket_upper_us(int idx)
+{
+    if (idx <= 0)
+        return 0;
+    if (idx >= 31)              /* avoid UB: 1u<<31 fits, beyond would overflow */
+        return 0x80000000u;
+    return 1u << idx;
+}
+
+uint32_t
+cuvs_lat_percentile(const uint32_t *buckets, int nbuckets, double q)
+{
+    uint64_t total = 0;
+    uint64_t target;
+    uint64_t cum = 0;
+
+    for (int i = 0; i < nbuckets; i++)
+        total += buckets[i];
+    if (total == 0)
+        return 0;
+
+    if (q < 0.0) q = 0.0;
+    if (q > 1.0) q = 1.0;
+
+    /* Rank of the target sample (1-based): the smallest count whose
+     * cumulative coverage reaches the q-quantile. */
+    target = (uint64_t)(q * (double)total);
+    if (target == 0)
+        target = 1;
+
+    for (int i = 0; i < nbuckets; i++)
+    {
+        cum += buckets[i];
+        if (cum >= target)
+            return lat_bucket_upper_us(i);
+    }
+    return lat_bucket_upper_us(nbuckets - 1);
+}
+
+/* ----------------------------------------------------------------
  * CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) and versioned .tids I/O.
  * LE-only: see cuvs_util.h header comment.
  * ---------------------------------------------------------------- */

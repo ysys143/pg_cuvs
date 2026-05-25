@@ -220,6 +220,30 @@ SELECT id FROM ec ORDER BY embedding <-> '[1,0.1,0,0]'::vector LIMIT 1;
 SET enable_cuvs = on;
 
 -- ============================================================================
+-- pg_stat_gpu_search: daemon-backed, cross-backend observability view.
+-- Assert only deterministic facts (CAGRA counts/latencies vary run to run):
+-- the ec_cagra row exists with resolvable identity, percentile ordering holds,
+-- a GPU search bumps search_count, and the view is queryable with cuvs off.
+-- All output is filtered to ec_cagra so other resident indexes can't perturb it.
+-- ============================================================================
+SET enable_seqscan = off;
+SELECT count(*) AS warm1
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 3) s;
+SELECT count(*) AS warm2
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[0,1,0,0]'::vector LIMIT 3) s;
+RESET enable_seqscan;
+SELECT index_name, metric, resident,
+       (search_count >= 1)                  AS searched,
+       (p99_latency_us >= p50_latency_us)   AS pctl_ordered
+FROM pg_stat_gpu_search
+WHERE index_oid = 'ec_cagra'::regclass;
+-- View queries the daemon directly, so it stays available with cuvs disabled.
+SET enable_cuvs = off;
+SELECT (count(*) = 1) AS row_present
+FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+SET enable_cuvs = on;
+
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 DROP TABLE ec, ec_big, ec_empty, ec_one, ec_d1, ec_d2000, ec_dup, ec_null,

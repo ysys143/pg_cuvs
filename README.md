@@ -75,13 +75,13 @@ Benchmark results (DBpedia 1M, 1536d, L4 GPU):
 
 ## Roadmap
 
-See [design/PLAN.md](design/PLAN.md) for the full phased plan.
+See [design/PLAN.md](design/PLAN.md) for the full product-roadmap plan. Some committed test-hardening work used its own "Phase 2/3/4/5" task labels; the table below refers only to the product roadmap.
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| 1 — Proof of Mechanism | PostgreSQL pipeline + sidecar CAGRA search | In progress |
+| 1 — Proof of Mechanism | PostgreSQL pipeline + sidecar CAGRA search | Done |
 | 1.5 — Test & Ops Hardening | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done (GPU VM verified) |
-| 2 — Production Ready | `pg_stat_gpu_search`, planner/write correctness, tiered cache, DiskANN prep | Planned |
+| 2 — Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric correctness, write/staleness, large-build memory, tiered cache | Planned |
 | 3 — Scale Out | S3-backed immutable index snapshots, replicas, multi-GPU | Planned |
 
 ## Requirements

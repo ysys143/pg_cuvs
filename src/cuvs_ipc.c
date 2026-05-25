@@ -300,6 +300,69 @@ cleanup:
 }
 
 /* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_stats
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_stats(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    uint32_t        index_oid,
+    CuvsIndexStats *out,
+    int             max,
+    int            *n_out)
+{
+    int sock = -1;
+    int rc   = CUVS_STATUS_ERROR;
+
+    if (n_out) *n_out = 0;
+
+    sock = uds_connect(socket_path);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;   /* daemon down -> caller treats as empty */
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_STATUS,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+    };
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+    if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
+    {
+        int n = (int)hdr.n_results;
+        int n_copy = (n > max) ? max : n;
+        CuvsIndexStats *buf = malloc((size_t)n * sizeof(CuvsIndexStats));
+        if (!buf)
+        {
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+        if (recv_all(sock, buf, (size_t)n * sizeof(CuvsIndexStats)) < 0)
+        {
+            free(buf);
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+        for (int i = 0; i < n_copy; i++)
+            out[i] = buf[i];
+        if (n_out) *n_out = n_copy;
+        free(buf);
+    }
+
+cleanup:
+    if (sock >= 0)
+        close(sock);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build
  * ---------------------------------------------------------------- */
 int

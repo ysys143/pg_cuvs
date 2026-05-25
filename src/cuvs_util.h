@@ -67,6 +67,23 @@ int cuvs_parse_index_filename(const char *name, uint32_t *db_oid, uint32_t *inde
 const char *cuvs_status_str(int status);
 
 /* ----------------------------------------------------------------
+ * Latency histogram (per-index, daemon-side). Log2-spaced fixed buckets:
+ * bucket 0 = {0 us}; bucket k (k>=1) covers [2^(k-1), 2^k) us. 32 buckets
+ * span up to ~2^31 us (~35 min), which comfortably bounds any GPU search.
+ * Percentiles are approximate (bucket upper edge) — adequate for
+ * monitoring, not for precise SLA accounting. Pure, PG/GPU-free.
+ * ---------------------------------------------------------------- */
+#define CUVS_LAT_BUCKETS 32
+
+/* Bucket index for a latency in microseconds (clamped to [0, CUVS_LAT_BUCKETS-1]). */
+uint32_t cuvs_lat_bucket_index(uint32_t us);
+
+/* q-quantile (q in [0,1]) over a CUVS_LAT_BUCKETS-wide histogram, returned as
+ * the containing bucket's upper-edge latency in us. Returns 0 for an empty
+ * histogram. nbuckets lets the unit test pass smaller arrays. */
+uint32_t cuvs_lat_percentile(const uint32_t *buckets, int nbuckets, double q);
+
+/* ----------------------------------------------------------------
  * Versioned, checksummed .tids on-disk sidecar format.
  *
  * Layout: [CuvsTidsHeader (32 bytes)] [n_vecs * uint64_t TID body].

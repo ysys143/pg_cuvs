@@ -18,6 +18,10 @@
 #                       registry is full (MAX_INDEXES=64 resident), evict_lru's
 #                       save_index is forced to fail (CUVS_FAULT_SAVE_INDEX),
 #                       so no slot frees and the build rolls back its persist.
+#   6. dim-mismatch search -> clear error, daemon stays alive, valid search OK.
+#   7. single-row build  -> clean error (n_vecs<2), daemon stays alive.
+#   8. pg_stat_gpu_search -> search_count increments; daemon-down view is empty
+#                       (never errors) and the backend survives.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -416,6 +420,62 @@ else
 fi
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_one;" >/dev/null 2>&1 || true
+
+# --- Scenario 8: pg_stat_gpu_search observability ------------------------
+# The view is daemon-backed and cross-backend. After GPU searches, the row
+# must show search_count >= 1; when the daemon is down the view must return
+# ZERO rows (never error) and leave the backend alive.
+echo "[it] --- scenario 8: pg_stat_gpu_search view ---"
+fresh_fixture
+start_test_daemon
+if ! run_sql "CREATE INDEX it_cagra ON it_items USING cagra (embedding vector_l2_ops);"; then
+    fail "stats: setup CREATE INDEX errored: $OUT"
+fi
+# Force the cagra path (tiny table would otherwise seqscan) and run a few searches.
+run_sql "SET enable_seqscan=off;
+         SELECT id FROM it_items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 3;
+         SELECT id FROM it_items ORDER BY embedding <-> '[0,1,0,0]'::vector LIMIT 3;
+         SELECT id FROM it_items ORDER BY embedding <-> '[0,0,1,0]'::vector LIMIT 3;" >/dev/null
+
+# search_count for the index (last line = the value under psql -At).
+SC=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT coalesce(max(search_count),0) FROM pg_stat_gpu_search WHERE index_oid='it_cagra'::regclass;
+SQL
+)
+if [ -n "$SC" ] && [ "$SC" -ge 1 ] 2>/dev/null; then
+    pass "stats: search_count incremented to $SC after GPU searches"
+else
+    fail "stats: search_count did not increment (got '$SC')"
+fi
+
+# The view exposes the index row with a resolvable name + percentile columns.
+ROW=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT index_name||'|'||metric||'|'||(p99_latency_us >= p50_latency_us)
+  FROM pg_stat_gpu_search WHERE index_oid='it_cagra'::regclass;
+SQL
+)
+if echo "$ROW" | grep -q "^it_cagra|l2|t$"; then
+    pass "stats: view row has index_name=it_cagra, metric=l2, p99>=p50"
+else
+    fail "stats: unexpected view row: '$ROW'"
+fi
+
+# Daemon down -> view returns zero rows, no error, backend survives.
+stop_test_daemon
+if run_sql "SELECT count(*) AS n FROM pg_stat_gpu_search;"; then
+    if echo "$OUT" | grep -qE "^[[:space:]]*0$"; then
+        pass "stats: daemon-down view returned empty set (no error)"
+    else
+        fail "stats: daemon-down view non-empty/unexpected: $OUT"
+    fi
+else
+    fail "stats: daemon-down view query ERRORed (should be empty, not error): $OUT"
+fi
+psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
 
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then

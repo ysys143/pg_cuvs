@@ -54,9 +54,55 @@ typedef struct IndexEntry {
     CuvsCagraIndex  handle;       /* cuVS opaque index */
     uint64_t       *tids;         /* TID array [n_vecs] */
     size_t          vram_bytes;   /* estimated VRAM usage */
-    time_t          last_search;  /* for LRU eviction */
+    time_t          last_search;  /* for LRU eviction; also stats last_search_at */
     int             valid;
+
+    /* Search stats (pg_stat_gpu_search). Reset on (re)build/load — they
+     * describe the currently resident index instance, not a persisted total. */
+    uint64_t        search_count;     /* CUVS_STATUS_OK searches */
+    uint64_t        error_count;      /* attributable non-OK searches */
+    uint64_t        total_latency_us; /* sum of OK latencies (for avg) */
+    uint32_t        lat_buckets[CUVS_LAT_BUCKETS];
+    uint32_t        last_status;      /* CUVS_STATUS_* of most recent search */
+    char            last_error[128];
 } IndexEntry;
+
+/* Zero just the stat counters of a (re)initialized entry. The slot may carry
+ * stale stats from a previously evicted index, and a rebuild starts fresh. */
+static void
+reset_entry_stats(IndexEntry *e)
+{
+    e->search_count     = 0;
+    e->error_count      = 0;
+    e->total_latency_us = 0;
+    memset(e->lat_buckets, 0, sizeof(e->lat_buckets));
+    e->last_status      = 0;
+    e->last_error[0]    = '\0';
+}
+
+/* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
+static void
+record_search_stat(IndexEntry *e, uint32_t status, uint32_t latency_us,
+                   const char *err)
+{
+    e->last_status = status;
+    e->last_search = time(NULL);
+    if (status == CUVS_STATUS_OK)
+    {
+        e->search_count++;
+        e->total_latency_us += latency_us;
+        e->lat_buckets[cuvs_lat_bucket_index(latency_us)]++;
+    }
+    else
+    {
+        e->error_count++;
+        if (err)
+        {
+            strncpy(e->last_error, err, sizeof(e->last_error) - 1);
+            e->last_error[sizeof(e->last_error) - 1] = '\0';
+        }
+    }
+}
 
 static IndexEntry  g_indexes[MAX_INDEXES];
 static int         g_n_indexes   = 0;
@@ -258,6 +304,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->vram_bytes  = needed;
     e->last_search = time(NULL);
     e->valid       = 1;
+    reset_entry_stats(e);
 
     LOG_INFO("pg_cuvs_server: loaded index %u/%u (%lld vecs, %zu MB VRAM)\n",
             db_oid, index_oid, (long long)n_vecs, needed / (1024*1024));
@@ -479,11 +526,12 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     if (cmd->dim != e->dim)
     {
         munmap(query, vec_bytes);
-        pthread_mutex_unlock(&g_index_mutex);
         CuvsReplyHeader hdr = {0};
         hdr.status = CUVS_STATUS_DIM_MISMATCH;
         snprintf(hdr.error, sizeof(hdr.error),
                  "query dim %u does not match index dim %u", cmd->dim, e->dim);
+        record_search_stat(e, CUVS_STATUS_DIM_MISMATCH, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
@@ -507,7 +555,6 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     if (ret != 0)
     {
         free(raw);
-        pthread_mutex_unlock(&g_index_mutex);
         CuvsReplyHeader hdr = {0};
         /* ret==2 is the wrapper's own dim-mismatch guard (defense in depth in
          * case the pre-check above is ever bypassed). Everything else maps to
@@ -516,6 +563,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         strncpy(hdr.error,
                 (ret == 2) ? "query dim != index dim" : "CAGRA search failed",
                 sizeof(hdr.error) - 1);
+        record_search_stat(e, hdr.status, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
         send_all(client_fd, &hdr, sizeof(hdr));
         return;
     }
@@ -542,12 +591,14 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     }
     free(raw);
 
-    pthread_mutex_unlock(&g_index_mutex);
-
     clock_gettime(CLOCK_MONOTONIC, &t1);
     uint32_t latency_us = (uint32_t)(
         (t1.tv_sec - t0.tv_sec) * 1000000 +
         (t1.tv_nsec - t0.tv_nsec) / 1000);
+
+    record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
+
+    pthread_mutex_unlock(&g_index_mutex);
 
     CuvsReplyHeader hdr = {0};
     hdr.status     = CUVS_STATUS_OK;
@@ -820,6 +871,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         existing->vram_bytes  = needed;
         existing->last_search = time(NULL);
         existing->valid       = 1;
+        reset_entry_stats(existing);   /* fresh index instance */
     } else {
         if (g_n_indexes >= MAX_INDEXES)
             evict_lru();
@@ -845,6 +897,7 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         e->vram_bytes  = needed;
         e->last_search = time(NULL);
         e->valid       = 1;
+        reset_entry_stats(e);
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -867,6 +920,65 @@ persist_fail:
     free(new_tids);
     pthread_mutex_unlock(&g_index_mutex);
     send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "disk persistence failed");
+}
+
+/* ----------------------------------------------------------------
+ * Handle STATS command (CUVS_OP_STATUS)
+ *
+ * Returns per-index search statistics for the requesting database. The
+ * daemon is the source of truth: counters are cross-backend and survive
+ * individual PG sessions (but reset on index rebuild/reload). With
+ * cmd->index_oid == 0, every resident index in cmd->db_oid is returned;
+ * otherwise just that one. Reply is the standard header (n_results = count)
+ * followed by n_results × CuvsIndexStats.
+ * ---------------------------------------------------------------- */
+static void
+handle_stats(int client_fd, const CuvsCmdFrame *cmd)
+{
+    pthread_mutex_lock(&g_index_mutex);
+
+    /* Bounded by MAX_INDEXES; gather under the lock, send after unlocking. */
+    CuvsIndexStats stats[MAX_INDEXES];
+    uint32_t n = 0;
+
+    for (int i = 0; i < g_n_indexes && n < MAX_INDEXES; i++)
+    {
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid)
+            continue;
+        if (e->db_oid != cmd->db_oid)
+            continue;
+        if (cmd->index_oid != 0 && e->index_oid != cmd->index_oid)
+            continue;
+
+        CuvsIndexStats *s = &stats[n++];
+        memset(s, 0, sizeof(*s));
+        s->db_oid           = e->db_oid;
+        s->index_oid        = e->index_oid;
+        s->dim              = e->dim;
+        s->metric           = e->metric;
+        s->n_vecs           = e->n_vecs;
+        s->vram_bytes       = e->vram_bytes;
+        s->resident         = 1;
+        s->last_status      = e->last_status;
+        s->search_count     = e->search_count;
+        s->error_count      = e->error_count;
+        s->total_latency_us = e->total_latency_us;
+        s->p50_us = cuvs_lat_percentile(e->lat_buckets, CUVS_LAT_BUCKETS, 0.50);
+        s->p95_us = cuvs_lat_percentile(e->lat_buckets, CUVS_LAT_BUCKETS, 0.95);
+        s->p99_us = cuvs_lat_percentile(e->lat_buckets, CUVS_LAT_BUCKETS, 0.99);
+        s->last_search_at   = (int64_t)e->last_search;
+        strncpy(s->last_error, e->last_error, sizeof(s->last_error) - 1);
+    }
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status    = CUVS_STATUS_OK;
+    hdr.n_results = n;
+    send_all(client_fd, &hdr, sizeof(hdr));
+    if (n > 0)
+        send_all(client_fd, stats, (size_t)n * sizeof(CuvsIndexStats));
 }
 
 /* ----------------------------------------------------------------
@@ -901,6 +1013,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_BUILD:
             handle_build(client_fd, &cmd);
+            break;
+        case CUVS_OP_STATUS:
+            handle_stats(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");
