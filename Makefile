@@ -166,6 +166,11 @@ gpu-postinstall:
 	CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/postinstall.sh
 
+# End-to-end durability smoke: build index, restart daemon, verify reload.
+# Piped over stdin (bash -s); plain ssh, no remote TTY needed.
+gpu-e2e:
+	ssh $(GCP_VM) "bash -s" < infra/scripts/e2e-smoke.sh
+
 gpu-server-start:
 	ssh -tt $(GCP_VM) "pg_cuvs_server \
 		--socket /tmp/.s.pg_cuvs \
