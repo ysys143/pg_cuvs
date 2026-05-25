@@ -499,12 +499,25 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
     uint32_t blk;
     uint16_t offset;
     cuvs_tid_decode(tid, &blk, &offset);
-    ss->cur++;
 
-    fprintf(stderr, "[gtdbg] cur=%d/%d tid=%llu blk=%u off=%u\n",
-            ss->cur - 1, ss->n_results, (unsigned long long)tid, blk, offset);
     ItemPointerSet(&scan->xs_heaptid, blk, offset);
     scan->xs_recheck = true;   /* recheck predicate on heap tuple */
+
+    /* ORDER BY support. Because amcanorderbyop is true, the executor may use
+     * IndexNextWithReorder, whose reorder queue reads xs_orderbyvals /
+     * xs_orderbynulls for every returned tuple. If we leave them unset they
+     * hold uninitialized/stale Datums and cmp_orderbyvals dereferences garbage
+     * (segfault, typically on the 2nd scan in a backend once the array holds
+     * stale values). Seed with the daemon's distance and set recheckorderby so
+     * the executor recomputes the exact <-> value on the heap tuple, giving the
+     * correct order regardless of metric or squared-vs-sqrt distance. */
+    if (scan->numberOfOrderBys > 0 && scan->xs_orderbyvals != NULL)
+    {
+        scan->xs_orderbyvals[0]  = Float8GetDatum((double) ss->distances[ss->cur]);
+        scan->xs_orderbynulls[0] = false;
+        scan->xs_recheckorderby  = true;
+    }
+    ss->cur++;
 
     return true;
 }
