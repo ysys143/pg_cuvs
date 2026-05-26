@@ -272,8 +272,8 @@ Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
 
 **결과**:
 - Phase 2에서는 쓰기 후 조용한 오답을 피한다. INSERT된 새 벡터는 base CAGRA에 없으므로 heap recheck만으로는 누락을 보정할 수 없다.
-- Phase 3 pending-delta가 들어오면 base CAGRA result와 delta exact result를 merge해 REINDEX 전에도 정합한 top-k를 유지한다.
-- delta 비율이 `cuvs.rebuild_threshold`를 초과하면 REINDEX/lazy rebuild 권고 또는 background rebuild trigger로 이어진다.
+- Phase 3A pending-delta가 들어오면 base CAGRA result와 CPU-side delta exact result를 snapshot-aware하게 merge해 REINDEX 전에도 정합한 top-k를 유지한다.
+- delta 비율이 `cuvs.rebuild_threshold` 또는 resource limit을 초과하면 GPU+delta path를 중지하고 CPU fallback한다. 자동 background rebuild는 별도 실행 주체가 생기기 전까지 Phase 3A MVP가 아니다.
 
 **대안**:
 - stale index를 계속 GPU로 검색. 거부 — INSERT/UPDATE new row 누락으로 오답 가능.

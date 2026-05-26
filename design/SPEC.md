@@ -219,15 +219,43 @@ the stale marker only after durable persistence succeeds.
 **WRITE-04**
 ```
 In Phase 3, the pg_cuvs extension shall provide a pending-delta correction path:
-INSERT/UPDATE new versions are searched with exact distance over a delta store,
-DELETE/UPDATE old versions are filtered with a tombstone set, and base CAGRA
-candidates plus delta candidates are merged before PostgreSQL heap recheck.
+INSERT/UPDATE new versions are searched with CPU-side exact distance over a
+bounded delta store, DELETE/UPDATE old versions are filtered only when invisible
+to the active PostgreSQL snapshot, and base CAGRA candidates plus delta
+candidates are over-fetched, merged, and re-ranked before PostgreSQL heap
+recheck.
+```
+
+**WRITE-04A**
+```
+The pending-delta path shall not clear or replace the durable stale/generation
+marker unless the base index has been rebuilt and persisted successfully. If a
+daemon restart, missing delta artifact, corrupt delta artifact, or cleanup
+failure prevents safe delta correction, query execution shall fail closed to CPU
+fallback rather than serving the stale base CAGRA graph as fresh.
+```
+
+**WRITE-04B**
+```
+The tombstone mechanism shall be snapshot-aware. A global tombstone shall not
+remove an UPDATE old tuple that remains visible to an older transaction
+snapshot. Heap recheck is not sufficient to recover candidates removed before
+the access method returns them.
+```
+
+**WRITE-04C**
+```
+The delta merge implementation shall define metric-compatible ordering for L2,
+cosine, and inner product, including over-fetch or retry/fallback behavior when
+heap recheck removes candidates and fewer than k visible rows remain.
 ```
 
 **WRITE-05**
 ```
 While the pending-delta set for a cagra index exceeds `cuvs.rebuild_threshold`,
-the pg_cuvs extension shall emit a WARNING or trigger a lazy rebuild policy.
+`cuvs.max_delta_rows`, or another configured resource limit, the pg_cuvs
+extension shall stop using GPU+delta correction and fall back to CPU until a
+successful REINDEX or explicit rebuild policy restores a compact base index.
 ```
 
 ---
