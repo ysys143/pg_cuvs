@@ -35,6 +35,8 @@
 #include "storage/bufmgr.h"
 #include "storage/itemptr.h"
 
+#include <sys/stat.h>
+
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
@@ -176,6 +178,21 @@ get_index_dir(void)
     return buf;
 }
 
+/* Plan-time stale check. The daemon writes a "<db>_<idx>.stale" sidecar when a
+ * heap write marks the index stale (pg_cuvs_server.c stale_file_path); we read
+ * it here so the planner can route around a stale CAGRA index. Pure stat() — no
+ * IPC or CUDA, so it is safe in the cost path. Naming MUST match the daemon. */
+static bool
+cuvs_index_is_stale(Oid index_oid)
+{
+    char        path[MAXPGPATH];
+    struct stat st;
+
+    snprintf(path, sizeof(path), "%s/%u_%u.stale",
+             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+    return stat(path, &st) == 0;
+}
+
 /* ----------------------------------------------------------------
  * Cost model
  *
@@ -197,8 +214,8 @@ get_index_dir(void)
  * first time and inflates Planning Time. Daemon availability is checked at
  * runtime by cuvs_ipc_search; if the daemon is down, gettuple returns
  * CUVS_STATUS_UNAVAILABLE and the executor falls back to CPU with a
- * WARNING. The cost path only needs to short-circuit when the GPU route is
- * explicitly off (enable_cuvs / circuit breaker). */
+ * WARNING. The cost path short-circuits the GPU route when it is explicitly
+ * off (enable_cuvs / circuit breaker) or the index is stale (.stale sidecar). */
 static void
 cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                    Cost *indexStartupCost, Cost *indexTotalCost,
@@ -212,11 +229,15 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     (void) root;
     (void) loop_count;
 
-    /* Process-local signals only — the planner must never touch CUDA or do
-     * IPC. enable_cuvs (GUC) and the circuit breaker (tripped after repeated
-     * runtime failures, i.e. daemon unhealthy) gate the GPU path. dim is
+    /* No CUDA / no IPC in the planner. Three gates turn the GPU path off:
+     * enable_cuvs (GUC), the circuit breaker (repeated runtime failures), and
+     * the .stale sidecar (heap writes since build). A stat() of the stale
+     * marker is local and cheap, unlike IPC — without this gate the planner
+     * keeps choosing a stale CAGRA index whose scan returns no rows. dim is
      * folded into the per-query constant rather than opening the index here. */
-    gpu_off = !enable_cuvs || cuvs_circuit_is_open((uint32_t) index_oid);
+    gpu_off = !enable_cuvs
+           || cuvs_circuit_is_open((uint32_t) index_oid)
+           || cuvs_index_is_stale(index_oid);
 
     if (gpu_off)
     {
@@ -659,11 +680,14 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             switch (rc)
             {
                 case CUVS_STATUS_STALE:
-                    /* Writes happened since build; the GPU graph is missing rows.
-                     * Fall back to the CPU path for correct, current results. */
+                    /* The cost path (cuvs_index_is_stale) normally steers the
+                     * planner away from a stale index, so we only reach here
+                     * when a write marked the index stale between planning and
+                     * this scan. Return no rows for this scan; the next query
+                     * replans onto the CPU path. */
                     ereport(WARNING,
-                            (errmsg("pg_cuvs: cagra index is stale (writes since "
-                                    "build); using CPU fallback"),
+                            (errmsg("pg_cuvs: cagra index went stale mid-scan; "
+                                    "returning no rows (retry replans to CPU)"),
                              errhint("REINDEX the index to re-enable GPU search.")));
                     /* Phase 3: delta correction plugs in here
                      * (stale && delta-available -> GPU+delta, else fallback). */

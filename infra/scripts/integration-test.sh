@@ -543,8 +543,40 @@ start_test_daemon
 run_sql "REINDEX INDEX it_st;" >/dev/null
 [ "$(st_query)" = "f" ] && pass "stale: REINDEX cleared staleness" \
     || fail "stale: REINDEX did not clear (got '$(st_query)')"
+
+# Stale fallback wiring (Phase 2.1): on a table large enough that the planner
+# prefers the cagra index when fresh, a stale index must replan to the CPU (Seq
+# Scan) and return correct rows — not the empty result a stale cagra scan gives.
+# id=g => embedding [g, 7g%997, 13g%997, 29g%997]; probe equals id=5's vector.
+run_sql "DROP TABLE IF EXISTS it_big;
+CREATE TABLE it_big (id bigint, embedding vector(4));
+INSERT INTO it_big SELECT g, format('[%s,%s,%s,%s]', g, (g*7)%997, (g*13)%997, (g*29)%997)::vector
+  FROM generate_series(1,100000) g;
+ANALYZE it_big;
+CREATE INDEX it_big_cagra ON it_big USING cagra (embedding vector_l2_ops);" >/dev/null
+# Guard against a vacuous test: when fresh, the planner must actually pick cagra.
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "it_big_cagra" \
+    && pass "stale-reroute: fresh planner picks cagra (test is non-vacuous)" \
+    || fail "stale-reroute: fresh planner did not pick cagra (table too small?): $OUT"
+# A heap write marks it stale; the same query must now avoid the GPU path.
+run_sql "INSERT INTO it_big VALUES (999999,'[1,1,1,1]');" >/dev/null
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "Seq Scan" \
+    && pass "stale-reroute: stale index replanned off the GPU to Seq Scan" \
+    || fail "stale-reroute: stale index still on the cagra path: $OUT"
+BIGID=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;
+SQL
+)
+[ "$BIGID" = "5" ] \
+    && pass "stale-reroute: stale query returns correct CPU result (id=5, not empty)" \
+    || fail "stale-reroute: stale query wrong/empty result (got '$BIGID', want 5)"
+
 stop_test_daemon
-psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
+psql -d "$DB" -c "DROP TABLE IF EXISTS it_items; DROP TABLE IF EXISTS it_big;" >/dev/null 2>&1 || true
 
 # --- Scenario 11: build memory cap (fail-fast instead of OOM) ----------------
 # A build whose estimated corpus exceeds the cap must ERROR cleanly (catalog

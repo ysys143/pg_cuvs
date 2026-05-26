@@ -302,6 +302,12 @@ SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
 -- Default planner on this tiny table prefers seqscan, so the query returns the
 -- correct CPU-exact nearest (id=1) even while the GPU index is stale.
 SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
+-- The just-inserted row participates: a probe equal to its vector returns id 99,
+-- which a stale GPU graph (missing that row) could not produce. Confirms a stale
+-- index serves current CPU results, not an empty/old GPU answer. (The plan-flip
+-- on a large table where the planner would otherwise pick cagra is asserted in
+-- integration Scenario 10.)
+SELECT id FROM ec ORDER BY embedding <-> '[0.5,0.5,0,0]'::vector LIMIT 1;
 -- REINDEX rebuilds the graph from the current heap and clears staleness.
 REINDEX INDEX ec_cagra;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
