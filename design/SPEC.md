@@ -206,7 +206,9 @@ VRAM-resident base index.
 ```
 While a cagra index is stale and no valid pending-delta correction path exists,
 the pg_cuvs extension shall not use the stale GPU CAGRA path for query results.
-The default policy is CPU fallback.
+The default policy is CPU fallback selected before execution. Returning false
+from `amgettuple` is not CPU fallback; it is an empty index scan and is
+non-compliant with this requirement.
 ```
 
 **WRITE-03**

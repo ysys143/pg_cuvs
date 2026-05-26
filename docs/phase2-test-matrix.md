@@ -13,7 +13,7 @@ Maps each Product Phase 2 feature to the tests that cover it. Layers:
 | LIMIT-k via `cuvs.k` (2) | — (GUC, no helper) | `cuvs.k=7` -> `requested_k=7`, rows bounded | Sc 9 (`cuvs.k=9` -> `requested_k=9`) | — | k sweep (anbench KS) |
 | Metric from opclass (2) | `cuvs_metric_from_opclass_name` | view `metric` = l2/cosine/ip | Sc 9 (cosine build -> metric=cosine) | l2/cosine/ip restart-stable | metric sweep |
 | Planner / cost model (3) | — (cost inline) | EXPLAIN plan-shape: GPU chosen / enable_cuvs=off seqscan / large-k stays GPU | — | — | plan vs bench (manual) |
-| Write/staleness (4) | — (daemon-side) | INSERT->stale=t, REINDEX->stale=f, **DELETE+VACUUM->stale=t** | Sc 10 (stale + .stale restart-persist + REINDEX) | — | — |
+| Write/staleness (4) | — (daemon-side) | INSERT->stale=t, REINDEX->stale=f, **DELETE+VACUUM->stale=t**; automatic query fallback after stale write is reopened | Sc 10 (stale + .stale restart-persist + REINDEX; does not yet assert stale query returns CPU ground truth) | — | — |
 | Build memory cap (5) | — (inline, /proc) | — (MB cap not triggerable on tiny tables) | Sc 11 (cap=1 -> fail-fast, rollback, daemon alive; high cap -> ok) | — | RSS (deferred) |
 | VRAM tiered cache (6) | — | — (MB budget not triggerable on tiny tables) | Sc 12 (evict-to-fit + reload; `pg_stat_gpu_cache` evictions/reloads) | — | — |
 | Persistence / corruption (1.5) | .tids CRC/magic/header rejections | — | Sc 2/3 persist fault, Sc 5 registry-full | restart reload + .tids magic | — |
@@ -28,3 +28,10 @@ Maps each Product Phase 2 feature to the tests that cover it. Layers:
 - **automatic peak backend RSS in benchmarks**: needs cross-process PID tracking; deferred.
 - **delta correction**: Phase 3 (`pg_cuvs.c` gettuple STALE branch has the seam comment).
 - **10M-scale benchmark**: VM-capacity dependent; run when feasible.
+
+## Reopened gap
+- **Automatic stale CPU fallback**: stale marking and `.stale` restart persistence are covered, but
+  a stale cagra query with `enable_cuvs=on` currently reaches `amgettuple`, receives
+  `CUVS_STATUS_STALE`, and returns false from the index scan. That is an empty-result path, not CPU
+  fallback. Phase 2.1 must add stale-aware planner reroute/costing or equivalent real fallback, then
+  add regression/integration coverage against pgvector/CPU ground truth.

@@ -1,8 +1,13 @@
 # Phase 2 — Exit Criteria Audit
 
-Status of the 10 PLAN.md Phase 2 exit criteria. Legend: **MET** / **MET (deviation)**.
+Status of the 10 PLAN.md Phase 2 exit criteria. Legend: **MET** / **MET (deviation)** / **REOPENED**.
 Evidence points to the implementing step and its test(s). See `docs/phase2-test-matrix.md`
 for the full feature->test matrix.
+
+Note: 2026-05-26 re-verification reopened criterion #5. The code marks stale
+and preserves `.stale`, but STALE at `amgettuple` currently returns false,
+which ends the index scan with zero rows instead of causing PostgreSQL to
+replan or execute a CPU fallback path.
 
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
@@ -10,7 +15,7 @@ for the full feature->test matrix.
 | 2 | `LIMIT` reflected in daemon top-k; fixed `k=100` removed | MET (deviation) | Step 2: `cuvs.k` GUC drives daemon top-k; `requested_k` column verifies. Deviation: a PG index AM cannot read SQL `LIMIT` at `amgettuple`, so we use a session GUC (same model as pgvector `hnsw.ef_search`). The hardcoded 100 is gone. |
 | 3 | L2/Cosine/IP metric from opclass/operator identity | MET | Step 2: `cuvs_index_metric` (opfamily identity) at build + scan. Regress: `metric` column = l2/cosine/ip; Integ Sc 9. |
 | 4 | repeated scan / parameterized / transaction / cursor / LATERAL crash-free, locked in regression | MET | edge_cases.sql: repeated same-session scans, LATERAL rescan, SCROLL cursor in a txn block, and PREPARE/EXECUTE `$1` (Step 8). |
-| 5 | After write/delete, a stale index is not silently used | MET | Step 4/7: `aminsert` (INSERT/UPDATE) + `ambulkdelete` (DELETE/VACUUM) mark stale; search -> CPU fallback. Regress: INSERT->stale, DELETE+VACUUM->stale; Integ Sc 10. |
+| 5 | After write/delete, a stale index is not silently used and query results fall back to CPU correctness | REOPENED | Step 4/7 verifies stale marking and `.stale` restart persistence, but not automatic query fallback. Runtime code currently returns false from the STALE branch in `amgettuple`, producing an empty index scan rather than CPU ground-truth results. Phase 2.1 must add stale-aware planner reroute/costing or an equivalent real fallback, plus a test that queries with `enable_cuvs=on` after writes. |
 | 6 | REINDEX clears stale + atomic durable artifact/resident swap | MET | Step 4: build swap resets stale + unlinks `.stale`; persisted `.cagra`/`.tids` atomic rename. Regress: REINDEX->stale=f; Integ Sc 10. |
 | 7 | Large build OOM/failure policy is explicit | MET (deviation) | Step 5: `cuvs.max_build_mem_mb` (0=auto = MemAvailable*ratio) preflight + runtime guard -> fail-fast ERROR. Integ Sc 11. Deviation: cap rejects oversized builds; streaming/mmap handoff is deferred (out of Phase 2 scope). |
 | 8 | VRAM budget overflow -> eviction/reload/fallback observable in stats + logs | MET | Step 6: `load_index` evict-to-fit, `pg_stat_gpu_cache` (evictions/reloads/hits/misses). Integ Sc 12. |
