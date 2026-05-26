@@ -159,10 +159,14 @@ get_index_dir(void)
  * Cost model
  *
  * startup_cost=1000 models UDS round-trip + CUDA context overhead.
- * Per-tuple cost reflects GPU batch parallelism advantage (ADR-003).
+ * Total cost is dominated by the requested top-k, not table size (ADR-003).
  * ---------------------------------------------------------------- */
 #define CUVS_STARTUP_COST      1000.0
-#define CUVS_PER_TUPLE_COST    0.0001
+/* KNN returns ~k rows regardless of table size, so cost is dominated by the
+ * requested top-k (cuvs.k), with only a weak table-size term. This keeps the
+ * GPU path preferred over seqscan+sort on large tables. */
+#define CUVS_K_COST            0.5
+#define CUVS_ROWS_COST         0.00001
 
 /* PG16 amcostestimate is a direct C function pointer, not a SQL function.
  *
@@ -182,12 +186,18 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 {
     double rows = path->path.rows;
     Oid    index_oid = path->indexinfo->indexoid;
+    bool   gpu_off;
 
     (void) root;
     (void) loop_count;
 
-    if (!enable_cuvs
-        || cuvs_circuit_is_open((uint32_t)index_oid))
+    /* Process-local signals only — the planner must never touch CUDA or do
+     * IPC. enable_cuvs (GUC) and the circuit breaker (tripped after repeated
+     * runtime failures, i.e. daemon unhealthy) gate the GPU path. dim is
+     * folded into the per-query constant rather than opening the index here. */
+    gpu_off = !enable_cuvs || cuvs_circuit_is_open((uint32_t) index_oid);
+
+    if (gpu_off)
     {
         *indexStartupCost = 1e9;
         *indexTotalCost   = 1e9;
@@ -195,8 +205,16 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     else
     {
         *indexStartupCost = CUVS_STARTUP_COST;
-        *indexTotalCost   = CUVS_STARTUP_COST + CUVS_PER_TUPLE_COST * rows;
+        *indexTotalCost   = CUVS_STARTUP_COST
+                          + CUVS_K_COST    * (double) cuvs_k
+                          + CUVS_ROWS_COST * rows;
     }
+
+    if (cuvs_debug)
+        ereport(DEBUG1,
+                (errmsg("pg_cuvs: costest oid=%u rows=%.0f k=%d gpu_off=%d total=%.1f",
+                        (uint32_t) index_oid, rows, cuvs_k, (int) gpu_off,
+                        *indexTotalCost)));
 
     *indexSelectivity = 1.0;
     *indexCorrelation = 0.0;

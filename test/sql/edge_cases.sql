@@ -261,6 +261,28 @@ WHERE index_oid IN ('ec_cagra'::regclass, 'ec_cos_cagra'::regclass, 'ec_ip_cagra
 ORDER BY index_name;
 
 -- ============================================================================
+-- Step 3: planner cost model — GPU path chosen for KNN, avoided when off.
+-- Assert deterministic PLAN SHAPE only (COSTS OFF; never cost numbers).
+-- ============================================================================
+-- With seqscan disabled, the KNN order-by can only be served by the cagra
+-- index scan -> the plan must use it.
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5;
+-- A large cuvs.k must NOT flip the choice away from the GPU path.
+SET cuvs.k = 1000;
+EXPLAIN (COSTS OFF)
+SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5;
+RESET cuvs.k;
+RESET enable_seqscan;
+-- enable_cuvs=off makes the cagra cost 1e9; with seqscan enabled the planner
+-- avoids the GPU and uses Seq Scan + Sort instead.
+SET enable_cuvs = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5;
+SET enable_cuvs = on;
+
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 DROP TABLE ec, ec_big, ec_empty, ec_one, ec_d1, ec_d2000, ec_dup, ec_null,
