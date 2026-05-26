@@ -311,6 +311,13 @@ SELECT id FROM ec ORDER BY embedding <-> '[0.5,0.5,0,0]'::vector LIMIT 1;
 -- REINDEX rebuilds the graph from the current heap and clears staleness.
 REINDEX INDEX ec_cagra;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+-- UPDATE marks stale too (aminsert fires on the new, non-HOT row version since
+-- the indexed vector changed). The CPU path reflects the new value: a probe
+-- equal to the updated vector returns id 99, while the stale GPU graph still
+-- holds the old [0.5,0.5,0,0].
+UPDATE ec SET embedding = '[0,0,0.5,0.5]' WHERE id = 99;
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+SELECT id FROM ec ORDER BY embedding <-> '[0,0,0.5,0.5]'::vector LIMIT 1;
 -- DELETE + VACUUM exercises the ambulkdelete path -> marks the index stale.
 DELETE FROM ec WHERE id = 99;
 VACUUM ec;

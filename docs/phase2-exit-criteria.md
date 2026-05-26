@@ -29,3 +29,9 @@ planner routes a stale index to seqscan/CPU. #5 is MET again.
 - **Automatic peak backend RSS** in benchmarks: needs cross-process PID tracking.
 - **10M-scale benchmark**: run when VM capacity allows.
 - **`gpu_kernel_us`/`ipc_us`/`cpu_recheck_us`** split in stats: single daemon timer today.
+- **Small DELETE on a large table does not mark stale**: PostgreSQL VACUUM bypasses
+  index vacuuming when dead tuples touch < ~2% of heap pages, so `ambulkdelete`
+  (and thus the stale marker) is skipped. Benign for correctness — a deleted TID
+  left in the CAGRA graph is filtered by heap recheck/MVCC, so the only effect is
+  mild recall erosion, not a wrong answer. INSERT staleness is unaffected
+  (`aminsert` marks per-row, independent of VACUUM).

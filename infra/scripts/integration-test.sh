@@ -574,6 +574,22 @@ SQL
 [ "$BIGID" = "5" ] \
     && pass "stale-reroute: stale query returns correct CPU result (id=5, not empty)" \
     || fail "stale-reroute: stale query wrong/empty result (got '$BIGID', want 5)"
+# REINDEX clears the .stale sidecar -> the gate must release and the planner go
+# back to the GPU path (proves the cost gate is not sticky / one-way).
+run_sql "REINDEX INDEX it_big_cagra;" >/dev/null
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "it_big_cagra" \
+    && pass "stale-reroute: REINDEX releases the gate (planner back on cagra)" \
+    || fail "stale-reroute: planner did not return to cagra after REINDEX: $OUT"
+# DELETE + VACUUM marks stale via ambulkdelete (not just aminsert) -> same reroute.
+# Delete a large fraction (> id 50000, keeping id 5): VACUUM bypasses index
+# vacuuming when dead tuples touch < ~2% of pages, so a tiny delete on a big
+# table would not call ambulkdelete at all (see PLAN Phase 2 staleness note).
+run_sql "DELETE FROM it_big WHERE id > 50000; VACUUM it_big;" >/dev/null
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "Seq Scan" \
+    && pass "stale-reroute: DELETE+VACUUM (ambulkdelete) also reroutes to Seq Scan" \
+    || fail "stale-reroute: delete-driven stale did not reroute: $OUT"
 
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items; DROP TABLE IF EXISTS it_big;" >/dev/null 2>&1 || true
