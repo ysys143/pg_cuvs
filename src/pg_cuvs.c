@@ -33,6 +33,7 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "storage/bufmgr.h"
+#include "storage/fd.h"
 #include "storage/itemptr.h"
 
 #include <sys/stat.h>
@@ -66,6 +67,7 @@ int   cuvs_circuit_breaker_threshold = 3;
 int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
 int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ratio); >0 = hard cap MB */
 double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
+double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -163,6 +165,17 @@ _PG_init(void)
         0.5, 0.01, 0.95,
         PGC_USERSET,
         0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable(
+        "cuvs.max_stale_fraction",
+        "Deleted-since-build row fraction above which a cagra index reroutes to CPU.",
+        "Backstop for delete drift that the .stale marker misses (e.g. when "
+        "vacuum_index_cleanup is off or VACUUM's failsafe bypasses ambulkdelete). "
+        "Compared at plan time against the .tids build count. 1.0 disables the gate.",
+        &cuvs_max_stale_fraction,
+        0.10, 0.0, 1.0,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
 }
 
 /* Resolve cuvs.index_dir: if empty, default to DataDir/cuvs_indexes */
@@ -191,6 +204,43 @@ cuvs_index_is_stale(Oid index_oid)
     snprintf(path, sizeof(path), "%s/%u_%u.stale",
              get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
     return stat(path, &st) == 0;
+}
+
+/* Plan-time delete-drift gate. The `.stale` marker is set by ambulkdelete, but
+ * VACUUM can skip ambulkdelete entirely (vacuum_index_cleanup=off, the wraparound
+ * failsafe, or the <2%-dead-pages bypass), leaving a stale graph unmarked and
+ * silently eroding recall. As a backstop we read the build-time corpus size from
+ * the `.tids` header (32-byte fixed header, no IPC/CUDA) and compare it to the
+ * planner's current live-row estimate; if the deleted fraction exceeds
+ * cuvs.max_stale_fraction, treat the index as stale. Inserts (live > build) are
+ * already caught per-row by aminsert, so only deletions matter here. */
+static bool
+cuvs_index_delete_drift_stale(Oid index_oid, double live_rows)
+{
+    char            path[MAXPGPATH];
+    FILE           *f;
+    CuvsTidsHeader  hdr;
+    size_t          got;
+
+    if (cuvs_max_stale_fraction >= 1.0 || live_rows < 0.0)
+        return false;   /* gate disabled, or live count unknown */
+
+    snprintf(path, sizeof(path), "%s/%u_%u.tids",
+             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+    f = AllocateFile(path, PG_BINARY_R);
+    if (f == NULL)
+        return false;   /* no persisted artifact -> other gates/paths handle it */
+    got = fread(&hdr, 1, sizeof(hdr), f);
+    FreeFile(f);
+
+    if (got != sizeof(hdr) || hdr.magic != CUVS_TIDS_MAGIC
+        || hdr.version != CUVS_TIDS_VERSION || hdr.n_vecs <= 0)
+        return false;
+    if (live_rows >= (double) hdr.n_vecs)
+        return false;   /* no net deletions vs build */
+
+    return ((double) hdr.n_vecs - live_rows) / (double) hdr.n_vecs
+           > cuvs_max_stale_fraction;
 }
 
 /* ----------------------------------------------------------------
@@ -229,15 +279,17 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     (void) root;
     (void) loop_count;
 
-    /* No CUDA / no IPC in the planner. Three gates turn the GPU path off:
-     * enable_cuvs (GUC), the circuit breaker (repeated runtime failures), and
-     * the .stale sidecar (heap writes since build). A stat() of the stale
-     * marker is local and cheap, unlike IPC — without this gate the planner
-     * keeps choosing a stale CAGRA index whose scan returns no rows. dim is
+    /* No CUDA / no IPC in the planner. Four gates turn the GPU path off:
+     * enable_cuvs (GUC), the circuit breaker (repeated runtime failures), the
+     * .stale sidecar (heap writes since build), and delete-drift (build count
+     * from the .tids header vs the live-row estimate). All are local file/state
+     * reads, not IPC. Without the stale/drift gates the planner keeps choosing a
+     * stale CAGRA index whose scan returns no rows or has eroded recall. dim is
      * folded into the per-query constant rather than opening the index here. */
     gpu_off = !enable_cuvs
            || cuvs_circuit_is_open((uint32_t) index_oid)
-           || cuvs_index_is_stale(index_oid);
+           || cuvs_index_is_stale(index_oid)
+           || cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples);
 
     if (gpu_off)
     {

@@ -29,9 +29,13 @@ planner routes a stale index to seqscan/CPU. #5 is MET again.
 - **Automatic peak backend RSS** in benchmarks: needs cross-process PID tracking.
 - **10M-scale benchmark**: run when VM capacity allows.
 - **`gpu_kernel_us`/`ipc_us`/`cpu_recheck_us`** split in stats: single daemon timer today.
-- **Small DELETE on a large table does not mark stale**: PostgreSQL VACUUM bypasses
-  index vacuuming when dead tuples touch < ~2% of heap pages, so `ambulkdelete`
-  (and thus the stale marker) is skipped. Benign for correctness — a deleted TID
-  left in the CAGRA graph is filtered by heap recheck/MVCC, so the only effect is
-  mild recall erosion, not a wrong answer. INSERT staleness is unaffected
-  (`aminsert` marks per-row, independent of VACUUM).
+- **Delete drift when `ambulkdelete` is suppressed**: PostgreSQL VACUUM can skip
+  index vacuuming (the < ~2%-dead-pages bypass, `vacuum_index_cleanup=off`, or the
+  wraparound failsafe), so the `.stale` marker is not set and recall silently
+  erodes (a deleted TID left in the CAGRA graph is filtered by heap recheck/MVCC,
+  so it is recall loss, not a wrong answer). Phase 2.1 adds a plan-time backstop:
+  `cuvsamcostestimate` compares the `.tids` build count to the live-row estimate
+  and reroutes to CPU once the deleted fraction exceeds `cuvs.max_stale_fraction`
+  (default 0.10; 1.0 disables). Integ Sc 10 isolates this with
+  `vacuum_index_cleanup=off`. Under normal VACUUM the bypass already bounds drift
+  to ~2% of the corpus, largely absorbed by `cuvs.k` over-fetch.

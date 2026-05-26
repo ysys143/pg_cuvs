@@ -591,6 +591,34 @@ echo "$OUT" | grep -q "Seq Scan" \
     && pass "stale-reroute: DELETE+VACUUM (ambulkdelete) also reroutes to Seq Scan" \
     || fail "stale-reroute: delete-driven stale did not reroute: $OUT"
 
+# Delete-drift gate: when ambulkdelete is suppressed (here vacuum_index_cleanup=off,
+# mimicking VACUUM's failsafe/bypass) the .stale marker is never set, yet recall
+# erodes. cuvs.max_stale_fraction catches it at plan time via the .tids build count.
+# REINDEX -> fresh build of 50000 rows, then delete 20% with index cleanup OFF.
+run_sql "REINDEX INDEX it_big_cagra;
+ALTER TABLE it_big SET (vacuum_index_cleanup = off);
+DELETE FROM it_big WHERE id > 40000;
+VACUUM it_big;" >/dev/null
+bigst() { psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid='it_big_cagra'::regclass;
+SQL
+}
+[ "$(bigst)" = "f" ] \
+    && pass "drift-gate: binary .stale NOT set (ambulkdelete suppressed) — isolates drift" \
+    || fail "drift-gate: index unexpectedly binary-stale (got '$(bigst)'); test not isolating drift"
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "Seq Scan" \
+    && pass "drift-gate: 20% deleted (> max_stale_fraction 0.10) reroutes to Seq Scan" \
+    || fail "drift-gate: drift past threshold did not reroute: $OUT"
+# Raising the threshold above the drift disables the gate -> planner back on cagra.
+run_sql "SET cuvs.max_stale_fraction = 1.0;
+EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "it_big_cagra" \
+    && pass "drift-gate: max_stale_fraction=1.0 disables the gate (tunable)" \
+    || fail "drift-gate: gate did not release at threshold 1.0: $OUT"
+
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items; DROP TABLE IF EXISTS it_big;" >/dev/null 2>&1 || true
 
