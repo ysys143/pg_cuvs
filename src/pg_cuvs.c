@@ -3,8 +3,10 @@
  *
  * Architecture: PostgreSQL C extension registering a custom Index AM
  * (Access Method). The planner routes vector similarity queries to the
- * GPU sidecar daemon (pg_cuvs_server) via UDS+shm IPC, or falls back
- * to pgvector HNSW / SeqScan via four automatic fallback conditions.
+ * GPU sidecar daemon (pg_cuvs_server) via UDS+shm IPC, or avoids the
+ * GPU path at plan time through local cost gates so PostgreSQL can use
+ * pgvector HNSW / SeqScan. Runtime GPU failures ERROR rather than
+ * pretending an index scan can switch plans mid-execution.
  *
  * C/C++ split (ADR-001): CUDA code lives in cuvs_wrapper.cu. This file
  * is pure C to avoid the PG/CUDA float4 typedef collision.
@@ -718,18 +720,21 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
     {
         ss->searched = true;
 
-        /* Fallback triggers 1 and 2: GUC or circuit breaker */
+        /* These should normally be caught by cuvsamcostestimate before this
+         * index path is chosen. If they change between planning and execution,
+         * returning false ends this index scan; the next statement replans
+         * through the cost gates. */
         Oid index_oid = RelationGetRelid(scan->indexRelation);
         if (!enable_cuvs || cuvs_circuit_is_open((uint32_t)index_oid))
-            return false;   /* executor retries with HNSW/seqscan */
+            return false;
 
         /* Extract query vector from ORDER BY operator argument */
         if (scan->numberOfOrderBys < 1 || !scan->orderByData)
             return false;
 
         /* A NULL query vector (e.g. `embedding <-> NULL`) has no neighbors.
-         * Returning false routes the scan to the CPU fallback instead of
-         * dereferencing a NULL Datum in DatumGetPgVector below (crash). */
+         * Return an empty scan instead of dereferencing a NULL Datum in
+         * DatumGetPgVector below (crash). */
         if (scan->orderByData[0].sk_flags & SK_ISNULL)
             return false;
 
@@ -799,7 +804,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                 case CUVS_STATUS_DIM_MISMATCH:
                     /* User error: query/index dimension differ. Fail loudly
                      * like pgvector does, rather than silently returning no
-                     * rows via the CPU fallback. */
+                     * rows from this index scan. */
                     ereport(ERROR,
                             (errcode(ERRCODE_DATA_EXCEPTION),
                              errmsg("pg_cuvs: query vector dimension %d does not "
