@@ -718,8 +718,10 @@ psql -d "$DB" -c "DROP TABLE IF EXISTS cc1, cc2;" >/dev/null 2>&1 || true
 
 # --- Scenario 13: clean daemon stop → socket gate → plan-time CPU reroute ------
 # When the daemon is cleanly stopped (SIGTERM unlinks its socket), the plan-time
-# socket-existence gate raises the cagra cost to 1e9. The planner routes to
+# socket-existence gate raises the cagra cost to 1e15. The planner routes to
 # seqscan/CPU and the query returns correct results — no ERROR, no empty result.
+# Needs a table large enough that the planner prefers cagra when fresh (same
+# 100k-row sizing as Scenario 10), else seqscan wins and the test is vacuous.
 echo ""
 echo "[it] --- Scenario 13: clean daemon stop -> socket gate -> CPU reroute ---"
 
@@ -728,7 +730,7 @@ run_sql "
 DROP TABLE IF EXISTS sc13;
 CREATE TABLE sc13 (id int, embedding vector(4));
 INSERT INTO sc13 SELECT g, format('[%s,0,0,0]', g)::vector
-    FROM generate_series(1,1000) g;
+    FROM generate_series(1,100000) g;
 ANALYZE sc13;
 CREATE INDEX sc13_cagra ON sc13 USING cagra (embedding vector_l2_ops);" >/dev/null \
     || fail "sc13: setup failed: $OUT"
@@ -736,7 +738,7 @@ CREATE INDEX sc13_cagra ON sc13 USING cagra (embedding vector_l2_ops);" >/dev/nu
 run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc13 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;"
 echo "$OUT" | grep -q "sc13_cagra" \
     && pass "sc13: GPU path chosen while daemon is up" \
-    || fail "sc13: expected cagra scan while daemon up; got: $OUT"
+    || fail "sc13: expected cagra scan while daemon up (table too small?): $OUT"
 
 stop_test_daemon
 [ ! -S "$TEST_SOCK" ] \
@@ -748,7 +750,7 @@ echo "$OUT" | grep -q "Seq Scan" \
     && pass "sc13: Seq Scan chosen after clean stop (socket gate fired)" \
     || fail "sc13: expected Seq Scan after clean stop; got: $OUT"
 
-SC13_ID=$(psql -d "$DB" -At 2>/dev/null <<SQL
+SC13_ID=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
 SET cuvs.socket_path='$TEST_SOCK';
 SET cuvs.index_dir='$TEST_IDX';
 SELECT id FROM sc13 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;
@@ -775,7 +777,7 @@ run_sql "
 DROP TABLE IF EXISTS sc14;
 CREATE TABLE sc14 (id int, embedding vector(4));
 INSERT INTO sc14 SELECT g, format('[%s,0,0,0]', g)::vector
-    FROM generate_series(1,1000) g;
+    FROM generate_series(1,100000) g;
 ANALYZE sc14;
 CREATE INDEX sc14_cagra ON sc14 USING cagra (embedding vector_l2_ops);" >/dev/null \
     || fail "sc14: setup failed: $OUT"
@@ -783,7 +785,7 @@ CREATE INDEX sc14_cagra ON sc14 USING cagra (embedding vector_l2_ops);" >/dev/nu
 run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc14 ORDER BY embedding <-> '[42,0,0,0]'::vector LIMIT 1;"
 echo "$OUT" | grep -q "sc14_cagra" \
     && pass "sc14: GPU path chosen while daemon is up" \
-    || fail "sc14: expected cagra scan while daemon up; got: $OUT"
+    || fail "sc14: expected cagra scan while daemon up (table too small?): $OUT"
 
 # Simulate crash: SIGKILL leaves the socket file in place
 kill -9 "$DAEMON_PID" 2>/dev/null || true
