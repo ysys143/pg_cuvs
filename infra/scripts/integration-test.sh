@@ -26,6 +26,8 @@
 #                       flows through to the daemon's requested_k.
 #  10. staleness -> a heap write marks the index stale; .stale survives a daemon
 #                       restart; REINDEX clears it.
+#  11. build memory cap -> an oversized build ERRORs (fail-fast, catalog rollback,
+#                       daemon untouched); a normal build under a high cap succeeds.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -539,6 +541,48 @@ run_sql "REINDEX INDEX it_st;" >/dev/null
     || fail "stale: REINDEX did not clear (got '$(st_query)')"
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
+
+# --- Scenario 11: build memory cap (fail-fast instead of OOM) ----------------
+# A build whose estimated corpus exceeds the cap must ERROR cleanly (catalog
+# rollback, daemon untouched). A normal build under a high cap still succeeds.
+echo "[it] --- scenario 11: build memory cap ---"
+fresh_fixture
+start_test_daemon
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+DROP TABLE IF EXISTS mem_items;
+CREATE TABLE mem_items (id bigint, embedding vector(2000));
+WITH v AS (SELECT ('['||string_agg('0',',')||']')::vector(2000) AS e FROM generate_series(1,2000))
+INSERT INTO mem_items SELECT g, v.e FROM generate_series(1,600) g, v;
+ANALYZE mem_items;
+SQL
+# 600 x 2000 x 4 = ~4.8 MB corpus; a 1 MB cap must reject it at preflight.
+if run_sql "SET cuvs.max_build_mem_mb=1; CREATE INDEX mem_idx ON mem_items USING cagra (embedding vector_l2_ops);"; then
+    fail "build-cap: CREATE INDEX unexpectedly succeeded under a 1 MB cap"
+else
+    if echo "$OUT" | grep -q "exceeds the build memory limit"; then
+        pass "build-cap: oversized build ERRORed (fail-fast)"
+    else
+        fail "build-cap: error text unexpected: $OUT"
+    fi
+fi
+MEMIDX=$(psql -d "$DB" -At -c \
+    "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+     JOIN pg_am a ON a.oid=c.relam WHERE i.indrelid='mem_items'::regclass AND a.amname='cagra';" 2>/dev/null || echo ERR)
+[ "$MEMIDX" = "0" ] && pass "build-cap: catalog rolled back (no cagra index)" \
+    || fail "build-cap: stray cagra index after rejected build ($MEMIDX)"
+if kill -0 "$DAEMON_PID" 2>/dev/null; then
+    pass "build-cap: daemon untouched (guard is backend-side, pre-IPC)"
+else
+    fail "build-cap: daemon died on a rejected build"
+fi
+# A normal small build under a high cap is not blocked.
+if run_sql "SET cuvs.max_build_mem_mb=8192; CREATE INDEX it_cagra ON it_items USING cagra (embedding vector_l2_ops);"; then
+    pass "build-cap: normal build succeeds under a high cap"
+else
+    fail "build-cap: high-cap build errored: $OUT"
+fi
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS mem_items, it_items;" >/dev/null 2>&1 || true
 
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then

@@ -62,6 +62,8 @@ char *cuvs_socket_path            = NULL;
 char *cuvs_index_dir              = NULL;
 int   cuvs_circuit_breaker_threshold = 3;
 int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search analog) */
+int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ratio); >0 = hard cap MB */
+double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -138,6 +140,25 @@ _PG_init(void)
         "applies the query's LIMIT. Larger values raise recall and VRAM/latency.",
         &cuvs_k,
         100, 1, 2000,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.max_build_mem_mb",
+        "Backend memory limit (MB) for accumulating a CAGRA build corpus.",
+        "0 = auto (MemAvailable * cuvs.build_mem_safety_ratio). >0 = hard cap in MB. "
+        "CREATE INDEX fails fast with a clear error instead of OOM-killing the backend.",
+        &cuvs_max_build_mem_mb,
+        0, 0, INT_MAX,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable(
+        "cuvs.build_mem_safety_ratio",
+        "Fraction of MemAvailable usable for a build corpus when max_build_mem_mb=0 (auto).",
+        "Only used in auto mode. Lower is safer against OOM; higher allows larger builds.",
+        &cuvs_build_mem_safety_ratio,
+        0.5, 0.01, 0.95,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 }
@@ -262,6 +283,46 @@ cuvs_index_metric(Relation indexRel)
 }
 
 /* ----------------------------------------------------------------
+ * Build memory cap
+ *
+ * cuvs_ambuild accumulates the whole corpus in backend memory before handing
+ * it to the daemon. On a large table that can OOM-kill the backend. The cap
+ * lets a build fail fast with a clear error instead. See plan Step 5.
+ * ---------------------------------------------------------------- */
+static size_t
+read_mem_available_bytes(void)
+{
+    FILE  *f = fopen("/proc/meminfo", "r");
+    char   line[256];
+    size_t kb = 0;
+
+    if (!f)
+        return 0;   /* non-Linux or unreadable: caller treats as "no limit" */
+    while (fgets(line, sizeof(line), f))
+    {
+        if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1)
+            break;
+    }
+    fclose(f);
+    return kb * (size_t) 1024;
+}
+
+/* Effective build-memory cap in bytes. 0 means "no limit" (hard cap unset and
+ * MemAvailable unknown). */
+static size_t
+cuvs_effective_build_cap_bytes(void)
+{
+    if (cuvs_max_build_mem_mb > 0)
+        return (size_t) cuvs_max_build_mem_mb * 1024 * 1024;   /* operator hard cap */
+
+    /* auto: a fraction of currently-available host memory */
+    size_t avail = read_mem_available_bytes();
+    if (avail == 0)
+        return 0;
+    return (size_t) ((double) avail * cuvs_build_mem_safety_ratio);
+}
+
+/* ----------------------------------------------------------------
  * Build state for CREATE INDEX scan
  * ---------------------------------------------------------------- */
 typedef struct CuvsBuildState {
@@ -272,6 +333,7 @@ typedef struct CuvsBuildState {
     uint64_t *tids;       /* malloc'd: [n_allocated] */
     uint32_t metric;      /* CUVS_METRIC_* */
     double   reltuples;
+    size_t   cap_bytes;   /* build memory limit (0 = none); see Step 5 */
 } CuvsBuildState;
 
 static void
@@ -280,6 +342,27 @@ grow_build_buffers(CuvsBuildState *bs)
     int64_t new_size = bs->n_allocated * 2;
     if (new_size < 64)
         new_size = 64;
+
+    /* Runtime guard: catch tables whose preflight estimate was unavailable
+     * (never ANALYZEd) or too low. Free what we hold before erroring so the
+     * ereport longjmp does not leak the malloc'd buffers. */
+    if (bs->cap_bytes > 0)
+    {
+        size_t projected = (size_t) new_size * bs->dim * sizeof(float)
+                         + (size_t) new_size * sizeof(uint64_t);
+        if (projected > bs->cap_bytes)
+        {
+            free(bs->vectors); bs->vectors = NULL;
+            free(bs->tids);    bs->tids = NULL;
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pg_cuvs: build corpus exceeds the build memory limit (%zu MB)",
+                            bs->cap_bytes / (1024 * 1024)),
+                     errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
+                             "cuvs.build_mem_safety_ratio, shard the table, or see "
+                             "docs/playbooks/large-dataset-benchmark.md.")));
+        }
+    }
 
     bs->vectors = realloc(bs->vectors,
                           (size_t)new_size * bs->dim * sizeof(float));
@@ -341,6 +424,38 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     CuvsBuildState bs;
     memset(&bs, 0, sizeof(bs));
     bs.metric = cuvs_index_metric(indexRel);  /* baked into the CAGRA graph */
+    bs.cap_bytes = cuvs_effective_build_cap_bytes();
+
+    /* Preflight: estimate the corpus size from the planner's row estimate and
+     * the indexed column's declared dimension, and fail before scanning if it
+     * would blow the build memory limit. (Unknown dim/reltuples -> skip; the
+     * runtime guard in grow_build_buffers still protects accumulation.) */
+    if (bs.cap_bytes > 0)
+    {
+        AttrNumber heap_attno = indexInfo->ii_IndexAttrNumbers[0];
+        int32 typmod = (heap_attno >= 1)
+            ? TupleDescAttr(RelationGetDescr(heapRel), heap_attno - 1)->atttypmod
+            : -1;
+        double reltuples = heapRel->rd_rel->reltuples;
+        if (typmod > 0 && reltuples > 0)
+        {
+            size_t est = (size_t) reltuples * (size_t) typmod * sizeof(float)
+                       + (size_t) reltuples * sizeof(uint64_t);
+            if (est > bs.cap_bytes)
+                ereport(ERROR,
+                        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                         errmsg("pg_cuvs: estimated build corpus %zu MB exceeds the "
+                                "build memory limit (%zu MB)",
+                                est / (1024 * 1024), bs.cap_bytes / (1024 * 1024)),
+                         errdetail("%s",
+                                   cuvs_max_build_mem_mb > 0
+                                   ? "Limit is the cuvs.max_build_mem_mb hard cap."
+                                   : "Limit is auto (MemAvailable * cuvs.build_mem_safety_ratio)."),
+                         errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
+                                 "cuvs.build_mem_safety_ratio, shard the table, or see "
+                                 "docs/playbooks/large-dataset-benchmark.md.")));
+        }
+    }
 
     /* Scan all live heap tuples, collect vectors + TIDs */
     bs.reltuples = table_index_build_scan(
