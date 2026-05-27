@@ -458,7 +458,9 @@ usable_gpu(int i)
 }
 
 /* Pick the GPU with the most VRAM headroom for a new index of `needed` bytes.
- * Returns device_id or -1 if no device can fit. */
+ * Returns device_id or -1 if no device can fit even in principle (needed >
+ * budget). Does NOT reject based on current usage -- ensure_vram handles
+ * eviction to make room. */
 static int
 pick_gpu_for_index(size_t needed)
 {
@@ -469,11 +471,11 @@ pick_gpu_for_index(size_t needed)
     {
         int dev = usable_gpu(i);
         size_t budget = g_max_vram_per_gpu[dev];
-        size_t used   = total_vram_used(dev);
-        if (budget > 0 && used + needed > budget)
+        if (budget > 0 && needed > budget)
             continue;
+        size_t used = total_vram_used(dev);
         size_t headroom = (budget > 0) ? (budget - used) : gpu_free_vram_bytes(dev);
-        if (headroom > best_headroom || best < 0) {
+        if (best < 0 || headroom > best_headroom) {
             best_headroom = headroom;
             best = dev;
         }
