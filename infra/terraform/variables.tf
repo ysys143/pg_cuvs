@@ -52,9 +52,15 @@ variable "ssh_pub_key_path" {
 }
 
 variable "gpu_count" {
-  description = "Number of GPUs (1=a2-highgpu-1g, 2=a2-highgpu-2g, 4=a2-highgpu-4g, 8=a2-highgpu-8g)"
+  description = "Number of GPUs for the multi-GPU instance (2/4/8). Set >1 to create pg-cuvs-dev-mgpu."
   type        = number
   default     = 1
+}
+
+variable "mgpu_zone" {
+  description = "Zone for the multi-GPU instance (may differ from dev VM zone due to capacity)"
+  type        = string
+  default     = "us-central1-f"
 }
 
 variable "preemptible" {

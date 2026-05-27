@@ -78,6 +78,7 @@ resource "google_compute_instance" "pg_cuvs_mgpu" {
   count        = var.gpu_count > 1 ? 1 : 0
   name         = "${var.instance_name}-mgpu"
   machine_type = "a2-highgpu-${var.gpu_count}g"
+  zone         = var.mgpu_zone
   tags         = ["pg-cuvs-dev"]
 
   guest_accelerator {
