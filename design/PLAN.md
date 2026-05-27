@@ -463,16 +463,50 @@ Phase 3D 완료 기준:
 
 #### Phase 3E — Multi-GPU / Sharding
 
-구현 항목:
-- shard 단위 index build/search.
-- GPU assignment와 VRAM budget per device.
-- query fanout 후 top-k merge.
-- PCIe/NUMA topology 고려.
+Scope decision:
+- Phase 3E의 본체는 PostgreSQL partitioning recipe가 아니라 **daemon-level multi-GPU runtime**이다.
+- PostgreSQL partitioning은 하나의 logical parent table을 여러 physical CAGRA indexes로 나누어 multi-GPU runtime을 활용하는 integration recipe일 뿐이다.
+- 단일 physical CAGRA index를 여러 GPU shard로 자동 분할하는 internal sub-index sharding은 3E MVP가 아니라 optional/future subphase다.
+- 이미 완료된 Phase 3A/3C/3D 번호는 유지한다. 3E 내부 subphase만 분리한다.
+
+3E-0 Architecture decision:
+- PG-Strom 조사 결과를 반영한다: partitioning과 multi-GPU는 별개다. PG-Strom의 partition pushdown은 PostgreSQL child relation 최적화이고, multi-GPU device support는 별도 runtime/scheduler 기능이다.
+- pg_cuvs도 partitioning을 multi-GPU의 구현체로 착각하지 않는다. multi-GPU는 daemon의 GPU context, index placement, dispatch, stats 계층에서 구현한다.
+
+3E-1 Daemon-level multi-GPU runtime:
+- daemon startup에서 모든 CUDA device를 발견하고 device별 cuVS/CUDA context와 worker/stream 상태를 초기화한다.
+- `IndexEntry`를 단일 전역 VRAM registry에서 per-GPU resident registry로 확장한다.
+- build/load/warmup 시 physical index artifact를 하나의 GPU에 배치한다. 기본 placement는 VRAM-aware이며, round-robin은 tie-breaker로만 쓴다.
+- search request는 index가 resident한 GPU context로 dispatch한다.
+- GPU별 VRAM budget, resident index count, search count, evictions, reloads, failures를 추적한다.
+- planner/backend가 CUDA를 직접 touch하지 않는 기존 계약을 유지한다.
+
+3E-2 Placement and degraded policy:
+- GPU unavailable, VRAM pressure, placement failure, reload failure를 구분한다.
+- index placement 실패 시 DDL은 명확한 ERROR, SELECT는 CPU fallback 또는 circuit-breaker reroute로 닫는다.
+- GPU별 eviction은 다른 GPU의 resident indexes에 영향을 주지 않아야 한다.
+- `cuvs.max_vram_mb`는 global-only가 아니라 per-device budget으로 해석하거나 별도 per-GPU override를 둔다.
+
+3E-3 Partitioned logical-table integration:
+- 하나의 parent table에 대한 query가 child partition CAGRA indexes를 사용하고, 각 physical index가 3E runtime에 의해 GPU별로 분산 배치되는 recipe를 문서화/검증한다.
+- global top-k correctness는 `enable_cuvs=off` CPU exact result와 비교한다.
+- single-GPU VM에서는 planner shape와 correctness만 검증하고, 실제 GPU별 placement는 multi-GPU VM에서 acceptance로 검증한다.
+
+3E-4 Multi-GPU hardware acceptance:
+- ephemeral 4/8-GPU VM 또는 DGX/HGX급 노드에서 검증한다.
+- 여러 physical CAGRA indexes가 서로 다른 GPUs에 resident함을 stats와 daemon log로 확인한다.
+- concurrent searches가 GPU별로 dispatch되고, per-GPU VRAM/cache counters가 독립적으로 움직이는지 검증한다.
+
+3E-5 Optional/future internal sub-index sharding:
+- 단일 non-partitioned table / 단일 logical CAGRA index를 여러 GPU shard로 나누는 설계는 별도 고급 기능으로 둔다.
+- 이 기능은 CAGRA graph split, per-shard over-fetch, daemon fanout, top-k merge, recall policy를 새로 요구하므로 3E MVP 완료 기준에 넣지 않는다.
 
 Phase 3E 완료 기준:
-- multi-GPU shard fanout과 top-k merge가 metric-compatible하게 동작한다.
+- daemon-level multi-GPU runtime이 여러 CUDA devices를 관리하고, physical CAGRA indexes를 GPU별로 배치/검색할 수 있다.
 - GPU별 VRAM budget과 eviction policy가 서로 간섭하지 않는다.
-- single-GPU fallback 또는 degraded mode가 명확하다.
+- GPU unavailable / placement failure / VRAM pressure에 대한 degraded mode가 명확하다.
+- partitioned parent table recipe는 하나의 logical table query로 보이면서 여러 physical CAGRA indexes를 multi-GPU runtime에 태우는 방식을 검증한다.
+- internal sub-index sharding은 명시적으로 future work로 남긴다.
 
 #### Phase 3F — Operational Playbooks / Runbooks
 
@@ -483,7 +517,7 @@ Phase 3E 완료 기준:
 - replica bootstrap / instance replacement runbook.
 - object storage permission failure, corrupt manifest, heap compatibility mismatch 대응.
 - async warmup/cache hydration 진단.
-- multi-GPU shard warmup, per-GPU VRAM pressure, shard failure/degraded mode 복구.
+- multi-GPU runtime warmup, per-GPU VRAM pressure, placement failure/degraded mode 복구.
 - capacity planning: VRAM, NVMe, object storage artifact size, delta growth.
 - on-call triage: stats view, daemon logs, PostgreSQL warnings/errors, GCS audit/logging 확인 순서.
 
