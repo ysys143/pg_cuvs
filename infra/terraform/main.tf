@@ -39,10 +39,10 @@ resource "google_compute_instance" "pg_cuvs_dev" {
   machine_type = var.machine_type
   tags         = ["pg-cuvs-dev"]
 
-  # GPU (A100 default; see variables.tf accelerator_type / gpu_count)
+  # GPU (A100 default; single-GPU dev instance)
   guest_accelerator {
     type  = var.accelerator_type
-    count = var.gpu_count
+    count = 1
   }
 
   scheduling {
@@ -68,6 +68,44 @@ resource "google_compute_instance" "pg_cuvs_dev" {
   metadata = local.ssh_metadata
 
   # Startup script: NVIDIA driver + CUDA + Miniforge + cuVS + PG16 + pgvector
+  metadata_startup_script = file("${path.module}/scripts/install_gpu_env.sh")
+
+  allow_stopping_for_update = true
+}
+
+# Multi-GPU VM for Phase 3E testing (optional — set gpu_count > 1 to create)
+resource "google_compute_instance" "pg_cuvs_mgpu" {
+  count        = var.gpu_count > 1 ? 1 : 0
+  name         = "${var.instance_name}-mgpu"
+  machine_type = "a2-highgpu-${var.gpu_count}g"
+  tags         = ["pg-cuvs-dev"]
+
+  guest_accelerator {
+    type  = var.accelerator_type
+    count = var.gpu_count
+  }
+
+  scheduling {
+    on_host_maintenance = "TERMINATE"
+    automatic_restart   = !var.preemptible
+    preemptible         = var.preemptible
+  }
+
+  boot_disk {
+    initialize_params {
+      image = "ubuntu-os-cloud/ubuntu-2204-lts"
+      size  = var.disk_size_gb
+      type  = "pd-ssd"
+    }
+  }
+
+  network_interface {
+    network = "default"
+    access_config {}
+  }
+
+  metadata = local.ssh_metadata
+
   metadata_startup_script = file("${path.module}/scripts/install_gpu_env.sh")
 
   allow_stopping_for_update = true

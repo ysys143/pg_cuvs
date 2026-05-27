@@ -22,3 +22,12 @@ output "env_gpu_snippet" {
     CUDA_ARCH=sm_80
   EOT
 }
+
+output "mgpu_external_ip" {
+  value       = var.gpu_count > 1 ? google_compute_instance.pg_cuvs_mgpu[0].network_interface[0].access_config[0].nat_ip : ""
+  description = "Multi-GPU instance IP (empty if gpu_count=1)"
+}
+
+output "mgpu_instance_name" {
+  value = var.gpu_count > 1 ? google_compute_instance.pg_cuvs_mgpu[0].name : ""
+}
