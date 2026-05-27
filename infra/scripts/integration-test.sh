@@ -97,6 +97,13 @@ start_test_daemon() {
         cat /tmp/pg_cuvs_test_daemon.log || true
         return 1
     fi
+    # Phase 3A: the PG backend (postgres user) writes the .delta sidecar into
+    # TEST_IDX, but this test daemon runs as the test-runner user (ubuntu). Make
+    # TEST_IDX writable by both so backend delta-append succeeds. (Production
+    # runs the daemon as the postgres user with a 0700 dir; this 0777 is a
+    # test-fixture concession — the prod permission model is exercised by the
+    # regression suite against the postgres-owned production daemon.)
+    chmod 0777 "$TEST_IDX" 2>/dev/null || true
 }
 
 stop_test_daemon() {

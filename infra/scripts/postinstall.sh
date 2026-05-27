@@ -44,6 +44,36 @@ else
     echo "[postinstall] shared_preload_libraries already present"
 fi
 
+echo "[postinstall] ensure pg-cuvs-server runs as the postgres user"
+# Phase 3A: the PG backend writes the .delta pending-insert sidecar into
+# cuvs.index_dir, so that directory must be writable by the postgres backend
+# user. Running the daemon as postgres (same user as the backend) keeps a single
+# index_dir (.cagra/.tids/.stale/.delta) with a simple owner=postgres 0700 model.
+UNIT=/etc/systemd/system/pg-cuvs-server.service
+if [ -f "$UNIT" ]; then
+    if ! grep -qE '^User=postgres' "$UNIT"; then
+        sudo sed -i 's/^User=.*/User=postgres/; s/^Group=.*/Group=postgres/' "$UNIT"
+        sudo systemctl daemon-reload
+        echo "[postinstall] set pg-cuvs-server User/Group=postgres (daemon-reload)"
+    else
+        echo "[postinstall] pg-cuvs-server already runs as postgres"
+    fi
+    # Migrate any pre-existing index_dir owned by a different user. Parse the
+    # --index-dir from the unit's ExecStart; default to /tmp/cuvs_indexes.
+    IDX_DIR=$(grep -oE -- '--index-dir[= ][^ ]+' "$UNIT" | head -1 | sed -E 's/--index-dir[= ]//')
+    IDX_DIR=${IDX_DIR:-/tmp/cuvs_indexes}
+    if [ -d "$IDX_DIR" ]; then
+        sudo systemctl stop pg-cuvs-server 2>/dev/null || true
+        sudo chown -R postgres:postgres "$IDX_DIR"
+        sudo chmod 0700 "$IDX_DIR"
+        sudo systemctl start pg-cuvs-server 2>/dev/null || true
+        echo "[postinstall] index_dir $IDX_DIR -> postgres:postgres 0700"
+    fi
+else
+    echo "[postinstall] WARN: $UNIT not found; create it with User=postgres so the"
+    echo "[postinstall]       backend can write the .delta sidecar into cuvs.index_dir"
+fi
+
 echo "[postinstall] restart PostgreSQL"
 sudo systemctl restart postgresql
 
