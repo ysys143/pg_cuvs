@@ -83,6 +83,7 @@ int   cuvs_delta_search_mode       = 0;    /* 0=auto, 1=cpu, 2=gpu (Phase 3A-3) 
 char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty = disabled (Phase 3C) */
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
+int   cuvs_warmup_threads          = 2;    /* background download/load threads in daemon (Phase 3D) */
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -240,6 +241,16 @@ _PG_init(void)
         "Empty string uses the GCP instance metadata server for authentication.",
         &cuvs_gcs_key_file,
         "",
+        PGC_SUSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.warmup_threads",
+        "Number of background warmup threads in the daemon (Phase 3D).",
+        "Controls how many GCS downloads can run concurrently during startup "
+        "or on-demand cache miss warmup. Passed to daemon via --warmup-threads.",
+        &cuvs_warmup_threads,
+        2, 1, 8,
         PGC_SUSET,
         0, NULL, NULL, NULL);
 }
@@ -1862,7 +1873,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 26
+#define GPU_STATS_NCOLS 31
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -1975,6 +1986,23 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         values[25] = CStringGetTextDatum(
             s->delta_search_mode == 2 ? "gpu" :
             s->delta_search_mode == 1 ? "cpu" : "none");
+
+        /* Phase 3D: warmup stats */
+        {
+            static const char *warmup_names[] = {
+                "hot", "cold", "queued", "downloading", "loading", "failed"
+            };
+            values[26] = CStringGetTextDatum(
+                s->warmup_state < 6 ? warmup_names[s->warmup_state] : "unknown");
+        }
+        if (s->last_warmup_at != 0)
+            values[27] = TimestampTzGetDatum(
+                time_t_to_timestamptz((pg_time_t) s->last_warmup_at));
+        else
+            nulls[27] = true;
+        values[28] = Int32GetDatum((int32) s->warmup_duration_ms);
+        values[29] = Int64GetDatum((int64) s->download_count);
+        values[30] = Int64GetDatum((int64) s->cache_miss_count);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

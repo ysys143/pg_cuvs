@@ -47,6 +47,16 @@
  * ---------------------------------------------------------------- */
 #define MAX_INDEXES 64
 
+/* Phase 3D: per-index warmup lifecycle state. */
+typedef enum WarmupState {
+    WARMUP_HOT          = 0,
+    WARMUP_COLD         = 1,
+    WARMUP_QUEUED       = 2,
+    WARMUP_DOWNLOADING  = 3,
+    WARMUP_LOADING      = 4,
+    WARMUP_FAILED       = 5,
+} WarmupState;
+
 typedef struct IndexEntry {
     uint32_t        db_oid;
     uint32_t        index_oid;
@@ -84,6 +94,7 @@ typedef struct IndexEntry {
     uint32_t        last_returned_k;   /* rows last OK search returned */
     uint64_t        delta_merged_count; /* searches where daemon merged delta on GPU */
     char            last_error[128];
+    WarmupState      warmup_state;     /* Phase 3D: WARMUP_HOT for resident indexes */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -130,6 +141,25 @@ static IndexEntry  g_indexes[MAX_INDEXES];
 static int         g_n_indexes   = 0;
 static pthread_mutex_t g_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Phase 3D: cold index registry — indexes known from .relfilenode sidecars but
+ * not yet VRAM-resident. Protected by g_index_mutex. When warmup completes,
+ * the entry is removed here and load_index() adds it to g_indexes. */
+typedef struct ColdIndexEntry {
+    uint32_t    db_oid;
+    uint32_t    index_oid;
+    uint32_t    relfilenode;
+    uint32_t    table_oid;
+    WarmupState warmup_state;
+    time_t      last_warmup_at;
+    uint32_t    warmup_duration_ms;
+    uint64_t    download_count;
+    uint64_t    cache_miss_count;
+    int         valid;
+} ColdIndexEntry;
+
+static ColdIndexEntry g_cold_indexes[MAX_INDEXES];
+static int            g_n_cold_indexes = 0;
+
 /* Daemon-global VRAM cache counters (mutated under g_index_mutex). Exposed via
  * CUVS_OP_CACHE_STATS / pg_stat_gpu_cache. Per-index counters can't track this
  * because eviction destroys the IndexEntry. */
@@ -150,6 +180,222 @@ static volatile int g_shutdown    = 0;
 static char   g_snapshot_uri[512] = ""; /* "gs://bucket[/prefix]"; empty = disabled */
 static char   g_cluster_id[128]   = ""; /* multi-node identifier for GCS path */
 static char   g_gcs_key_file[512] = ""; /* service account JSON; empty = instance metadata */
+
+/* ----------------------------------------------------------------
+ * Phase 3D: background warmup thread pool + queue
+ * ---------------------------------------------------------------- */
+typedef struct WarmupJob {
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t relfilenode;
+    uint32_t table_oid;
+    int      from_cache_miss;
+} WarmupJob;
+
+#define WARMUP_QUEUE_MAX 64
+
+static WarmupJob       g_warmup_queue[WARMUP_QUEUE_MAX];
+static int             g_warmup_head  = 0;
+static int             g_warmup_tail  = 0;
+static int             g_warmup_count = 0;
+static pthread_mutex_t g_warmup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_warmup_cond  = PTHREAD_COND_INITIALIZER;
+static int             g_warmup_nthreads = 2;
+static pthread_t       g_warmup_tids[8];
+
+static int
+warmup_enqueue(uint32_t db_oid, uint32_t index_oid,
+               uint32_t relfilenode, uint32_t table_oid,
+               int from_cache_miss)
+{
+    pthread_mutex_lock(&g_warmup_mutex);
+
+    /* Duplicate check: skip if already queued or downloading. */
+    for (int i = 0; i < g_warmup_count; i++)
+    {
+        int idx = (g_warmup_head + i) % WARMUP_QUEUE_MAX;
+        if (g_warmup_queue[idx].db_oid == db_oid &&
+            g_warmup_queue[idx].index_oid == index_oid)
+        {
+            pthread_mutex_unlock(&g_warmup_mutex);
+            return -1;
+        }
+    }
+
+    if (g_warmup_count >= WARMUP_QUEUE_MAX)
+    {
+        pthread_mutex_unlock(&g_warmup_mutex);
+        return -1;
+    }
+
+    WarmupJob *j = &g_warmup_queue[g_warmup_tail];
+    j->db_oid         = db_oid;
+    j->index_oid      = index_oid;
+    j->relfilenode    = relfilenode;
+    j->table_oid      = table_oid;
+    j->from_cache_miss = from_cache_miss;
+    g_warmup_tail = (g_warmup_tail + 1) % WARMUP_QUEUE_MAX;
+    g_warmup_count++;
+
+    pthread_cond_signal(&g_warmup_cond);
+    pthread_mutex_unlock(&g_warmup_mutex);
+    return 0;
+}
+
+static int
+warmup_dequeue(WarmupJob *out)
+{
+    pthread_mutex_lock(&g_warmup_mutex);
+    while (g_warmup_count == 0 && !g_shutdown)
+        pthread_cond_wait(&g_warmup_cond, &g_warmup_mutex);
+
+    if (g_shutdown)
+    {
+        pthread_mutex_unlock(&g_warmup_mutex);
+        return -1;
+    }
+
+    *out = g_warmup_queue[g_warmup_head];
+    g_warmup_head = (g_warmup_head + 1) % WARMUP_QUEUE_MAX;
+    g_warmup_count--;
+    pthread_mutex_unlock(&g_warmup_mutex);
+    return 0;
+}
+
+/* Forward declarations for warmup worker. */
+static int load_index(uint32_t db_oid, uint32_t index_oid);
+
+static void *
+warmup_worker_thread(void *arg)
+{
+    (void)arg;
+    while (!g_shutdown)
+    {
+        WarmupJob job;
+        if (warmup_dequeue(&job) != 0)
+            break;
+
+        LOG_INFO("warmup: downloading %u/%u from GCS\n",
+                 job.db_oid, job.index_oid);
+
+        /* Update cold entry state -> DOWNLOADING (under g_index_mutex). */
+        pthread_mutex_lock(&g_index_mutex);
+        for (int i = 0; i < g_n_cold_indexes; i++)
+        {
+            ColdIndexEntry *ce = &g_cold_indexes[i];
+            if (ce->valid && ce->db_oid == job.db_oid &&
+                ce->index_oid == job.index_oid)
+            {
+                ce->warmup_state = WARMUP_DOWNLOADING;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        int rc = cuvs_objstore_download(
+            g_snapshot_uri, g_cluster_id, g_gcs_key_file,
+            g_index_dir, job.db_oid, job.index_oid,
+            job.relfilenode, NULL);
+
+        if (rc != 0)
+        {
+            LOG_WARN("warmup: GCS download failed for %u/%u\n",
+                     job.db_oid, job.index_oid);
+            pthread_mutex_lock(&g_index_mutex);
+            for (int i = 0; i < g_n_cold_indexes; i++)
+            {
+                ColdIndexEntry *ce = &g_cold_indexes[i];
+                if (ce->valid && ce->db_oid == job.db_oid &&
+                    ce->index_oid == job.index_oid)
+                {
+                    ce->warmup_state = WARMUP_FAILED;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_index_mutex);
+            continue;
+        }
+
+        /* Download succeeded — load into VRAM. */
+        pthread_mutex_lock(&g_index_mutex);
+
+        /* Mark LOADING. */
+        ColdIndexEntry *target_ce = NULL;
+        for (int i = 0; i < g_n_cold_indexes; i++)
+        {
+            ColdIndexEntry *ce = &g_cold_indexes[i];
+            if (ce->valid && ce->db_oid == job.db_oid &&
+                ce->index_oid == job.index_oid)
+            {
+                ce->warmup_state = WARMUP_LOADING;
+                target_ce = ce;
+                break;
+            }
+        }
+
+        if (load_index(job.db_oid, job.index_oid) != 0)
+        {
+            LOG_WARN("warmup: VRAM load failed for %u/%u\n",
+                     job.db_oid, job.index_oid);
+            if (target_ce)
+                target_ce->warmup_state = WARMUP_FAILED;
+            pthread_mutex_unlock(&g_index_mutex);
+            continue;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint32_t dur_ms = (uint32_t)((t1.tv_sec - t0.tv_sec) * 1000 +
+                                     (t1.tv_nsec - t0.tv_nsec) / 1000000);
+
+        /* Propagate warmup stats to the hot entry. */
+        IndexEntry *he = NULL;
+        for (int i = 0; i < g_n_indexes; i++)
+        {
+            if (g_indexes[i].valid && g_indexes[i].db_oid == job.db_oid &&
+                g_indexes[i].index_oid == job.index_oid)
+            {
+                he = &g_indexes[i];
+                break;
+            }
+        }
+        if (he)
+        {
+            he->warmup_state = WARMUP_HOT;
+        }
+
+        /* Remove from cold registry (shift down). */
+        if (target_ce)
+        {
+            int ci = (int)(target_ce - g_cold_indexes);
+            for (int i = ci; i < g_n_cold_indexes - 1; i++)
+                g_cold_indexes[i] = g_cold_indexes[i + 1];
+            g_n_cold_indexes--;
+        }
+
+        pthread_mutex_unlock(&g_index_mutex);
+
+        /* Clean up stale delta/tombstone sidecars from a previous generation. */
+        {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%u_%u.delta",
+                     g_index_dir, job.db_oid, job.index_oid);
+            unlink(path);
+            snprintf(path, sizeof(path), "%s/%u_%u.tombstone",
+                     g_index_dir, job.db_oid, job.index_oid);
+            unlink(path);
+            snprintf(path, sizeof(path), "%s/%u_%u.stale",
+                     g_index_dir, job.db_oid, job.index_oid);
+            unlink(path);
+        }
+
+        LOG_INFO("warmup: %u/%u loaded into VRAM in %u ms\n",
+                 job.db_oid, job.index_oid, dur_ms);
+    }
+    return NULL;
+}
 
 /* ----------------------------------------------------------------
  * VRAM helpers
@@ -593,6 +839,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
     e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
     e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+    e->warmup_state = WARMUP_HOT;
     reset_entry_stats(e);
 
     /* Restore staleness from the .stale sidecar so a daemon restart does not
@@ -639,10 +886,11 @@ startup_load_indexes(void)
     }
     closedir(dir);
 
-    /* Phase 3C: second pass — for indexes that have a .relfilenode sidecar
-     * but no local .cagra, try downloading from GCS. The .relfilenode sidecar
-     * serves as the registry: its presence means the extension built this index
-     * here and the daemon should maintain it. */
+    /* Phase 3D: second pass — for indexes that have a .relfilenode sidecar
+     * but no local .cagra, register as COLD and enqueue background download.
+     * The daemon opens its UDS socket before these downloads complete, so
+     * queries for COLD indexes get NOT_FOUND -> CPU fallback until warmup
+     * finishes. */
     if (g_snapshot_uri[0] == '\0')
         return;
 
@@ -653,11 +901,9 @@ startup_load_indexes(void)
     while ((ent = readdir(dir)) != NULL)
     {
         uint32_t db_oid, index_oid;
-        /* Match "<db_oid>_<index_oid>.relfilenode" */
         if (sscanf(ent->d_name, "%u_%u.relfilenode", &db_oid, &index_oid) != 2)
             continue;
 
-        /* Skip if already resident in the registry (loaded in first pass) */
         int already_loaded = 0;
         for (int i = 0; i < g_n_indexes; i++)
         {
@@ -676,31 +922,24 @@ startup_load_indexes(void)
         read_relfilenode_sidecar(g_index_dir, db_oid, index_oid,
                                  &local_rfn, &local_table_oid);
 
-        LOG_INFO("objstore: local .cagra missing for %u/%u, trying GCS download\n",
+        if (g_n_cold_indexes < MAX_INDEXES)
+        {
+            ColdIndexEntry *ce = &g_cold_indexes[g_n_cold_indexes++];
+            ce->db_oid            = db_oid;
+            ce->index_oid         = index_oid;
+            ce->relfilenode       = local_rfn;
+            ce->table_oid         = local_table_oid;
+            ce->warmup_state      = WARMUP_QUEUED;
+            ce->last_warmup_at    = 0;
+            ce->warmup_duration_ms = 0;
+            ce->download_count    = 0;
+            ce->cache_miss_count  = 0;
+            ce->valid             = 1;
+        }
+
+        warmup_enqueue(db_oid, index_oid, local_rfn, local_table_oid, 0);
+        LOG_INFO("warmup: enqueued background download for %u/%u\n",
                  db_oid, index_oid);
-
-        int rc = cuvs_objstore_download(
-            g_snapshot_uri,
-            g_cluster_id,
-            g_gcs_key_file,
-            g_index_dir,
-            db_oid,
-            index_oid,
-            local_rfn,   /* 0 = skip compat check */
-            NULL         /* build_timestamp_out */
-        );
-
-        if (rc == 0)
-        {
-            LOG_INFO("objstore: download succeeded for %u/%u, loading\n",
-                     db_oid, index_oid);
-            load_index(db_oid, index_oid);
-        }
-        else
-        {
-            LOG_WARN("objstore: download failed for %u/%u; will rebuild on first query\n",
-                     db_oid, index_oid);
-        }
     }
     closedir(dir);
 }
@@ -877,6 +1116,32 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 
     if (!e)
     {
+        /* Phase 3D: if GCS is configured, check the cold registry. If this
+         * index is known-but-not-resident, enqueue a background download
+         * (if not already queued/downloading). The current query still gets
+         * NOT_FOUND -> CPU fallback; once the download completes, subsequent
+         * queries will find the index resident. */
+        if (g_snapshot_uri[0] != '\0')
+        {
+            for (int i = 0; i < g_n_cold_indexes; i++)
+            {
+                ColdIndexEntry *ce = &g_cold_indexes[i];
+                if (ce->valid && ce->db_oid == cmd->db_oid &&
+                    ce->index_oid == cmd->index_oid)
+                {
+                    ce->cache_miss_count++;
+                    if (ce->warmup_state == WARMUP_COLD ||
+                        ce->warmup_state == WARMUP_FAILED)
+                    {
+                        ce->warmup_state = WARMUP_QUEUED;
+                        warmup_enqueue(ce->db_oid, ce->index_oid,
+                                       ce->relfilenode, ce->table_oid, 1);
+                    }
+                    break;
+                }
+            }
+        }
+
         pthread_mutex_unlock(&g_index_mutex);
         CuvsReplyHeader hdr = {0};
         hdr.status = CUVS_STATUS_NOT_FOUND;
@@ -1431,6 +1696,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         e->stale_since = 0;
         e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
         e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+        e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+        e->warmup_state = WARMUP_HOT;
         reset_entry_stats(e);
     }
 
@@ -1546,7 +1813,35 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->delta_vram_bytes   = e->delta_vram_bytes;
         s->delta_merged_count = e->delta_merged_count;
         s->delta_search_mode  = (e->delta_idx && e->n_delta > 0) ? 2 : 0;
-        s->_pad0              = 0;
+        s->warmup_state       = (uint32_t)e->warmup_state;
+        s->last_warmup_at     = 0;
+        s->warmup_duration_ms = 0;
+        s->download_count     = 0;
+        s->cache_miss_count   = 0;
+    }
+
+    /* Phase 3D: also emit cold (not-yet-resident) entries so operators can
+     * see warmup progress in pg_stat_gpu_search. */
+    for (int i = 0; i < g_n_cold_indexes && n < MAX_INDEXES; i++)
+    {
+        ColdIndexEntry *ce = &g_cold_indexes[i];
+        if (!ce->valid)
+            continue;
+        if (ce->db_oid != cmd->db_oid)
+            continue;
+        if (cmd->index_oid != 0 && ce->index_oid != cmd->index_oid)
+            continue;
+
+        CuvsIndexStats *s = &stats[n++];
+        memset(s, 0, sizeof(*s));
+        s->db_oid             = ce->db_oid;
+        s->index_oid          = ce->index_oid;
+        s->resident           = 0;
+        s->warmup_state       = (uint32_t)ce->warmup_state;
+        s->last_warmup_at     = (int64_t)ce->last_warmup_at;
+        s->warmup_duration_ms = ce->warmup_duration_ms;
+        s->download_count     = (uint32_t)ce->download_count;
+        s->cache_miss_count   = ce->cache_miss_count;
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -1700,6 +1995,18 @@ graceful_shutdown(void)
 {
     LOG_INFO("pg_cuvs_server: SIGTERM received, serializing indexes...\n");
 
+    /* Phase 3D: signal warmup workers to exit and wait for them. */
+    if (g_snapshot_uri[0] != '\0')
+    {
+        pthread_mutex_lock(&g_warmup_mutex);
+        pthread_cond_broadcast(&g_warmup_cond);
+        pthread_mutex_unlock(&g_warmup_mutex);
+
+        for (int i = 0; i < g_warmup_nthreads; i++)
+            pthread_join(g_warmup_tids[i], NULL);
+        LOG_INFO("warmup: all worker threads joined\n");
+    }
+
     pthread_mutex_lock(&g_index_mutex);
     int saved = 0, failed = 0;
     for (int i = 0; i < g_n_indexes; i++)
@@ -1748,6 +2055,12 @@ main(int argc, char **argv)
             strncpy(g_cluster_id, argv[++i], sizeof(g_cluster_id) - 1);
         else if (strcmp(argv[i], "--gcs-key-file") == 0 && i+1 < argc)
             strncpy(g_gcs_key_file, argv[++i], sizeof(g_gcs_key_file) - 1);
+        else if (strcmp(argv[i], "--warmup-threads") == 0 && i+1 < argc)
+        {
+            int n = atoi(argv[++i]);
+            if (n >= 1 && n <= 8)
+                g_warmup_nthreads = n;
+        }
     }
 
     LOG_INFO("pg_cuvs_server: starting (socket=%s index-dir=%s snapshot=%s)\n",
@@ -1815,6 +2128,17 @@ main(int argc, char **argv)
     }
 
     LOG_INFO("pg_cuvs_server: listening on %s\n", g_socket_path);
+
+    /* Phase 3D: spawn warmup worker threads. They process the queue populated
+     * by startup_load_indexes() Pass 2 and by on-demand cache miss triggers.
+     * Workers download from GCS and load into VRAM in background while the
+     * daemon is already accepting queries. */
+    if (g_snapshot_uri[0] != '\0')
+    {
+        for (int i = 0; i < g_warmup_nthreads; i++)
+            pthread_create(&g_warmup_tids[i], NULL, warmup_worker_thread, NULL);
+        LOG_INFO("warmup: spawned %d worker threads\n", g_warmup_nthreads);
+    }
 
     /* Accept loop */
     while (!g_shutdown)

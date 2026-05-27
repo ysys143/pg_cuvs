@@ -116,7 +116,12 @@ CREATE FUNCTION pg_cuvs_gpu_search_stats(
     OUT delta_generation   bigint,
     OUT delta_vram_bytes   bigint,
     OUT delta_merged_count bigint,
-    OUT delta_search_mode  text
+    OUT delta_search_mode  text,
+    OUT warmup_state       text,
+    OUT last_warmup_at     timestamptz,
+    OUT warmup_duration_ms integer,
+    OUT download_count     bigint,
+    OUT cache_miss_count   bigint
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'
