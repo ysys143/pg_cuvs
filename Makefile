@@ -72,10 +72,15 @@ SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
                  -D_POSIX_C_SOURCE=200809L
 SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -lstdc++ \
                  -Wl,-rpath,$(CUVS_LIB) \
-                 -lpthread -lrt
+                 -lpthread -lrt \
+                 -lcurl -lssl -lcrypto
 
 # server .c → .o (not via PGXS — separate rule with no PG headers)
-src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h
+src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h
+	$(CC) $(SERVER_CFLAGS) -c $< -o $@
+
+# cuvs_objstore.o for server (GCS client — not linked into the PG extension .so)
+src/cuvs_objstore_server.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuvs_ipc.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
 # cuvs_ipc.o for server (same source, no PG headers needed)
@@ -88,7 +93,7 @@ src/cuvs_ipc_server.o: src/cuvs_ipc.c src/cuvs_ipc.h
 src/cuvs_util_server.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_wrapper.o
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_wrapper.o
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -106,7 +111,7 @@ install-server: server
 SERVER_TEST_BIN     = pg_cuvs_server_test
 SERVER_TEST_CFLAGS  = $(SERVER_CFLAGS) -DCUVS_TEST_HOOKS
 
-src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h
+src/pg_cuvs_server_test.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cuvs_wrapper.h src/cuvs_objstore.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
 src/cuvs_ipc_server_test.o: src/cuvs_ipc.c src/cuvs_ipc.h
@@ -115,7 +120,10 @@ src/cuvs_ipc_server_test.o: src/cuvs_ipc.c src/cuvs_ipc.h
 src/cuvs_util_server_test.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_wrapper.o
+src/cuvs_objstore_server_test.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuvs_ipc.h
+	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
+
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_wrapper.o
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)

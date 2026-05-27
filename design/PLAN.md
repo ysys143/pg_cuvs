@@ -334,15 +334,14 @@ query vector
   -> if visible rows < k and more candidates may exist, retry with larger slop or CPU fallback
 ```
 
-MVP scope decision:
-- Phase 3A MVP의 delta exact search는 **backend CPU-side**로 수행한다.
-- 이유: daemon GPU-side delta는 per-insert IPC, daemon-owned vector memory, restart durability, VRAM pressure를 동시에 키운다. Phase 3A의 목적은 write-after-build 정합성 회복이며, delta 크기가 작을 때 CPU exact가 가장 좁은 구현이다.
-- GPU-side/batched daemon delta는 Phase 3A MVP가 아니라 후속 최적화다.
-- delta가 비용 한계 또는 정합성 한계를 넘으면 stale GPU를 억지로 쓰지 않고 CPU fallback한다.
-- 이번 increment는 **3A-0 + 3A-1 CPU-exact MVP only**다. daemon-side delta cache, GPU brute-force delta, new IPC op, stats column 확장, snapshot-aware tombstone은 별도 increment다.
+Delivered scope:
+- **3A-1 CPU-exact MVP**: backend-side `.delta` append + CPU exact merge로 INSERT/UPDATE new version을 보정한다.
+- **3A-2 GPU delta cache core**: daemon이 `.delta`를 generation/mtime 기준 lazy reload하고, resident GPU brute-force delta cache를 base CAGRA 결과와 merge한다. IPC reply의 `delta_merged` flag로 backend가 CPU merge fallback을 생략할지 결정한다.
+- daemon-side GPU delta cache는 성능 경로이고, backend CPU merge는 daemon이 merge하지 못한 경우의 correctness fallback이다.
+- 아직 남은 후속 increment: `cuvs.delta_search=cpu|gpu|auto`, delta stats columns, incremental zero-reupload delta updates, snapshot-aware tombstone.
 
 구현 항목:
-- pending-delta 저장소: backend-visible local/sidecar metadata MVP. daemon-owned GPU delta는 제외한다.
+- pending-delta 저장소: backend-visible `.delta` sidecar. daemon은 같은 artifact를 읽어 resident GPU brute-force cache를 구성한다.
 - delta entry schema: TID, vector, op type(INSERT/UPDATE-new), base generation, write generation, xmin 또는 heap recheck에 필요한 최소 metadata.
 - `aminsert` policy: delta append 성공 시 daemon `MARK_STALE`을 보내지 않는다. delta append 실패 시 기존 stale path로 fail closed한다.
 - persistent generation marker: delta artifact가 어떤 base CAGRA generation을 보정하는지 확인한다. generation mismatch는 GPU+delta를 사용하지 않고 CPU reroute한다.
@@ -350,7 +349,7 @@ MVP scope decision:
 - over-fetch policy: base CAGRA와 delta exact 모두 `k + slop`을 대상으로 merge한다. heap recheck 후 visible rows가 k 미만이면 slop 확대 또는 CPU fallback한다.
 - write capture batching: `COPY`/bulk INSERT가 per-row IPC storm을 만들지 않도록 batch capture 또는 threshold-then-CPU-fallback 정책을 둔다.
 - threshold/backpressure policy: `cuvs.rebuild_threshold` 또는 `cuvs.max_delta_rows` 초과 시 GPU+delta path를 중지하고 CPU fallback한다. background rebuild는 Phase 3A MVP 범위 밖이며, 자동 실행 주체가 생기기 전까지는 `REINDEX` 권고만 한다.
-- stats: 이번 CPU MVP에서는 schema 확장을 하지 않는다. deterministic tests와 optional DEBUG/NOTICE만 사용하고, stats columns는 GPU delta cache increment에서 추가한다.
+- stats: 아직 schema 확장을 하지 않는다. `pg_stat_gpu_search` delta columns는 다음 increment다.
 - rebuild compaction: successful REINDEX 후 pending-delta를 비우고 새 base generation으로 교체한다.
 
 정합성 원칙:
@@ -376,7 +375,7 @@ PostgreSQL transaction/MVCC caveat:
 - delta threshold 초과 시 GPU+delta path가 중지되고 CPU reroute 또는 REINDEX 권고가 발생한다.
 - daemon restart 후 delta가 유실되어도 generation/delta validity gate 때문에 incomplete GPU 결과를 서빙하지 않는다.
 - aborted transaction delta가 가까운 distance를 갖더라도 heap recheck 후 k개 recall이 유지되거나 CPU fallback한다.
-- L2/cosine/IP 각각에서 pgvector CPU ground truth와 top-k가 일치한다.
+- L2/cosine/IP 각각에서 GPU delta merge 결과가 pgvector CPU ground truth와 top-k가 일치한다. Integration Sc 15는 daemon log assertion으로 resident GPU delta cache가 실제 build됐음을 확인한다.
 - random INSERT/UPDATE/DELETE/query interleaving property test를 추가한다.
 - bulk INSERT/COPY에서 delta append와 threshold/backpressure 정책이 daemon IPC storm 없이 동작한다.
 
@@ -386,6 +385,12 @@ Phase 3A 완료 기준:
 - DELETE/VACUUM은 기존 `.stale` CPU reroute 정책을 유지한다.
 - delta 손상 또는 cleanup 실패는 CPU fallback으로 닫힌다.
 - over-fetch recall, restart fail-closed, metric-specific merge가 regression/integration/property test로 검증된다.
+
+Phase 3A remaining increments:
+- `cuvs.delta_search=cpu|gpu|auto` tri-mode GUC.
+- `pg_stat_gpu_search` delta columns(`delta_rows`, `delta_generation`, `delta_search_mode`, `delta_merged`, delta latency).
+- incremental zero-reupload delta cache updates.
+- snapshot-aware DELETE/UPDATE-old tombstone correction.
 
 #### Phase 3B — DiskANN / Vamana Local NVMe
 
@@ -405,43 +410,49 @@ Phase 3B 완료 기준:
 - local NVMe DiskANN/Vamana search가 CAGRA-only path와 동일 metric semantics를 유지한다.
 - hot CAGRA + cold DiskANN tiered search가 동작한다.
 
-#### Phase 3C — Artifact Manifest / S3-backed Immutable Index Snapshots
+#### Phase 3C — Artifact Manifest / Object Storage-backed Immutable Index Snapshots
 
 구현 항목:
-- local `cuvs.index_dir` artifact를 S3 snapshot으로 확장한다.
-- 경로: `s3://<bucket>/pg_cuvs/<cluster_id>/<database_oid>/<index_oid>/<version>/`
+- local `cuvs.index_dir` artifact를 object storage snapshot으로 확장한다.
+- object storage snapshot은 **heap/table 배포 수단이 아니다**. PostgreSQL heap은 physical replication, basebackup/WAL archive, managed replica, logical replication, dump/restore 같은 PostgreSQL 메커니즘이 책임진다.
+- pg_cuvs snapshot은 heap-compatible PostgreSQL node가 이미 존재할 때, GPU/NVMe index rebuild 시간을 줄이는 derived index artifact cache다.
+- MVP provider는 GCS로 시작하고, provider-neutral manifest를 유지한다. S3는 후속 provider로 추가 가능해야 한다.
+- 경로 예: `gs://<bucket>/pg_cuvs/<cluster_id>/<database_oid>/<index_oid>/<version>/`
 - manifest, checksum, version을 둬 partial upload/corrupt upload/stale upload를 감지한다.
-- local NVMe는 cache, S3는 재사용 가능한 artifact store로 취급한다.
+- local NVMe는 cache, object storage는 재사용 가능한 artifact store로 취급한다.
 - index artifact는 WAL 대상이 아닌 derived data로 유지한다.
 
 Manifest contract:
 - `database_oid`
+- `table_oid`
 - `index_oid`
-- `relfilenode` 또는 build source identity
+- heap compatibility identity: `relfilenode` 또는 build source identity, plus any snapshot/checkpoint marker needed to prove the local heap can use the TID mapping
 - `base_generation`
 - metric, dimension, vector count
 - artifact paths와 checksums
 - build timestamp
 - pg_cuvs version과 cuVS version
 - stale/delta compatibility marker
+- replica compatibility marker: target node must already have a compatible PostgreSQL heap; otherwise the artifact must not be loaded
 
 Phase 3C 완료 기준:
-- manifest-backed S3 snapshot upload/download가 성공한다.
+- manifest-backed GCS snapshot upload/download가 성공한다.
 - partial upload, corrupt artifact, stale manifest, missing local cache가 감지되고 복구 또는 CPU fallback으로 닫힌다.
 - snapshot artifact는 PostgreSQL WAL source-of-truth가 아니라 재생성 가능한 derived data로 유지된다.
+- heap-incompatible node는 artifact를 로드하지 않고 REINDEX 또는 PostgreSQL restore/replication 절차를 요구한다.
 
 #### Phase 3D — Replica / Multi-node Loading + Async Warmup
 
 구현 항목:
-- primary에서 build 후 S3 upload.
-- read replica는 heap scan rebuild 없이 S3에서 download/load.
+- primary에서 build 후 object storage upload.
+- read replica는 heap scan rebuild 없이 object storage에서 download/load.
 - catalog OID, relfilenode 변화, manifest version mapping을 관리한다.
 - daemon startup 시 metadata만 scan하고 hot index를 background prefetch한다.
-- NVMe cache miss 시 S3 download 후 VRAM promotion한다.
+- NVMe cache miss 시 object storage download 후 VRAM promotion한다.
 - warmup 상태와 miss reason을 stats view에 노출한다.
 
 Phase 3D 완료 기준:
-- 새 daemon 또는 read replica가 heap rebuild 없이 S3 snapshot에서 index를 복구한다.
+- 새 daemon 또는 read replica가 heap rebuild 없이 object storage snapshot에서 index를 복구한다.
 - startup은 metadata scan으로 빠르게 시작하고, hot artifact는 background warmup으로 적재한다.
 - warmup/cache miss/download/reload 상태가 stats view에 노출된다.
 
@@ -487,7 +498,7 @@ Phase 3 전체 완료 기준:
 | 실행 모델 | PG + GPU sidecar | PG in-process | PG + LanceDB | 전용 서버 |
 | SQL/트랜잭션 | 완전 지원 목표 | 완전 지원 | 제한적 | 없음 |
 | GPU 가속 | CAGRA/Vamana build | 없음 | 없음 | 일부 |
-| 데이터 규모 | VRAM hot + NVMe/S3 cold | NVMe DiskANN | S3/Lance | 외부 cluster |
+| 데이터 규모 | VRAM hot + NVMe/object storage cold | NVMe DiskANN | S3/Lance | 외부 cluster |
 | 운영 복잡도 | 중간 | 낮음 | 낮음 | 높음 |
 | 타겟 워크로드 | Operational vector search | Operational vector search | Analytics | Dedicated vector DB |
 

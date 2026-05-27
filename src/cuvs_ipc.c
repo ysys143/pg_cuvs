@@ -440,7 +440,9 @@ cuvs_ipc_build(
     int64_t        n_vecs,
     int            dim,
     uint32_t       metric,
-    const char    *index_dir)
+    const char    *index_dir,
+    uint32_t       table_oid,
+    uint32_t       relfilenode)
 {
     char shm_key[64];
     int  shm_fd = -1;
@@ -467,13 +469,15 @@ cuvs_ipc_build(
     }
 
     CuvsCmdFrame cmd = {
-        .op        = CUVS_OP_BUILD,
-        .db_oid    = db_oid,
-        .index_oid = index_oid,
-        .k         = 0,
-        .metric    = metric,
-        .dim       = (uint32_t)dim,
-        .n_vecs    = n_vecs,
+        .op          = CUVS_OP_BUILD,
+        .db_oid      = db_oid,
+        .index_oid   = index_oid,
+        .k           = 0,
+        .metric      = metric,
+        .dim         = (uint32_t)dim,
+        .n_vecs      = n_vecs,
+        .table_oid   = table_oid,
+        .relfilenode = relfilenode,
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 

@@ -166,7 +166,7 @@
 
 **결과**:
 - Phase 2 NVMe tiered caching과 자연스럽게 연결 — index_dir을 NVMe 마운트 포인트로 설정 가능
-- Phase 3 S3 연동 시 동일 경로 추상화 재사용 가능
+- Phase 3C object storage snapshot 연동 시 동일 경로 추상화 재사용 가능
 - SIGTERM 수신 시 모든 VRAM 상주 인덱스를 직렬화 후 종료
 - 시작 시 `pg_catalog.pg_index`에 존재하는 OID와 대조해 유효한 인덱스만 로드
 
@@ -240,21 +240,23 @@ Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
 
 ---
 
-## ADR-013 — Phase 3 S3: Derived Data + S3 Source of Truth 방향
+## ADR-013 — Phase 3C Object Storage: Derived Data + Snapshot Source of Truth 방향
 
 **날짜**: 2026-05-23
+**상태**: S3-specific 표현에서 GCS-first object storage 설계로 일반화됨
 
 **문제**: 수십억 규모 인덱스를 어떻게 저장하고 멀티노드에서 공유할지 결정이 필요하다.
 
 **결정**: 두 단계로 전환.
 
-- **Phase 3 MVP**: 인덱스를 derived data로 취급 (WAL 제외). S3 스냅샷은 재빌드 시간 절약용 캐시로 사용. 장애 시 테이블에서 재빌드 가능.
-- **Phase 3 v2**: S3를 Source of Truth로 전환. 로컬 NVMe는 io_uring 비동기 프리페치 캐시. 인스턴스 교체 또는 읽기 전용 레플리카가 S3에서 직접 로드.
+- **Phase 3C MVP**: 인덱스를 derived data로 취급 (WAL 제외). Object storage snapshot은 heap-compatible PostgreSQL node에서 재빌드 시간을 줄이는 캐시로 사용한다. Heap/table 배포는 PostgreSQL backup/replication이 책임진다. MVP provider는 GCS다.
+- **Phase 3C v2**: Object storage를 derived index artifact의 snapshot source로 전환. 로컬 NVMe는 io_uring 비동기 프리페치 캐시. 인스턴스 교체 또는 읽기 전용 레플리카가 compatible heap을 이미 가진 경우 object storage에서 index artifact를 직접 로드한다.
 
 **결과**:
 - MVP 단계에서 구현 복잡도 최소화
-- 멀티노드 공유 필요 시 S3 SoT 전환으로 자연스럽게 진화
-- 인덱스 파일은 `pg_basebackup` WAL 스트림에서 제외 (`SPEC.md S3-03` 참조)
+- 멀티노드 공유 필요 시 object storage snapshot source로 자연스럽게 진화
+- 인덱스 파일은 `pg_basebackup` WAL 스트림에서 제외 (`SPEC.md OBJSTORE-03` 참조)
+- heap 없이 index artifact만 있는 노드는 사용할 수 없다. TID mapping은 로컬 PostgreSQL heap block/offset과 호환되어야 한다.
 
 ---
 

@@ -76,6 +76,9 @@ int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ra
 double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
 double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
 int   cuvs_max_delta_rows          = 10000; /* pending-insert delta cap; 0 disables delta (Phase 3A) */
+char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty = disabled (Phase 3C) */
+char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
+char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -195,6 +198,33 @@ _PG_init(void)
         &cuvs_max_delta_rows,
         10000, 0, INT_MAX,
         PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "cuvs.snapshot_uri",
+        "GCS root URI for artifact snapshots (Phase 3C).",
+        "Format: gs://bucket[/prefix]. Empty string disables GCS upload/download.",
+        &cuvs_snapshot_uri,
+        "",
+        PGC_SUSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "cuvs.cluster_id",
+        "Cluster identifier used in the GCS artifact path (Phase 3C).",
+        "Distinguishes artifacts from multiple pg_cuvs clusters sharing a bucket.",
+        &cuvs_cluster_id,
+        "",
+        PGC_SUSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "cuvs.gcs_key_file",
+        "Path to GCP service account JSON key file (Phase 3C).",
+        "Empty string uses the GCP instance metadata server for authentication.",
+        &cuvs_gcs_key_file,
+        "",
+        PGC_SUSET,
         0, NULL, NULL, NULL);
 }
 
@@ -744,6 +774,8 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     /* Send corpus to daemon for CAGRA build */
+    uint32_t heap_table_oid  = (uint32_t)RelationGetRelid(heapRel);
+    uint32_t heap_relfilenode = (uint32_t)heapRel->rd_rel->relfilenode;
     int rc = cuvs_ipc_build(
         cuvs_socket_path,
         (uint32_t)MyDatabaseId,
@@ -753,7 +785,9 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         bs.n_vecs,
         bs.dim,
         bs.metric,
-        get_index_dir());
+        get_index_dir(),
+        heap_table_oid,
+        heap_relfilenode);
 
     free(bs.vectors);
     free(bs.tids);
@@ -788,6 +822,23 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                  errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
                         "aborted to preserve catalog durability", rc),
                  errhint("%s", hint)));
+    }
+
+    /* Phase 3C: write .relfilenode sidecar so the daemon can verify heap
+     * compatibility before loading a GCS artifact on a new node. */
+    {
+        char sidecar[MAXPGPATH];
+        snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
+                 get_index_dir(),
+                 (uint32_t)MyDatabaseId,
+                 (uint32_t)RelationGetRelid(indexRel));
+        FILE *f = fopen(sidecar, "w");
+        if (f)
+        {
+            fprintf(f, "%u %u\n", heap_relfilenode, heap_table_oid);
+            fclose(f);
+        }
+        /* Non-fatal: GCS download will skip compat check if sidecar is absent */
     }
 
     /* Phase 3A: the fresh base absorbs all current rows, so any pending-insert

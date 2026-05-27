@@ -19,6 +19,8 @@
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
 #include "cuvs_wrapper.h"
+#include "cuvs_objstore.h"
+#include <curl/curl.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,11 +138,14 @@ static uint64_t g_cache_persist_fail = 0;
 /* ----------------------------------------------------------------
  * Configuration
  * ---------------------------------------------------------------- */
-static char   g_socket_path[256] = "/tmp/.s.pg_cuvs.server";
-static char   g_index_dir[256]   = "/tmp/pg_cuvs_indexes";
-static size_t g_max_vram_bytes   = 0;  /* 0 = unlimited */
-static int    g_server_fd        = -1;
-static volatile int g_shutdown   = 0;
+static char   g_socket_path[256]  = "/tmp/.s.pg_cuvs.server";
+static char   g_index_dir[256]    = "/tmp/pg_cuvs_indexes";
+static size_t g_max_vram_bytes    = 0;   /* 0 = unlimited */
+static int    g_server_fd         = -1;
+static volatile int g_shutdown    = 0;
+static char   g_snapshot_uri[512] = ""; /* "gs://bucket[/prefix]"; empty = disabled */
+static char   g_cluster_id[128]   = ""; /* multi-node identifier for GCS path */
+static char   g_gcs_key_file[512] = ""; /* service account JSON; empty = instance metadata */
 
 /* ----------------------------------------------------------------
  * VRAM helpers
@@ -200,6 +205,28 @@ delta_file_path(char *out, size_t outlen,
                 const char *dir, uint32_t db_oid, uint32_t index_oid)
 {
     snprintf(out, outlen, "%s/%u_%u.delta", dir, db_oid, index_oid);
+}
+
+/* Phase 3C: heap compatibility sidecar; written by the extension at build time.
+ * Format: "<relfilenode> <table_oid>\n" */
+static void
+relfilenode_file_path(char *out, size_t outlen,
+                      const char *dir, uint32_t db_oid, uint32_t index_oid)
+{
+    snprintf(out, outlen, "%s/%u_%u.relfilenode", dir, db_oid, index_oid);
+}
+
+static int
+read_relfilenode_sidecar(const char *dir, uint32_t db_oid, uint32_t index_oid,
+                         uint32_t *rfn_out, uint32_t *table_oid_out)
+{
+    char path[512];
+    relfilenode_file_path(path, sizeof(path), dir, db_oid, index_oid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int ok = (fscanf(f, "%u %u", rfn_out, table_oid_out) == 2);
+    fclose(f);
+    return ok ? 0 : -1;
 }
 
 /* ----------------------------------------------------------------
@@ -533,6 +560,71 @@ startup_load_indexes(void)
          * rejects .tids files). See cuvs_parse_index_filename. */
         if (cuvs_parse_index_filename(ent->d_name, &db_oid, &index_oid) == 0)
             load_index(db_oid, index_oid);
+    }
+    closedir(dir);
+
+    /* Phase 3C: second pass — for indexes that have a .relfilenode sidecar
+     * but no local .cagra, try downloading from GCS. The .relfilenode sidecar
+     * serves as the registry: its presence means the extension built this index
+     * here and the daemon should maintain it. */
+    if (g_snapshot_uri[0] == '\0')
+        return;
+
+    dir = opendir(g_index_dir);
+    if (!dir)
+        return;
+
+    while ((ent = readdir(dir)) != NULL)
+    {
+        uint32_t db_oid, index_oid;
+        /* Match "<db_oid>_<index_oid>.relfilenode" */
+        if (sscanf(ent->d_name, "%u_%u.relfilenode", &db_oid, &index_oid) != 2)
+            continue;
+
+        /* Skip if already resident in the registry (loaded in first pass) */
+        int already_loaded = 0;
+        for (int i = 0; i < g_n_indexes; i++)
+        {
+            if (g_indexes[i].valid &&
+                g_indexes[i].db_oid    == db_oid &&
+                g_indexes[i].index_oid == index_oid)
+            {
+                already_loaded = 1;
+                break;
+            }
+        }
+        if (already_loaded)
+            continue;
+
+        uint32_t local_rfn = 0, local_table_oid = 0;
+        read_relfilenode_sidecar(g_index_dir, db_oid, index_oid,
+                                 &local_rfn, &local_table_oid);
+
+        LOG_INFO("objstore: local .cagra missing for %u/%u, trying GCS download\n",
+                 db_oid, index_oid);
+
+        int rc = cuvs_objstore_download(
+            g_snapshot_uri,
+            g_cluster_id,
+            g_gcs_key_file,
+            g_index_dir,
+            db_oid,
+            index_oid,
+            local_rfn,   /* 0 = skip compat check */
+            NULL         /* build_timestamp_out */
+        );
+
+        if (rc == 0)
+        {
+            LOG_INFO("objstore: download succeeded for %u/%u, loading\n",
+                     db_oid, index_oid);
+            load_index(db_oid, index_oid);
+        }
+        else
+        {
+            LOG_WARN("objstore: download failed for %u/%u; will rebuild on first query\n",
+                     db_oid, index_oid);
+        }
     }
     closedir(dir);
 }
@@ -961,6 +1053,55 @@ fsync_path(const char *path)
 }
 
 /* ----------------------------------------------------------------
+ * Phase 3C: detached upload thread — spawned after OK reply so that
+ * CREATE INDEX returns immediately. Upload failure is non-fatal; the
+ * local artifact is already durable at this point.
+ * ---------------------------------------------------------------- */
+typedef struct {
+    char     snapshot_uri[512];
+    char     cluster_id[128];
+    char     gcs_key_file[512];
+    char     cagra_path[512];
+    char     tids_path[512];
+    uint32_t db_oid;
+    uint32_t table_oid;
+    uint32_t index_oid;
+    uint32_t relfilenode;
+    uint32_t metric;
+    uint32_t dim;
+    int64_t  vector_count;
+} UploadThreadArgs;
+
+static void *
+objstore_upload_thread(void *arg)
+{
+    UploadThreadArgs *a = (UploadThreadArgs *)arg;
+    int rc = cuvs_objstore_upload(
+        a->snapshot_uri,
+        a->cluster_id,
+        a->gcs_key_file,
+        a->cagra_path,
+        a->tids_path,
+        a->db_oid,
+        a->table_oid,
+        a->index_oid,
+        a->relfilenode,
+        a->metric,
+        a->dim,
+        a->vector_count,
+        0   /* base_generation: not yet tracked at upload time */
+    );
+    if (rc == 0)
+        LOG_INFO("objstore: uploaded index %u/%u to %s\n",
+                 a->db_oid, a->index_oid, a->snapshot_uri);
+    else
+        LOG_WARN("objstore: upload FAILED for index %u/%u (non-fatal, local artifact intact)\n",
+                 a->db_oid, a->index_oid);
+    free(a);
+    return NULL;
+}
+
+/* ----------------------------------------------------------------
  * Handle BUILD command
  *
  * Atomicity contract (B-1 + B-2 + B-3):
@@ -1225,6 +1366,40 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     CuvsReplyHeader hdr_ok = {0};
     hdr_ok.status = CUVS_STATUS_OK;
     send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+
+    /* Phase 3C: upload to GCS in a detached thread after replying OK.
+     * CREATE INDEX has already returned; upload failure is non-fatal. */
+    if (g_snapshot_uri[0] != '\0' && cmd->relfilenode != 0)
+    {
+        UploadThreadArgs *ua = malloc(sizeof(*ua));
+        if (ua)
+        {
+            strncpy(ua->snapshot_uri, g_snapshot_uri, sizeof(ua->snapshot_uri) - 1);
+            strncpy(ua->cluster_id,   g_cluster_id,   sizeof(ua->cluster_id)   - 1);
+            strncpy(ua->gcs_key_file, g_gcs_key_file, sizeof(ua->gcs_key_file) - 1);
+            strncpy(ua->cagra_path,   idx_final,       sizeof(ua->cagra_path)   - 1);
+            strncpy(ua->tids_path,    tids_final,      sizeof(ua->tids_path)    - 1);
+            ua->db_oid      = cmd->db_oid;
+            ua->table_oid   = cmd->table_oid;
+            ua->index_oid   = cmd->index_oid;
+            ua->relfilenode = cmd->relfilenode;
+            ua->metric      = cmd->metric;
+            ua->dim         = cmd->dim;
+            ua->vector_count = cmd->n_vecs;
+
+            pthread_t upload_tid;
+            pthread_attr_t upload_attr;
+            pthread_attr_init(&upload_attr);
+            pthread_attr_setdetachstate(&upload_attr, PTHREAD_CREATE_DETACHED);
+            if (pthread_create(&upload_tid, &upload_attr, objstore_upload_thread, ua) != 0)
+            {
+                LOG_WARN("objstore: failed to spawn upload thread for %u/%u\n",
+                         cmd->db_oid, cmd->index_oid);
+                free(ua);
+            }
+            pthread_attr_destroy(&upload_attr);
+        }
+    }
     return;
 
 persist_fail:
@@ -1484,10 +1659,17 @@ main(int argc, char **argv)
             strncpy(g_index_dir, argv[++i], sizeof(g_index_dir) - 1);
         else if (strcmp(argv[i], "--max-vram-mb") == 0 && i+1 < argc)
             g_max_vram_bytes = (size_t)atol(argv[++i]) * 1024 * 1024;
+        else if (strcmp(argv[i], "--snapshot-uri") == 0 && i+1 < argc)
+            strncpy(g_snapshot_uri, argv[++i], sizeof(g_snapshot_uri) - 1);
+        else if (strcmp(argv[i], "--cluster-id") == 0 && i+1 < argc)
+            strncpy(g_cluster_id, argv[++i], sizeof(g_cluster_id) - 1);
+        else if (strcmp(argv[i], "--gcs-key-file") == 0 && i+1 < argc)
+            strncpy(g_gcs_key_file, argv[++i], sizeof(g_gcs_key_file) - 1);
     }
 
-    LOG_INFO("pg_cuvs_server: starting (socket=%s index-dir=%s)\n",
-            g_socket_path, g_index_dir);
+    LOG_INFO("pg_cuvs_server: starting (socket=%s index-dir=%s snapshot=%s)\n",
+            g_socket_path, g_index_dir,
+            g_snapshot_uri[0] ? g_snapshot_uri : "disabled");
 
     /* Install SIGTERM/SIGINT via sigaction WITHOUT SA_RESTART so a signal
      * interrupts a blocked accept() (returns -1/EINTR) and we can break out
@@ -1499,6 +1681,11 @@ main(int argc, char **argv)
     sa.sa_flags = 0;  /* no SA_RESTART */
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
+
+    /* Phase 3C: initialize libcurl once for the process lifetime. Must be called
+     * before any curl_easy_* or download/upload operations. */
+    if (g_snapshot_uri[0] != '\0')
+        curl_global_init(CURL_GLOBAL_DEFAULT);
 
     /* Load persisted indexes */
     startup_load_indexes();

@@ -224,11 +224,13 @@ the stale marker only after durable persistence succeeds.
 **WRITE-04**
 ```
 In Phase 3, the pg_cuvs extension shall provide a pending-delta correction path:
-INSERT/UPDATE new versions are searched with CPU-side exact distance over a
-bounded delta store, and base CAGRA candidates plus delta candidates are
-over-fetched, merged, and re-ranked before PostgreSQL heap recheck. Phase 3A
-CPU MVP does not implement DELETE/UPDATE-old tombstone correction; those paths
-remain covered by heap recheck, delete-drift gating, and stale CPU reroute.
+INSERT/UPDATE new versions are searched with exact distance over a bounded
+delta store, and base CAGRA candidates plus delta candidates are over-fetched,
+merged, and re-ranked before PostgreSQL heap recheck. The CPU merge path is the
+correctness fallback; the daemon-side resident GPU delta cache is the
+performance path. Phase 3A does not implement DELETE/UPDATE-old tombstone
+correction; those paths remain covered by heap recheck, delete-drift gating,
+and stale CPU reroute.
 ```
 
 **WRITE-04A**
@@ -346,35 +348,42 @@ global cache counters; detailed fallback reason is a deferred enhancement.
 
 ---
 
-## 8. Phase 3 — S3 연동 (Q8)
+## 8. Phase 3C — Object Storage Snapshot (Q8)
 
-**S3-01**
+**OBJSTORE-01**
 ```
-Where `cuvs.s3_bucket` GUC is configured,
+Where `cuvs.snapshot_uri` GUC is configured,
 when an index build or rebuild completes,
-the pg_cuvs_server shall upload the serialized index to S3 in chunked parts
-using the path `s3://<bucket>/pg_cuvs/<cluster_id>/<database_oid>/<index_oid>/`.
+the pg_cuvs_server shall upload the serialized index artifacts to object
+storage using a provider-neutral manifest. The MVP provider is GCS, using paths
+under `gs://<bucket>/pg_cuvs/<cluster_id>/<database_oid>/<index_oid>/`.
+This snapshot shall contain derived pg_cuvs index artifacts only, not PostgreSQL
+heap/table data.
 ```
 
-**S3-02**
+**OBJSTORE-02**
 ```
-Where `cuvs.s3_bucket` is configured,
+Where `cuvs.snapshot_uri` is configured,
 when pg_cuvs_server starts and a local index file is missing from `cuvs.index_dir`,
-the pg_cuvs_server shall download the index from S3 to local NVMe cache
-using io_uring async prefetch before servicing queries.
+the pg_cuvs_server shall download the index from object storage to local NVMe cache
+using io_uring async prefetch before servicing queries, but only after verifying
+that the local PostgreSQL heap is compatible with the manifest's heap identity.
 ```
 
-**S3-03**
+**OBJSTORE-03**
 ```
 The pg_cuvs index files shall be treated as derived data and shall not be
-included in `pg_basebackup` WAL streams.
+included in `pg_basebackup` WAL streams. Heap/table distribution remains the
+responsibility of PostgreSQL backup and replication mechanisms.
 ```
 
-**S3-04**
+**OBJSTORE-04**
 ```
-Where multiple PostgreSQL instances share the same `cuvs.s3_bucket` and
-`cuvs.cluster_id`,
-read-only replicas shall load indexes from S3 without rebuilding from heap.
+Where multiple PostgreSQL instances share the same `cuvs.snapshot_uri` and
+`cuvs.cluster_id`, read-only replicas shall load indexes from object storage
+without rebuilding from heap only if they already have a heap-compatible
+PostgreSQL replica or restore. A node without compatible heap data shall not load
+the index artifact.
 ```
 
 ---
@@ -504,5 +513,5 @@ rollback/cleanup.
 | `cuvs.circuit_breaker_threshold` | int | 3 | 연속 실패 임계값 |
 | `cuvs.rebuild_threshold` | float | 0.10 | delta 비율 임계값 (REINDEX/lazy rebuild 권고) |
 | `cuvs.export_hnsw` | bool | off | CAGRA 빌드 시 HNSW 병행 export |
-| `cuvs.s3_bucket` | string | '' | Phase 3 S3 버킷 (비어있으면 비활성) |
+| `cuvs.snapshot_uri` | string | '' | Phase 3C object storage root, e.g. `gs://bucket/prefix` (비어있으면 비활성) |
 | `cuvs.cluster_id` | string | '' | Phase 3 멀티노드 식별자 |

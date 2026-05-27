@@ -58,6 +58,8 @@ typedef struct CuvsCmdFrame {
     uint32_t dim;           /* vector dimension */
     int64_t  n_vecs;        /* BUILD: corpus size; SEARCH: unused */
     char     shm_key[64];   /* shm_open name for payload data */
+    uint32_t table_oid;     /* BUILD: heap relation OID (for manifest) */
+    uint32_t relfilenode;   /* BUILD: heap relfilenode (heap compat identity, ADR-013) */
 } CuvsCmdFrame;
 
 /*
@@ -168,7 +170,9 @@ int cuvs_ipc_build(
     int64_t        n_vecs,
     int            dim,
     uint32_t       metric,
-    const char    *index_dir   /* daemon saves index here */
+    const char    *index_dir,   /* daemon saves index here */
+    uint32_t       table_oid,   /* heap relation OID */
+    uint32_t       relfilenode  /* heap relfilenode (heap compat identity) */
 );
 
 /*

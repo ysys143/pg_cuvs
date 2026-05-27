@@ -81,8 +81,8 @@ See [design/PLAN.md](design/PLAN.md) for the full product-roadmap plan. Some com
 |-------|------|--------|
 | 1 — Proof of Mechanism | PostgreSQL pipeline + sidecar CAGRA search | Done |
 | 1.5 — Test & Ops Hardening | DDL durability, large-data benchmarks, GPU e2e, playbooks | Done (GPU VM verified) |
-| 2 — Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric correctness, write/staleness, large-build memory, tiered cache | Done (single-node core; streaming/delta deferred) |
-| 3 — Scale Out | pending-delta correction, S3-backed immutable snapshots, replicas, multi-GPU | Planned |
+| 2 — Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric correctness, write/staleness, large-build memory, tiered cache | Done (single-node core; streaming deferred) |
+| 3 — Scale Out | pending-delta correction, DiskANN/Vamana, object-storage snapshots, replicas, multi-GPU | In progress |
 
 ## Requirements
 
