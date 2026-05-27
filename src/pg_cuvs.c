@@ -39,6 +39,11 @@
 #include "storage/itemptr.h"
 
 #include <sys/stat.h>
+#include <sys/file.h>   /* flock */
+#include <fcntl.h>      /* O_RDWR, O_CREAT */
+#include <unistd.h>     /* lseek, pread, pwrite, ftruncate, unlink */
+#include <errno.h>
+#include <math.h>       /* sqrt (cosine distance) */
 
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"
@@ -70,6 +75,7 @@ int   cuvs_k                      = 100;   /* GPU top-k (pgvector ef_search anal
 int   cuvs_max_build_mem_mb       = 0;     /* 0 = auto (MemAvailable * safety_ratio); >0 = hard cap MB */
 double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailable */
 double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
+int   cuvs_max_delta_rows          = 10000; /* pending-insert delta cap; 0 disables delta (Phase 3A) */
 
 /* ----------------------------------------------------------------
  * Last-search stats (process-local; one slot per backend)
@@ -178,6 +184,18 @@ _PG_init(void)
         0.10, 0.0, 1.0,
         PGC_USERSET,
         0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.max_delta_rows",
+        "Max pending-insert rows merged from the .delta sidecar before CPU reroute.",
+        "Phase 3A: INSERT/UPDATE append the new vector to a per-index .delta file "
+        "that a query merges (CPU-exact) with the base CAGRA results — no rebuild. "
+        "Above this many pending rows the planner reroutes to CPU (REINDEX to "
+        "absorb the delta). 0 disables the delta and falls back to mark-stale.",
+        &cuvs_max_delta_rows,
+        10000, 0, INT_MAX,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
 }
 
 /* Resolve cuvs.index_dir: if empty, default to DataDir/cuvs_indexes */
@@ -281,6 +299,139 @@ cuvs_index_has_artifact(Oid index_oid)
 }
 
 /* ----------------------------------------------------------------
+ * Phase 3A pending-delta sidecar (CPU MVP)
+ *
+ * INSERT/UPDATE append the new vector to "<db>_<idx>.delta" instead of marking
+ * the index stale, so the daemon keeps serving the base CAGRA and the backend
+ * merges base + CPU-exact delta candidates at scan time. The delta is tied to
+ * its base build via base_tids_crc32 (the .tids body CRC); a REINDEX rewrites
+ * the base and invalidates a leftover delta. All reads here are local file I/O
+ * (no IPC/CUDA), safe in the planner.
+ * ---------------------------------------------------------------- */
+
+/* Build "<index_dir>/<db>_<idx>.delta". */
+static void
+cuvs_delta_path(Oid index_oid, char *buf, size_t buflen)
+{
+    snprintf(buf, buflen, "%s/%u_%u.delta",
+             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+}
+
+/* Read the base .tids body_crc32 (generation token). Returns true + *crc_out on
+ * success; false if the .tids artifact is missing or its header unreadable. */
+static bool
+cuvs_read_tids_crc(Oid index_oid, uint32_t *crc_out)
+{
+    char            path[MAXPGPATH];
+    FILE           *f;
+    CuvsTidsHeader  hdr;
+    size_t          got;
+
+    snprintf(path, sizeof(path), "%s/%u_%u.tids",
+             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+    f = AllocateFile(path, PG_BINARY_R);
+    if (f == NULL)
+        return false;
+    got = fread(&hdr, 1, sizeof(hdr), f);
+    FreeFile(f);
+    if (got != sizeof(hdr) || hdr.magic != CUVS_TIDS_MAGIC
+        || hdr.version != CUVS_TIDS_VERSION)
+        return false;
+    *crc_out = hdr.body_crc32;
+    return true;
+}
+
+/* Plan-time gate: a .delta that exists but cannot be merged forces CPU reroute.
+ * Unusable = corrupt header, body-size mismatch (truncation), n_rows over
+ * cuvs.max_delta_rows, or generation mismatch vs the current base .tids. A
+ * missing .delta is usable (base-only path). Pure file reads. */
+static bool
+cuvs_index_delta_unusable(Oid index_oid)
+{
+    char            path[MAXPGPATH];
+    FILE           *f;
+    CuvsDeltaHeader hdr;
+    long            fsize;
+    uint32_t        base_crc;
+
+    cuvs_delta_path(index_oid, path, sizeof(path));
+    f = AllocateFile(path, PG_BINARY_R);
+    if (f == NULL)
+        return false;   /* no delta -> base-only path is fine */
+
+    if (cuvs_delta_read_header(f, &hdr) != 0
+        || fseek(f, 0, SEEK_END) != 0
+        || (fsize = ftell(f)) < (long) sizeof(hdr))
+    {
+        FreeFile(f);
+        return true;    /* corrupt / unreadable */
+    }
+    FreeFile(f);
+
+    if (cuvs_delta_validate(&hdr, (int64_t) fsize - (int64_t) sizeof(hdr)) != 0)
+        return true;    /* truncated / oversized body */
+    if (hdr.n_rows > (int64_t) cuvs_max_delta_rows)
+        return true;    /* too big to merge -> CPU reroute (REINDEX) */
+    if (!cuvs_read_tids_crc(index_oid, &base_crc)
+        || base_crc != hdr.base_tids_crc32)
+        return true;    /* delta belongs to a previous base build */
+    return false;
+}
+
+/* Remove the .delta sidecar (best-effort; called after a successful build). */
+static void
+cuvs_delta_unlink(Oid index_oid)
+{
+    char path[MAXPGPATH];
+
+    cuvs_delta_path(index_oid, path, sizeof(path));
+    (void) unlink(path);
+}
+
+/* pread/pwrite full-length wrappers (retry partials and EINTR). 0 on success. */
+static int
+cuvs_pwrite_all(int fd, off_t off, const void *buf, size_t len)
+{
+    const char *p = (const char *) buf;
+
+    while (len > 0)
+    {
+        ssize_t w = pwrite(fd, p, len, off);
+        if (w < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (w == 0)
+            return -1;
+        p += w; off += w; len -= (size_t) w;
+    }
+    return 0;
+}
+
+static int
+cuvs_pread_all(int fd, off_t off, void *buf, size_t len)
+{
+    char *p = (char *) buf;
+
+    while (len > 0)
+    {
+        ssize_t r = pread(fd, p, len, off);
+        if (r < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (r == 0)
+            return -1;   /* short file */
+        p += r; off += r; len -= (size_t) r;
+    }
+    return 0;
+}
+
+/* ----------------------------------------------------------------
  * Cost model
  *
  * startup_cost=1000 models UDS round-trip + CUDA context overhead.
@@ -316,7 +467,7 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
     (void) root;
     (void) loop_count;
 
-    /* Six gates turn the GPU path off — all local file/state reads, no IPC.
+    /* Seven gates turn the GPU path off — all local file/state reads, no IPC.
      * Cost is set to 1e15 (> PG disable_cost 1e10) so the gated index loses
      * even when enable_seqscan = off, preventing empty-result or ERROR paths.
      *  1. enable_cuvs GUC
@@ -324,13 +475,17 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
      *  3. .stale sidecar (heap write marked index stale since build)
      *  4. delete-drift (.tids build count vs planner live-row estimate)
      *  5. socket existence (missing → daemon cleanly stopped or not yet started)
-     *  6. artifact existence (no .tids → index was built on empty table) */
+     *  6. artifact existence (no .tids → index was built on empty table)
+     *  7. delta unusable (.delta corrupt / generation mismatch / over cap →
+     *     can't merge pending inserts, so route to CPU; a usable delta keeps the
+     *     GPU path and is merged at scan time) */
     gpu_off = !enable_cuvs
            || cuvs_circuit_is_open((uint32_t) index_oid)
            || cuvs_index_is_stale(index_oid)
            || cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples)
            || !cuvs_daemon_socket_ready()
-           || !cuvs_index_has_artifact(index_oid);
+           || !cuvs_index_has_artifact(index_oid)
+           || cuvs_index_delta_unusable(index_oid);
 
     if (gpu_off)
     {
@@ -635,6 +790,11 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                  errhint("%s", hint)));
     }
 
+    /* Phase 3A: the fresh base absorbs all current rows, so any pending-insert
+     * delta from before this (RE)build is obsolete. Drop it; the new base .tids
+     * CRC also invalidates a leftover via the generation guard as a backstop. */
+    cuvs_delta_unlink(RelationGetRelid(indexRel));
+
     return result;
 }
 
@@ -654,6 +814,164 @@ typedef struct CuvsScanState {
     int       cur;        /* next result to return */
     bool      searched;   /* cuvs_ipc_search already called */
 } CuvsScanState;
+
+/* ----------------------------------------------------------------
+ * Phase 3A delta merge (CPU MVP)
+ *
+ * After the daemon returns base CAGRA candidates, merge in the pending-insert
+ * delta vectors computed exactly on the CPU. Distances MUST be on the same
+ * scale as the daemon's cuVS output so the merged order is correct (the scan
+ * sets xs_recheckorderby=false, i.e. the executor trusts this order):
+ *   L2     -> squared L2  (cuVS L2Expanded), nearer = smaller
+ *   cosine -> 1 - cossim  (cuVS CosineExpanded), nearer = smaller
+ *   ip     -> raw dot     (cuVS InnerProduct), nearer = LARGER
+ * ---------------------------------------------------------------- */
+typedef struct CuvsCand {
+    uint64_t tid;
+    float    dist;
+} CuvsCand;
+
+/* Distance on the cuVS scale for the index metric (see table above). */
+static float
+cuvs_cpu_distance(uint32_t metric, const float *q, const float *v, int dim)
+{
+    double dot = 0.0, qn = 0.0, vn = 0.0, l2 = 0.0;
+
+    for (int i = 0; i < dim; i++)
+    {
+        double qi = (double) q[i];
+        double vi = (double) v[i];
+        double d  = qi - vi;
+        l2  += d * d;
+        dot += qi * vi;
+        qn  += qi * qi;
+        vn  += vi * vi;
+    }
+
+    switch (metric)
+    {
+        case CUVS_METRIC_COSINE:
+        {
+            double denom = sqrt(qn) * sqrt(vn);
+            return (denom > 0.0) ? (float) (1.0 - dot / denom) : 1.0f;
+        }
+        case CUVS_METRIC_IP:
+            return (float) dot;        /* raw inner product */
+        case CUVS_METRIC_L2:
+        default:
+            return (float) l2;         /* squared L2 */
+    }
+}
+
+/* qsort_arg comparator: order candidates nearest-first. arg = &metric. */
+static int
+cuvs_cand_cmp(const void *a, const void *b, void *arg)
+{
+    const CuvsCand *x = (const CuvsCand *) a;
+    const CuvsCand *y = (const CuvsCand *) b;
+    uint32_t metric = *(const uint32_t *) arg;
+
+    if (metric == CUVS_METRIC_IP)   /* larger dot = nearer */
+    {
+        if (x->dist > y->dist) return -1;
+        if (x->dist < y->dist) return 1;
+        return 0;
+    }
+    if (x->dist < y->dist) return -1;   /* smaller distance = nearer */
+    if (x->dist > y->dist) return 1;
+    return 0;
+}
+
+/* Merge the .delta pending-insert vectors into the base result set already in
+ * *ss (tids/distances/n_results), keeping the nearest k overall. No delta ->
+ * leaves the base set untouched. A delta that is corrupt / generation-mismatched
+ * / oversized at scan time (a plan->execute race vs the cost gate) ERRORs so the
+ * next query replans to CPU — never silently drop the pending rows. */
+static void
+cuvs_merge_delta(CuvsScanState *ss, Oid index_oid, const float *query,
+                 int dim, int k, uint32_t metric)
+{
+    char            path[MAXPGPATH];
+    int             fd;
+    CuvsDeltaHeader hdr;
+    off_t           fsize;
+    size_t          rec_bytes = cuvs_delta_record_bytes((uint32_t) dim);
+    uint32_t        base_crc;
+    CuvsCand       *cands;
+    char           *recbuf;
+    int             n_base, n_total, out;
+
+    cuvs_delta_path(index_oid, path, sizeof(path));
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+        return;     /* no delta -> base-only (matches the plan gate) */
+
+    fsize = lseek(fd, 0, SEEK_END);
+    if (cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
+        || hdr.magic != CUVS_DELTA_MAGIC || hdr.version != CUVS_DELTA_VERSION
+        || hdr.dim != (uint32_t) dim
+        || fsize < 0
+        || cuvs_delta_validate(&hdr, (int64_t) fsize - (int64_t) sizeof(hdr)) != 0
+        || hdr.n_rows > (int64_t) cuvs_max_delta_rows
+        || !cuvs_read_tids_crc(index_oid, &base_crc)
+        || base_crc != hdr.base_tids_crc32)
+    {
+        CloseTransientFile(fd);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: delta sidecar unusable mid-scan; "
+                        "retry will replan to CPU")));
+    }
+    if (hdr.n_rows == 0)
+    {
+        CloseTransientFile(fd);
+        return;     /* empty delta -> base only */
+    }
+
+    n_base  = ss->n_results;
+    n_total = n_base + (int) hdr.n_rows;
+    cands   = (CuvsCand *) palloc((Size) n_total * sizeof(CuvsCand));
+
+    for (int i = 0; i < n_base; i++)
+    {
+        cands[i].tid  = ss->tids[i];
+        cands[i].dist = ss->distances[i];
+    }
+
+    recbuf = (char *) palloc(rec_bytes);
+    for (int64_t i = 0; i < hdr.n_rows; i++)
+    {
+        off_t    off = (off_t) sizeof(hdr) + (off_t) i * (off_t) rec_bytes;
+        uint64_t tid;
+
+        if (cuvs_pread_all(fd, off, recbuf, rec_bytes) != 0)
+        {
+            CloseTransientFile(fd);
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_cuvs: delta record read failed mid-scan; "
+                            "retry will replan to CPU")));
+        }
+        memcpy(&tid, recbuf, sizeof(tid));
+        cands[n_base + i].tid  = tid;
+        cands[n_base + i].dist = cuvs_cpu_distance(metric, query,
+                                                   (const float *) (recbuf + sizeof(tid)),
+                                                   dim);
+    }
+    pfree(recbuf);
+    CloseTransientFile(fd);
+
+    qsort_arg(cands, (size_t) n_total, sizeof(CuvsCand), cuvs_cand_cmp, &metric);
+
+    out = (n_total < k) ? n_total : k;
+    for (int i = 0; i < out; i++)
+    {
+        ss->tids[i]      = cands[i].tid;
+        ss->distances[i] = cands[i].dist;
+    }
+    ss->n_results = out;
+    pfree(cands);
+}
 
 static IndexScanDesc
 cuvs_beginscan(Relation rel, int nkeys, int norderbys)
@@ -851,6 +1169,12 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
         cuvs_circuit_record_success((uint32_t)index_oid);
         ss->cur = 0;
 
+        /* Phase 3A: merge pending-insert delta vectors (CPU-exact) into the base
+         * candidate set so INSERT/UPDATE since the build are reflected without a
+         * rebuild. No-op when delta is disabled or absent. */
+        if (cuvs_max_delta_rows > 0)
+            cuvs_merge_delta(ss, index_oid, qvec->x, dim, k, metric);
+
         /* Record per-search stats for pg_cuvs_last_search_* and EXPLAIN. */
         cuvs_last_latency_us   = latency_us;
         cuvs_last_n_results    = ss->n_results;
@@ -935,27 +1259,131 @@ cuvs_mark_index_stale(Relation indexRel)
                                (uint32_t) RelationGetRelid(indexRel));
 }
 
-/* aminsert fires per inserted/updated row. CAGRA keeps no incremental per-row
- * structure, so we don't store a tuple — we only need to mark the index stale
- * once. Dedup via rd_amcache (relcache-lifetime; cleared on REINDEX's relcache
- * invalidation, so post-REINDEX writes re-mark correctly). */
+/* Append one {TID, vector} record to the index's .delta sidecar. flock-
+ * serialized across backends; positions the record at the canonical offset
+ * (sizeof(header) + n_rows*record_bytes) and ftruncates, so a torn tail from a
+ * crashed prior append self-heals. Returns true on durable append; false on any
+ * error or when the delta has reached cuvs.max_delta_rows (caller then fails
+ * closed by marking the index stale). */
+static bool
+cuvs_delta_append(Relation indexRel, uint64_t tid, const float *vec, int dim,
+                  uint32_t metric)
+{
+    char            path[MAXPGPATH];
+    int             fd;
+    CuvsDeltaHeader hdr;
+    off_t           fsize, rec_off;
+    size_t          rec_bytes = cuvs_delta_record_bytes((uint32_t) dim);
+    bool            ok = false;
+
+    cuvs_delta_path(RelationGetRelid(indexRel), path, sizeof(path));
+
+    fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
+    if (fd < 0)
+        return false;
+    /* Serialize concurrent appends from other backends (O_CREAT does not
+     * truncate, so racing creators share one file; flock orders the writes). */
+    if (flock(fd, LOCK_EX) != 0)
+    {
+        CloseTransientFile(fd);
+        return false;
+    }
+
+    fsize = lseek(fd, 0, SEEK_END);
+    if (fsize < 0)
+        goto done;
+
+    if (fsize == 0)
+    {
+        /* New delta: tie it to the current base build via the .tids body CRC. */
+        uint32_t base_crc;
+        if (!cuvs_read_tids_crc(RelationGetRelid(indexRel), &base_crc))
+            goto done;   /* no base artifact -> can't establish generation */
+        cuvs_delta_header_init(&hdr, (uint32_t) dim, metric, base_crc);
+    }
+    else if (fsize < (off_t) sizeof(hdr)
+             || cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
+             || hdr.magic != CUVS_DELTA_MAGIC
+             || hdr.version != CUVS_DELTA_VERSION
+             || hdr.dim != (uint32_t) dim)
+    {
+        goto done;       /* corrupt / dim drift -> fail closed */
+    }
+
+    if (hdr.n_rows >= (int64_t) cuvs_max_delta_rows)
+        goto done;       /* cap reached -> caller marks stale, bounds growth */
+
+    /* Write the record at the canonical slot, bump the count, trim torn tail. */
+    rec_off = (off_t) sizeof(hdr) + (off_t) hdr.n_rows * (off_t) rec_bytes;
+    if (cuvs_pwrite_all(fd, rec_off, &tid, sizeof(tid)) != 0)
+        goto done;
+    if (cuvs_pwrite_all(fd, rec_off + (off_t) sizeof(tid), vec,
+                        (size_t) dim * sizeof(float)) != 0)
+        goto done;
+    hdr.n_rows++;
+    if (cuvs_pwrite_all(fd, 0, &hdr, sizeof(hdr)) != 0)
+        goto done;
+    if (ftruncate(fd, (off_t) sizeof(hdr) + (off_t) hdr.n_rows * (off_t) rec_bytes) != 0)
+        goto done;
+    if (pg_fsync(fd) != 0)
+        goto done;
+    ok = true;
+
+done:
+    flock(fd, LOCK_UN);
+    CloseTransientFile(fd);
+    return ok;
+}
+
+/* aminsert fires per inserted/updated row. Phase 3A: record the new vector in
+ * the durable .delta sidecar so a query merges it with the base CAGRA results
+ * — no rebuild, no stale reroute. The daemon is NOT told stale, so it keeps
+ * serving the base search. Fail closed: on any delta error (or the delta cap),
+ * mark the index stale so the planner routes to CPU and the row is never lost.
+ * DELETE/VACUUM still mark stale via ambulkdelete (Phase 3A defers tombstones). */
 static bool
 cuvs_aminsert(Relation indexRel, Datum *values, bool *isnull,
               ItemPointer heap_tid, Relation heapRel,
               IndexUniqueCheck checkUnique, bool indexUnchanged,
               IndexInfo *indexInfo)
 {
-    (void) values; (void) isnull; (void) heap_tid; (void) heapRel;
-    (void) checkUnique; (void) indexUnchanged; (void) indexInfo;
+    PgVector *vec;
+    uint64_t  tid;
+    uint32_t  metric;
 
-    if (indexRel->rd_amcache == NULL)
+    (void) heapRel; (void) checkUnique; (void) indexUnchanged; (void) indexInfo;
+
+    /* NULL vector: nothing to index (pgvector does not search NULLs either). */
+    if (isnull[0])
+        return false;
+
+    /* Delta disabled (GUC 0): fall back to Phase 2 behavior — mark stale once
+     * per relcache life and route to CPU. */
+    if (cuvs_max_delta_rows <= 0)
     {
-        cuvs_mark_index_stale(indexRel);
-        /* sentinel: presence means "already marked stale this relcache life" */
-        indexRel->rd_amcache = MemoryContextAllocZero(indexRel->rd_indexcxt,
-                                                      sizeof(bool));
+        if (indexRel->rd_amcache == NULL)
+        {
+            cuvs_mark_index_stale(indexRel);
+            indexRel->rd_amcache = MemoryContextAllocZero(indexRel->rd_indexcxt,
+                                                          sizeof(bool));
+        }
+        return false;
     }
-    return false;   /* no index entry stored */
+
+    /* Already stale (delete-driven via ambulkdelete): the planner reroutes to
+     * CPU regardless, so don't grow the delta. Leave it until REINDEX. */
+    if (cuvs_index_is_stale(RelationGetRelid(indexRel)))
+        return false;
+
+    vec    = DatumGetPgVector(values[0]);
+    tid    = cuvs_tid_encode(ItemPointerGetBlockNumber(heap_tid),
+                             ItemPointerGetOffsetNumber(heap_tid));
+    metric = cuvs_index_metric(indexRel);
+
+    if (!cuvs_delta_append(indexRel, tid, vec->x, (int) vec->dim, metric))
+        cuvs_mark_index_stale(indexRel);
+
+    return false;   /* no in-index entry stored */
 }
 
 /* ambulkdelete runs once per VACUUM when dead tuples (DELETE/UPDATE) are

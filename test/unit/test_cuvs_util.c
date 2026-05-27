@@ -326,6 +326,70 @@ test_fault_hook(void)
 }
 #endif
 
+/* Write a delta header + body into a tmpfile and assert validate accepts the
+ * good case and rejects bad magic/version/reserved/dim and a truncated body. */
+static void
+test_delta_format(void)
+{
+    const uint32_t dim = 4, metric = CUVS_METRIC_L2, base_crc = 0xCAFEBABEu;
+    const int64_t  n = 3;
+    size_t rec = cuvs_delta_record_bytes(dim);
+
+    ASSERT(rec == sizeof(uint64_t) + 4 * sizeof(float), "delta record bytes");
+    ASSERT(sizeof(CuvsDeltaHeader) == 32, "delta header is 32 bytes");
+
+    /* init + round-trip a header through a FILE*. */
+    CuvsDeltaHeader h;
+    cuvs_delta_header_init(&h, dim, metric, base_crc);
+    h.n_rows = n;
+    ASSERT(h.magic == CUVS_DELTA_MAGIC, "init magic");
+    ASSERT(h.version == CUVS_DELTA_VERSION, "init version");
+    ASSERT(h.reserved == 0, "init reserved zero");
+    ASSERT(h.base_tids_crc32 == base_crc, "init generation token");
+
+    FILE *f = tmpfile();
+    ASSERT(f != NULL, "delta tmpfile open");
+    fwrite(&h, sizeof(h), 1, f);
+    /* n records of {tid, vec[dim]} — content does not matter for validate. */
+    for (int64_t i = 0; i < n; i++)
+    {
+        uint64_t tid = cuvs_tid_encode((uint32_t) i, (uint16_t) i);
+        float    vec[4] = { (float) i, 0.0f, 0.0f, 0.0f };
+        fwrite(&tid, sizeof(tid), 1, f);
+        fwrite(vec, sizeof(float), dim, f);
+    }
+    rewind(f);
+
+    CuvsDeltaHeader hr;
+    ASSERT(cuvs_delta_read_header(f, &hr) == 0, "delta read_header ok");
+    ASSERT(hr.n_rows == n && hr.dim == dim, "delta header round-trip");
+    ASSERT(cuvs_delta_validate(&hr, (int64_t) (n * (int64_t) rec)) == 0,
+           "validate accepts exact body size");
+    ASSERT(cuvs_delta_validate(&hr, (int64_t) (n * (int64_t) rec) - 1) == -1,
+           "validate rejects truncated body");
+    ASSERT(cuvs_delta_validate(&hr, (int64_t) (n * (int64_t) rec) + rec) == -1,
+           "validate rejects oversized body");
+    fclose(f);
+
+    /* field rejections */
+    CuvsDeltaHeader b;
+    cuvs_delta_header_init(&b, dim, metric, base_crc); b.n_rows = n;
+    b.magic = 0xDEADBEEFu;
+    ASSERT(cuvs_delta_validate(&b, (int64_t)(n * (int64_t) rec)) == -1, "reject bad magic");
+    cuvs_delta_header_init(&b, dim, metric, base_crc); b.n_rows = n;
+    b.version = 99u;
+    ASSERT(cuvs_delta_validate(&b, (int64_t)(n * (int64_t) rec)) == -1, "reject bad version");
+    cuvs_delta_header_init(&b, dim, metric, base_crc); b.n_rows = n;
+    b.reserved = 1u;
+    ASSERT(cuvs_delta_validate(&b, (int64_t)(n * (int64_t) rec)) == -1, "reject reserved != 0");
+    cuvs_delta_header_init(&b, 0, metric, base_crc); b.n_rows = n;
+    ASSERT(cuvs_delta_validate(&b, 0) == -1, "reject dim 0");
+
+    /* generation mismatch is a header-field comparison the caller makes; here
+     * we just confirm the token survives a round-trip so the gate can compare. */
+    ASSERT(hr.base_tids_crc32 == base_crc, "generation token preserved on read");
+}
+
 static void
 test_lat_histogram(void)
 {
@@ -394,6 +458,7 @@ main(void)
     test_crc32();
     test_tids_roundtrip();
     test_tids_rejections();
+    test_delta_format();
     test_lat_histogram();
     test_metric_from_opclass();
 #ifdef CUVS_TEST_HOOKS

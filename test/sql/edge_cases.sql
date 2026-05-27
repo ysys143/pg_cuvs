@@ -293,32 +293,45 @@ SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5;
 SET enable_cuvs = on;
 
 -- ============================================================================
--- Step 4: staleness — a heap write marks the index stale; REINDEX clears it.
--- Assert deterministic facts only (stale boolean; CPU-exact result).
+-- Step 4: pending delta (Phase 3A) + DELETE staleness.
+-- INSERT/UPDATE no longer mark the index stale; they append the new vector to
+-- the .delta sidecar so the GPU path stays usable and a query merges the new
+-- vectors (CPU-exact) with the base CAGRA results. Only DELETE/VACUUM
+-- (ambulkdelete) still marks stale. Assert deterministic facts only.
 -- ============================================================================
 -- ec_cagra was rebuilt during DDL churn above, so it starts fresh.
-INSERT INTO ec VALUES (99, '[0.5,0.5,0,0]');   -- aminsert -> marks index stale
+INSERT INTO ec VALUES (99, '[0.5,0.5,0,0]');   -- aminsert -> .delta append (NOT stale)
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
--- Default planner on this tiny table prefers seqscan, so the query returns the
--- correct CPU-exact nearest (id=1) even while the GPU index is stale.
-SELECT id FROM ec ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
--- The just-inserted row participates: a probe equal to its vector returns id 99,
--- which a stale GPU graph (missing that row) could not produce. Confirms a stale
--- index serves current CPU results, not an empty/old GPU answer. (The plan-flip
--- on a large table where the planner would otherwise pick cagra is asserted in
--- integration Scenario 10.)
+-- Force the GPU path (this tiny table would otherwise seqscan) and confirm the
+-- pending-delta row is merged: a probe equal to id 99's own vector returns 99
+-- with distance 0, which the base graph (built before the INSERT) cannot.
+SET enable_seqscan = off;
 SELECT id FROM ec ORDER BY embedding <-> '[0.5,0.5,0,0]'::vector LIMIT 1;
--- REINDEX rebuilds the graph from the current heap and clears staleness.
+RESET enable_seqscan;
+-- An aborted INSERT still writes the .delta record (the append is not
+-- transactional), but heap recheck/MVCC filters the invisible tuple: a probe at
+-- the rolled-back vector must NOT return id 100.
+BEGIN;
+INSERT INTO ec VALUES (100, '[0.25,0.75,0,0]');
+ROLLBACK;
+SET enable_seqscan = off;
+SELECT count(*) AS aborted_delta_visible
+FROM (SELECT id FROM ec ORDER BY embedding <-> '[0.25,0.75,0,0]'::vector LIMIT 1) s
+WHERE id = 100;
+RESET enable_seqscan;
+-- REINDEX absorbs the delta into a fresh base and clears it (and staleness).
 REINDEX INDEX ec_cagra;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
--- UPDATE marks stale too (aminsert fires on the new, non-HOT row version since
--- the indexed vector changed). The CPU path reflects the new value: a probe
--- equal to the updated vector returns id 99, while the stale GPU graph still
--- holds the old [0.5,0.5,0,0].
+-- UPDATE also appends the new version to the delta (NOT stale). A probe equal to
+-- the updated vector returns id 99 via merge; the old version is filtered by
+-- heap recheck/MVCC.
 UPDATE ec SET embedding = '[0,0,0.5,0.5]' WHERE id = 99;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;
+SET enable_seqscan = off;
 SELECT id FROM ec ORDER BY embedding <-> '[0,0,0.5,0.5]'::vector LIMIT 1;
--- DELETE + VACUUM exercises the ambulkdelete path -> marks the index stale.
+RESET enable_seqscan;
+-- DELETE + VACUUM exercises the ambulkdelete path -> marks the index stale
+-- (Phase 3A defers delete tombstones; deletes still force a rebuild).
 DELETE FROM ec WHERE id = 99;
 VACUUM ec;
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid = 'ec_cagra'::regclass;

@@ -35,6 +35,10 @@
 #  14. daemon crash (kill -9) -> socket lingers; first N queries ERROR (UNAVAILABLE)
 #                       + increment circuit breaker; breaker opens; next query
 #                       replans to CPU and returns correct result.
+#  15. pending-delta merge (Phase 3A) -> INSERT after build appends to .delta (not
+#                       stale); GPU path retained; query merges the new row and
+#                       matches pgvector ground truth; REINDEX absorbs the delta;
+#                       a corrupt .delta reroutes to CPU.
 #
 # Requires: pg_cuvs installed; the production pg-cuvs-server systemd unit
 # (stopped during the run, restarted at cleanup); CONDA_ENV exported so the
@@ -523,13 +527,14 @@ stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS it_items;" >/dev/null 2>&1 || true
 
 # --- Scenario 10: staleness persists across daemon restart -------------------
-# A heap write marks the index stale; the .stale sidecar must keep it stale
-# after a daemon restart; REINDEX clears it.
+# DELETE+VACUUM (ambulkdelete) marks the index stale; the .stale sidecar must
+# keep it stale after a daemon restart; REINDEX clears it. (Phase 3A: INSERT no
+# longer marks stale — it appends to the .delta sidecar; see Scenario 15.)
 echo "[it] --- scenario 10: staleness + .stale persistence ---"
 fresh_fixture
 start_test_daemon
 run_sql "CREATE INDEX it_st ON it_items USING cagra (embedding vector_l2_ops);" >/dev/null
-run_sql "INSERT INTO it_items VALUES (99, '[0.5,0.5,0,0]');" >/dev/null   # aminsert -> mark stale
+run_sql "DELETE FROM it_items WHERE id = 8; VACUUM it_items;" >/dev/null   # ambulkdelete -> mark stale
 st_query() {
     psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
 SET cuvs.socket_path='$TEST_SOCK';
@@ -537,8 +542,8 @@ SET cuvs.index_dir='$TEST_IDX';
 SELECT stale FROM pg_stat_gpu_search WHERE index_oid='it_st'::regclass;
 SQL
 }
-[ "$(st_query)" = "t" ] && pass "stale: INSERT marked index stale" \
-    || fail "stale: INSERT did not mark stale (got '$(st_query)')"
+[ "$(st_query)" = "t" ] && pass "stale: DELETE+VACUUM marked index stale" \
+    || fail "stale: DELETE+VACUUM did not mark stale (got '$(st_query)')"
 # Restart the daemon — .stale sidecar must survive.
 stop_test_daemon
 start_test_daemon
@@ -564,11 +569,16 @@ run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35
 echo "$OUT" | grep -q "it_big_cagra" \
     && pass "stale-reroute: fresh planner picks cagra (test is non-vacuous)" \
     || fail "stale-reroute: fresh planner did not pick cagra (table too small?): $OUT"
-# A heap write marks it stale; the same query must now avoid the GPU path.
-run_sql "INSERT INTO it_big VALUES (999999,'[1,1,1,1]');" >/dev/null
+# DELETE + VACUUM (ambulkdelete) marks it stale; the same query must now avoid
+# the GPU path and return correct CPU results — not the empty result a stale
+# cagra scan gives. (Phase 3A: INSERT no longer marks stale; only DELETE does.)
+# Delete a large fraction (> id 50000, keeping id 5): VACUUM bypasses index
+# vacuuming when dead tuples touch < ~2% of pages, so a tiny delete on a big
+# table would not call ambulkdelete at all (see PLAN Phase 2 staleness note).
+run_sql "DELETE FROM it_big WHERE id > 50000; VACUUM it_big;" >/dev/null
 run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
 echo "$OUT" | grep -q "Seq Scan" \
-    && pass "stale-reroute: stale index replanned off the GPU to Seq Scan" \
+    && pass "stale-reroute: DELETE+VACUUM stale index replanned off the GPU to Seq Scan" \
     || fail "stale-reroute: stale index still on the cagra path: $OUT"
 BIGID=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
 SET cuvs.socket_path='$TEST_SOCK';
@@ -586,15 +596,6 @@ run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35
 echo "$OUT" | grep -q "it_big_cagra" \
     && pass "stale-reroute: REINDEX releases the gate (planner back on cagra)" \
     || fail "stale-reroute: planner did not return to cagra after REINDEX: $OUT"
-# DELETE + VACUUM marks stale via ambulkdelete (not just aminsert) -> same reroute.
-# Delete a large fraction (> id 50000, keeping id 5): VACUUM bypasses index
-# vacuuming when dead tuples touch < ~2% of pages, so a tiny delete on a big
-# table would not call ambulkdelete at all (see PLAN Phase 2 staleness note).
-run_sql "DELETE FROM it_big WHERE id > 50000; VACUUM it_big;" >/dev/null
-run_sql "EXPLAIN (COSTS OFF) SELECT id FROM it_big ORDER BY embedding <-> '[5,35,65,145]'::vector LIMIT 1;"
-echo "$OUT" | grep -q "Seq Scan" \
-    && pass "stale-reroute: DELETE+VACUUM (ambulkdelete) also reroutes to Seq Scan" \
-    || fail "stale-reroute: delete-driven stale did not reroute: $OUT"
 
 # Delete-drift gate: when ambulkdelete is suppressed (here vacuum_index_cleanup=off,
 # mimicking VACUUM's failsafe/bypass) the .stale marker is never set, yet recall
@@ -821,6 +822,105 @@ SC14_ID=$(echo "$SC14_OUT" | grep -E '^[0-9]+$' | tail -1)
 
 rm -f "$TEST_SOCK"
 psql -d "$DB" -c "DROP TABLE IF EXISTS sc14;" >/dev/null 2>&1 || true
+
+# --- Scenario 15: pending-delta merge (Phase 3A CPU MVP) ----------------------
+# INSERT/UPDATE after a build append the new vector to the .delta sidecar instead
+# of marking the index stale. The daemon keeps serving the base CAGRA and the
+# backend merges base + CPU-exact delta candidates, so a query sees the new rows
+# without a rebuild. REINDEX absorbs the delta; a corrupt delta reroutes to CPU.
+echo ""
+echo "[it] --- Scenario 15: pending-delta merge (Phase 3A) ---"
+
+start_test_daemon
+run_sql "
+DROP TABLE IF EXISTS sc15;
+CREATE TABLE sc15 (id bigint, embedding vector(4));
+INSERT INTO sc15 SELECT g, format('[%s,%s,%s,%s]', g, (g*7)%997, (g*13)%997, (g*29)%997)::vector
+    FROM generate_series(1,100000) g;
+ANALYZE sc15;
+CREATE INDEX sc15_cagra ON sc15 USING cagra (embedding vector_l2_ops);" >/dev/null \
+    || fail "sc15: setup failed: $OUT"
+
+# Non-vacuous guard: fresh, the planner must pick cagra.
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc15 ORDER BY embedding <-> '[1000,1000,1000,1000]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "sc15_cagra" \
+    && pass "sc15: fresh planner picks cagra (non-vacuous)" \
+    || fail "sc15: fresh planner did not pick cagra: $OUT"
+
+# INSERT a row far from every base vector (components < 997), AFTER the build.
+run_sql "INSERT INTO sc15 VALUES (10000001, '[1000,1000,1000,1000]');" >/dev/null
+
+# It must NOT mark the index stale (Phase 3A appends to .delta instead).
+SC15_STALE=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT stale FROM pg_stat_gpu_search WHERE index_oid='sc15_cagra'::regclass;
+SQL
+)
+[ "$SC15_STALE" = "f" ] \
+    && pass "sc15: INSERT did NOT mark stale (delta path)" \
+    || fail "sc15: INSERT unexpectedly marked stale (got '$SC15_STALE')"
+
+# The GPU path must stay (delta is usable) — not reroute to Seq Scan.
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc15 ORDER BY embedding <-> '[1000,1000,1000,1000]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "sc15_cagra" \
+    && pass "sc15: GPU path retained after INSERT (delta usable)" \
+    || fail "sc15: lost cagra path after INSERT: $OUT"
+
+# The merged result must include the pending row: a probe at its own vector
+# returns it (distance 0) — the base graph (built before) cannot contain it.
+SC15_ID=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT id FROM sc15 ORDER BY embedding <-> '[1000,1000,1000,1000]'::vector LIMIT 1;
+SQL
+)
+[ "$SC15_ID" = "10000001" ] \
+    && pass "sc15: pending-insert row merged into GPU result (id=10000001)" \
+    || fail "sc15: delta row not merged (got '$SC15_ID', want 10000001)"
+
+# Ground truth: the CPU path (enable_cuvs=off) must agree.
+SC15_CPU=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET enable_cuvs = off;
+SELECT id FROM sc15 ORDER BY embedding <-> '[1000,1000,1000,1000]'::vector LIMIT 1;
+SQL
+)
+[ "$SC15_CPU" = "$SC15_ID" ] \
+    && pass "sc15: GPU+delta matches pgvector CPU ground truth (id=$SC15_CPU)" \
+    || fail "sc15: GPU+delta ($SC15_ID) != CPU ground truth ($SC15_CPU)"
+
+# REINDEX absorbs the delta into a fresh base and keeps the GPU path.
+run_sql "REINDEX INDEX sc15_cagra;" >/dev/null
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc15 ORDER BY embedding <-> '[1000,1000,1000,1000]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "sc15_cagra" \
+    && pass "sc15: REINDEX keeps cagra path (delta absorbed)" \
+    || fail "sc15: lost cagra path after REINDEX: $OUT"
+
+# Corrupt-delta safety: a new INSERT recreates the .delta; truncating it makes
+# the plan-time gate reroute to CPU (correctness preserved, not an ERROR/empty).
+run_sql "INSERT INTO sc15 VALUES (10000002, '[2000,2000,2000,2000]');" >/dev/null
+SC15_DELTA=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SELECT (SELECT oid FROM pg_database WHERE datname=current_database())
+       || '_' || 'sc15_cagra'::regclass::oid || '.delta';
+SQL
+)
+truncate -s 10 "$TEST_IDX/$SC15_DELTA" 2>/dev/null || true
+run_sql "EXPLAIN (COSTS OFF) SELECT id FROM sc15 ORDER BY embedding <-> '[2000,2000,2000,2000]'::vector LIMIT 1;"
+echo "$OUT" | grep -q "Seq Scan" \
+    && pass "sc15: corrupt .delta reroutes to Seq Scan (gate fail-closed)" \
+    || fail "sc15: corrupt delta did not reroute: $OUT"
+SC15_CORRUPT=$(psql -d "$DB" -At 2>/dev/null <<SQL | tail -1
+SET cuvs.socket_path='$TEST_SOCK';
+SET cuvs.index_dir='$TEST_IDX';
+SELECT id FROM sc15 ORDER BY embedding <-> '[2000,2000,2000,2000]'::vector LIMIT 1;
+SQL
+)
+[ "$SC15_CORRUPT" = "10000002" ] \
+    && pass "sc15: corrupt-delta query returns correct CPU result (id=10000002)" \
+    || fail "sc15: corrupt-delta wrong result (got '$SC15_CORRUPT', want 10000002)"
+
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS sc15;" >/dev/null 2>&1 || true
 
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then

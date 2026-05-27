@@ -197,9 +197,12 @@ emit an ERROR-level log entry, and fall back to CPU until
 
 **WRITE-01**
 ```
-When a row is inserted, updated, or deleted in a table that has a cagra index,
-the pg_cuvs extension shall mark the cagra index stale without modifying the
-VRAM-resident base index.
+In Phase 2, when a row is inserted, updated, or deleted in a table that has a
+cagra index, the pg_cuvs extension shall mark the cagra index stale without
+modifying the VRAM-resident base index.
+In Phase 3A, INSERT/UPDATE new versions may instead append to a valid pending
+delta artifact and leave the base CAGRA index searchable. DELETE/VACUUM and
+delta-write failure shall continue to mark the index stale and route to CPU.
 ```
 
 **WRITE-02**
@@ -222,27 +225,28 @@ the stale marker only after durable persistence succeeds.
 ```
 In Phase 3, the pg_cuvs extension shall provide a pending-delta correction path:
 INSERT/UPDATE new versions are searched with CPU-side exact distance over a
-bounded delta store, DELETE/UPDATE old versions are filtered only when invisible
-to the active PostgreSQL snapshot, and base CAGRA candidates plus delta
-candidates are over-fetched, merged, and re-ranked before PostgreSQL heap
-recheck.
+bounded delta store, and base CAGRA candidates plus delta candidates are
+over-fetched, merged, and re-ranked before PostgreSQL heap recheck. Phase 3A
+CPU MVP does not implement DELETE/UPDATE-old tombstone correction; those paths
+remain covered by heap recheck, delete-drift gating, and stale CPU reroute.
 ```
 
 **WRITE-04A**
 ```
-The pending-delta path shall not clear or replace the durable stale/generation
-marker unless the base index has been rebuilt and persisted successfully. If a
-daemon restart, missing delta artifact, corrupt delta artifact, or cleanup
-failure prevents safe delta correction, query execution shall fail closed to CPU
-fallback rather than serving the stale base CAGRA graph as fresh.
+The pending-delta path shall not treat a base CAGRA index as complete unless a
+valid delta artifact for the matching base generation is available. If a daemon
+restart, missing delta artifact, corrupt delta artifact, generation mismatch, or
+cleanup failure prevents safe delta correction, query execution shall fail
+closed to CPU fallback rather than serving the incomplete base CAGRA graph as
+fresh.
 ```
 
 **WRITE-04B**
 ```
-The tombstone mechanism shall be snapshot-aware. A global tombstone shall not
-remove an UPDATE old tuple that remains visible to an older transaction
-snapshot. Heap recheck is not sufficient to recover candidates removed before
-the access method returns them.
+When tombstone correction is implemented in a later increment, it shall be
+snapshot-aware. A global tombstone shall not remove an UPDATE old tuple that
+remains visible to an older transaction snapshot. Heap recheck is not
+sufficient to recover candidates removed before the access method returns them.
 ```
 
 **WRITE-04C**

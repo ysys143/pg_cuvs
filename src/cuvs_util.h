@@ -124,6 +124,57 @@ int cuvs_tids_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
  * what it allocated (leaving *tids_out NULL). */
 int cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out);
 
+/* ----------------------------------------------------------------
+ * Versioned .delta pending-insert sidecar (Phase 3A).
+ *
+ * Layout: [CuvsDeltaHeader (32 bytes)] [n_rows * record], each record being
+ * { uint64_t tid; float vec[dim]; } (fixed width = 8 + dim*4 bytes). Holds
+ * vectors inserted/updated since the base CAGRA build so a query can merge GPU
+ * base candidates with CPU-exact delta candidates without a rebuild.
+ *
+ * LITTLE-ENDIAN ONLY, like .tids. Corruption (e.g. a truncated file) is caught
+ * by a file-size check: the body must be exactly n_rows*record_bytes. There is
+ * deliberately no whole-body CRC — appends must stay O(1), and a CRC recomputed
+ * over the growing body on every insert would be O(n^2). base_tids_crc32 ties a
+ * delta to its base build's .tids body_crc32; a REINDEX rewrites the base and
+ * changes that CRC, so a leftover delta is detected as a generation mismatch.
+ * ---------------------------------------------------------------- */
+#define CUVS_DELTA_MAGIC   0x544c4544u   /* 'DELT' little-endian */
+#define CUVS_DELTA_VERSION 1u
+
+typedef struct CuvsDeltaHeader {
+    uint32_t magic;
+    uint32_t version;
+    int64_t  n_rows;
+    uint32_t dim;
+    uint32_t metric;
+    uint32_t base_tids_crc32;  /* .tids body_crc32 at delta creation (generation) */
+    uint32_t reserved;         /* must be 0 */
+} CuvsDeltaHeader;             /* 32 bytes, LE-only, x86-64 daemon */
+
+/* Bytes per delta record for a given dim: TID (uint64) + dim float32s. */
+static inline size_t
+cuvs_delta_record_bytes(uint32_t dim)
+{
+    return sizeof(uint64_t) + (size_t) dim * sizeof(float);
+}
+
+/* Initialize a fresh (empty) delta header. */
+void cuvs_delta_header_init(CuvsDeltaHeader *h, uint32_t dim, uint32_t metric,
+                            uint32_t base_tids_crc32);
+
+/* Validate a delta header against the actual body byte count (file size minus
+ * sizeof(CuvsDeltaHeader)). Checks magic/version/reserved/dim, n_rows range,
+ * and that body_bytes == n_rows * record_bytes exactly. Returns 0 if valid,
+ * -1 otherwise. Pure (no I/O). */
+int cuvs_delta_validate(const CuvsDeltaHeader *h, int64_t body_bytes);
+
+/* Read + validate just the delta header from an open FILE* (does not read the
+ * body). Returns 0 and fills *out on magic/version/reserved success; -1 on a
+ * short read or bad fields. The body-size check is the caller's job (it has
+ * the file size) via cuvs_delta_validate. */
+int cuvs_delta_read_header(FILE *f, CuvsDeltaHeader *out);
+
 #ifdef CUVS_TEST_HOOKS
 /* Test-only fault injection: returns 1 if env var `name` is set, else 0.
  * Compiled in ONLY under CUVS_TEST_HOOKS; absent from production builds. */

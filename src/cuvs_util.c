@@ -229,6 +229,62 @@ cuvs_tids_read(FILE *f, CuvsTidsHeader *hdr_out, uint64_t **tids_out)
     return 0;
 }
 
+/* ----------------------------------------------------------------
+ * Versioned .delta pending-insert sidecar I/O (Phase 3A).
+ * ---------------------------------------------------------------- */
+void
+cuvs_delta_header_init(CuvsDeltaHeader *h, uint32_t dim, uint32_t metric,
+                       uint32_t base_tids_crc32)
+{
+    h->magic           = CUVS_DELTA_MAGIC;
+    h->version         = CUVS_DELTA_VERSION;
+    h->n_rows          = 0;
+    h->dim             = dim;
+    h->metric          = metric;
+    h->base_tids_crc32 = base_tids_crc32;
+    h->reserved        = 0;
+}
+
+int
+cuvs_delta_validate(const CuvsDeltaHeader *h, int64_t body_bytes)
+{
+    if (h->magic != CUVS_DELTA_MAGIC)
+        return -1;
+    if (h->version != CUVS_DELTA_VERSION)
+        return -1;
+    if (h->reserved != 0)
+        return -1;
+    if (h->dim == 0)
+        return -1;
+    if (h->n_rows < 0 || h->n_rows > CUVS_TIDS_MAX_VECS)
+        return -1;
+    if (body_bytes < 0)
+        return -1;
+    /* Body must be exactly n_rows fixed-width records — catches truncation. */
+    if ((uint64_t) body_bytes
+        != (uint64_t) h->n_rows * cuvs_delta_record_bytes(h->dim))
+        return -1;
+    return 0;
+}
+
+int
+cuvs_delta_read_header(FILE *f, CuvsDeltaHeader *out)
+{
+    CuvsDeltaHeader h;
+
+    if (fread(&h, sizeof(h), 1, f) != 1)
+        return -1;
+    if (h.magic != CUVS_DELTA_MAGIC)
+        return -1;
+    if (h.version != CUVS_DELTA_VERSION)
+        return -1;
+    if (h.reserved != 0)
+        return -1;
+    if (out)
+        *out = h;
+    return 0;
+}
+
 #ifdef CUVS_TEST_HOOKS
 int
 cuvs_fault(const char *name)

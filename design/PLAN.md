@@ -307,14 +307,21 @@ Phase 2.1 완료 기준(전부 충족):
 
 Phase 2의 stale fallback은 정합성을 지키지만, 쓰기가 발생한 순간 GPU path를 포기한다. 운영 workload에 INSERT/UPDATE가 조금이라도 섞이면 너무 보수적이므로 Phase 3에서는 pending-delta를 필수 기능으로 구현한다.
 
+Phase 3A policy split:
+- `.delta` = INSERT/UPDATE new version을 보정하는 append-only derived artifact.
+- `.stale` = delta로 보정할 수 없어 CPU reroute가 필요한 상태.
+- INSERT/UPDATE가 delta append에 성공하면 `.stale`로 표시하지 않고 daemon `MARK_STALE`도 보내지 않는다. base CAGRA는 계속 검색 가능해야 backend가 base candidates + CPU delta candidates를 merge할 수 있다.
+- delta append 실패, delta 손상, generation mismatch, threshold 초과는 `.stale` 또는 plan-time gate로 CPU reroute한다.
+- DELETE/VACUUM은 이번 increment에서 기존 Phase 2.1 정책을 유지한다. `ambulkdelete`는 `.stale` mark를 남기고 CPU reroute하며, DELETE tombstone/snapshot-aware old-version correction은 후속 단계다.
+
 Phase 3A entry gate:
 - Phase 2.1 stale fallback hotfix가 완료되어야 한다. delta correction이 불가능하거나 손상된 경우 CPU fallback이 실제로 동작해야 하며, gettuple `return false` 기반 empty result를 fallback으로 간주하지 않는다.
 
 목표:
 - 마지막 successful CAGRA build/REINDEX 이후의 INSERT/UPDATE를 pending-delta store에 보관한다.
-- DELETE/UPDATE old version은 snapshot-aware tombstone metadata에 기록한다.
+- DELETE/UPDATE old version tombstone은 CPU MVP 범위에 넣지 않는다. UPDATE의 new version은 delta에 기록하고, old/dead TID는 heap recheck, over-fetch, delete-drift gate, 기존 VACUUM stale path로 방어한다.
 - query 시 base CAGRA search와 CPU-side pending-delta exact search를 함께 수행한다.
-- base candidates, delta candidates, snapshot-aware tombstone filtering 결과를 over-fetch 기반으로 top-k merge한다.
+- base candidates와 delta candidates를 over-fetch 기반으로 top-k merge한다.
 - PostgreSQL heap recheck/MVCC는 마지막 방어선으로 유지한다.
 
 검색 흐름:
@@ -322,7 +329,6 @@ Phase 3A entry gate:
 query vector
   -> base CAGRA search over immutable graph with k + slop
   -> CPU exact search over pending-delta rows visible to the current snapshot
-  -> apply snapshot-aware tombstone filtering
   -> metric-compatible merge/re-rank to k + slop candidates
   -> PostgreSQL heap recheck / MVCC visibility
   -> if visible rows < k and more candidates may exist, retry with larger slop or CPU fallback
@@ -333,51 +339,53 @@ MVP scope decision:
 - 이유: daemon GPU-side delta는 per-insert IPC, daemon-owned vector memory, restart durability, VRAM pressure를 동시에 키운다. Phase 3A의 목적은 write-after-build 정합성 회복이며, delta 크기가 작을 때 CPU exact가 가장 좁은 구현이다.
 - GPU-side/batched daemon delta는 Phase 3A MVP가 아니라 후속 최적화다.
 - delta가 비용 한계 또는 정합성 한계를 넘으면 stale GPU를 억지로 쓰지 않고 CPU fallback한다.
+- 이번 increment는 **3A-0 + 3A-1 CPU-exact MVP only**다. daemon-side delta cache, GPU brute-force delta, new IPC op, stats column 확장, snapshot-aware tombstone은 별도 increment다.
 
 구현 항목:
 - pending-delta 저장소: backend-visible local/sidecar metadata MVP. daemon-owned GPU delta는 제외한다.
-- delta entry schema: TID, vector, op type, base generation, write generation, xmin/xmax 또는 snapshot 비교에 필요한 metadata.
-- tombstone metadata: base CAGRA에 남아 있을 수 있는 deleted/updated-old TID를 전역 삭제하지 않는다. 현재 query snapshot에서 invisible한 경우에만 제거한다.
-- persistent stale/generation marker: `.stale` 또는 generation sidecar는 delta artifact와 독립적으로 유지한다. delta가 base stale을 보정할 수 있는 상태일 때도 daemon restart 후 fail-open하지 않아야 한다.
+- delta entry schema: TID, vector, op type(INSERT/UPDATE-new), base generation, write generation, xmin 또는 heap recheck에 필요한 최소 metadata.
+- `aminsert` policy: delta append 성공 시 daemon `MARK_STALE`을 보내지 않는다. delta append 실패 시 기존 stale path로 fail closed한다.
+- persistent generation marker: delta artifact가 어떤 base CAGRA generation을 보정하는지 확인한다. generation mismatch는 GPU+delta를 사용하지 않고 CPU reroute한다.
 - merge algorithm: base result와 delta exact result의 metric-compatible distance ordering을 보장한다. L2/cosine/IP 각각의 정렬 방향, normalization, tie-break를 명시하고 pgvector ground truth로 검증한다.
 - over-fetch policy: base CAGRA와 delta exact 모두 `k + slop`을 대상으로 merge한다. heap recheck 후 visible rows가 k 미만이면 slop 확대 또는 CPU fallback한다.
 - write capture batching: `COPY`/bulk INSERT가 per-row IPC storm을 만들지 않도록 batch capture 또는 threshold-then-CPU-fallback 정책을 둔다.
 - threshold/backpressure policy: `cuvs.rebuild_threshold` 또는 `cuvs.max_delta_rows` 초과 시 GPU+delta path를 중지하고 CPU fallback한다. background rebuild는 Phase 3A MVP 범위 밖이며, 자동 실행 주체가 생기기 전까지는 `REINDEX` 권고만 한다.
-- stats: `pg_stat_gpu_search`에 `delta_count`, `tombstone_count`, `delta_search_us`, `delta_merged`, `stale_but_corrected` 계열 컬럼 추가.
-- rebuild compaction: successful REINDEX 후 pending-delta/tombstone을 비우고 새 base generation으로 교체.
+- stats: 이번 CPU MVP에서는 schema 확장을 하지 않는다. deterministic tests와 optional DEBUG/NOTICE만 사용하고, stats columns는 GPU delta cache increment에서 추가한다.
+- rebuild compaction: successful REINDEX 후 pending-delta를 비우고 새 base generation으로 교체한다.
 
 정합성 원칙:
 - pending-delta가 없으면 INSERT된 새 벡터가 CAGRA 후보에 절대 나오지 않으므로 stale GPU search는 틀릴 수 있다.
 - pending-delta exact search가 들어오기 전까지 Phase 2의 CPU fallback 정책을 유지한다.
 - delta merge가 실패하거나 delta artifact가 손상되면 GPU path를 사용하지 않고 CPU fallback한다.
-- Phase 3 MVP의 delta/tombstone은 source-of-truth가 아니라 derived artifact다. WAL과 같은 durability 계약을 흉내 내지 않는다.
-- daemon restart 후 delta/tombstone artifact가 없거나 손상되면 stale GPU path를 쓰지 않고 CPU fallback한다.
-- `.stale`/generation marker는 delta보다 오래 살아야 한다. delta가 유실돼도 base CAGRA가 fresh로 오인되면 안 된다.
+- Phase 3A MVP의 delta는 source-of-truth가 아니라 derived artifact다. WAL과 같은 durability 계약을 흉내 내지 않는다.
+- daemon restart 후 delta artifact가 없거나 손상되면 base CAGRA를 fresh+complete로 오인하지 않고 CPU fallback한다.
+- `.stale`은 더 이상 모든 INSERT/UPDATE의 기본 결과가 아니다. valid delta가 있는 INSERT/UPDATE는 corrected-not-stale 상태이고, `.stale`은 DELETE/VACUUM 또는 delta failure/unsafe 상태를 의미한다.
 - 전역 tombstone으로 UPDATE old TID를 제거하면 오래된 snapshot에서 visible한 tuple을 누락할 수 있으므로 금지한다.
 
 PostgreSQL transaction/MVCC caveat:
 - index AM write callback은 transaction commit 전에 호출될 수 있다.
-- aborted transaction의 tuple TID가 delta/tombstone에 남을 수 있으므로 heap recheck/MVCC visibility가 최종 필터다.
-- heap recheck는 후보를 제거할 수만 있고, merge에서 이미 빠진 후보를 되살릴 수 없다. 따라서 tombstone filtering은 snapshot-aware여야 하고, over-fetch/fallback이 필요하다.
+- aborted transaction의 tuple TID가 delta에 남을 수 있으므로 heap recheck/MVCC visibility가 최종 필터다.
+- heap recheck는 후보를 제거할 수만 있고, merge에서 이미 빠진 후보를 되살릴 수 없다. 따라서 이번 CPU MVP는 tombstone filtering을 하지 않고, over-fetch/fallback으로 deleted/dead base candidates의 underfill을 방어한다. 후속 tombstone filtering은 snapshot-aware여야 한다.
 - rollback을 완벽히 추적하는 WAL-like delta는 Phase 3A MVP 범위가 아니다.
-- cleanup policy는 명시해야 한다: VACUUM/REINDEX/build generation 전환 시 delta/tombstone을 정리하고, cleanup 실패 시 CPU fallback한다.
+- cleanup policy는 명시해야 한다: REINDEX/build generation 전환 시 delta를 정리하고, cleanup 실패 시 CPU fallback한다. VACUUM/DELETE tombstone cleanup은 후속 tombstone increment 범위다.
 
 검증:
 - INSERT 후 REINDEX 전에도 새 row가 GPU+delta merged top-k에 포함된다.
-- UPDATE는 old snapshot에서 old TID가 계속 보이고, new snapshot에서 new vector delta가 보인다.
-- DELETE된 base TID는 해당 snapshot에서 invisible할 때만 merge 단계에서 제거된다.
-- delta threshold 초과 시 rebuild 권고/trigger가 발생한다.
-- daemon restart 후 delta/tombstone이 유실되어도 persistent stale/generation marker 때문에 stale GPU를 fresh로 서빙하지 않는다.
+- UPDATE 후 new vector delta가 보인다. old-version snapshot-aware tombstone은 이번 increment 완료 기준이 아니다.
+- DELETE/VACUUM은 기존처럼 `.stale` CPU reroute를 유지한다.
+- delta threshold 초과 시 GPU+delta path가 중지되고 CPU reroute 또는 REINDEX 권고가 발생한다.
+- daemon restart 후 delta가 유실되어도 generation/delta validity gate 때문에 incomplete GPU 결과를 서빙하지 않는다.
 - aborted transaction delta가 가까운 distance를 갖더라도 heap recheck 후 k개 recall이 유지되거나 CPU fallback한다.
 - L2/cosine/IP 각각에서 pgvector CPU ground truth와 top-k가 일치한다.
 - random INSERT/UPDATE/DELETE/query interleaving property test를 추가한다.
-- bulk INSERT/COPY에서 delta threshold/backpressure 정책이 per-row IPC storm 없이 동작한다.
+- bulk INSERT/COPY에서 delta append와 threshold/backpressure 정책이 daemon IPC storm 없이 동작한다.
 
 Phase 3A 완료 기준:
 - write-heavy workload에서 stale CPU fallback 없이 base CAGRA + pending-delta exact search로 정합한 top-k를 반환한다.
-- aborted transaction, UPDATE, DELETE, VACUUM, daemon restart에서 틀린 GPU 결과를 반환하지 않는다.
-- delta/tombstone 손상 또는 cleanup 실패는 CPU fallback으로 닫힌다.
-- old snapshot visibility, over-fetch recall, restart fail-closed, metric-specific merge가 regression/integration/property test로 검증된다.
+- INSERT/UPDATE, aborted transaction, daemon restart에서 틀린 GPU 결과를 반환하지 않는다.
+- DELETE/VACUUM은 기존 `.stale` CPU reroute 정책을 유지한다.
+- delta 손상 또는 cleanup 실패는 CPU fallback으로 닫힌다.
+- over-fetch recall, restart fail-closed, metric-specific merge가 regression/integration/property test로 검증된다.
 
 #### Phase 3B — DiskANN / Vamana Local NVMe
 
@@ -466,7 +474,7 @@ Phase 3 전체 완료 기준:
 | daemon 장애 | SELECT는 CPU fallback, DDL은 ERROR |
 | planner에서 CUDA touch | daemon status cache 또는 conservative cost |
 | signal unsafe shutdown | signal handler는 flag만 set, main loop에서 graceful shutdown |
-| write/stale index | stale marker, fallback, lazy rebuild, VACUUM/REINDEX 계약 |
+| write/stale index | delta-corrected INSERT/UPDATE, stale marker fallback, VACUUM/REINDEX 계약 |
 | large build memory pressure | chunked streaming, mmap staging, shard build |
 | artifact corruption | tmp+fsync+rename, manifest/checksum, pair validation |
 
