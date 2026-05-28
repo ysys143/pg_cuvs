@@ -39,6 +39,28 @@ EOF
 > `GCP_VM`의 IP는 VM을 stop/start 할 때마다 바뀐다(ephemeral IP).  
 > IP 확인: `gcloud compute instances describe $GCP_INSTANCE --zone $GCP_ZONE --project $GCP_PROJECT --format='get(networkInterfaces[0].accessConfigs[0].natIP)'`
 
+### SSH 접속 설정 (최초 1회)
+
+`make gpu-*` 래퍼들은 내부적으로 `ssh $GCP_VM ...` 으로 VM에 접속한다.  
+처음 사용하는 경우 SSH 키를 GCP에 등록해야 한다.
+
+```bash
+# gcloud로 SSH 키 자동 등록 + 접속 테스트
+gcloud compute ssh $GCP_INSTANCE --zone $GCP_ZONE --project $GCP_PROJECT
+
+# 성공하면 VM 셸이 열린다. exit로 빠져나온다.
+# 이후 일반 ssh도 동작:
+ssh $GCP_VM "echo connected"
+```
+
+**기대 출력:**
+```
+connected
+```
+**-> `Permission denied (publickey)`:** SSH 키가 등록되지 않음 — `gcloud compute ssh` 로 키 등록 먼저  
+**-> `Connection refused` / `No route to host`:** VM이 꺼져 있음 — Step 0으로  
+**-> `Host key verification failed`:** VM IP가 바뀜 — `ssh-keygen -R <old_IP>` 후 재시도
+
 ### 직접 명령 실행 전 환경 변수 로드
 
 ```bash
