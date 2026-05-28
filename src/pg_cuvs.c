@@ -80,6 +80,7 @@ double cuvs_build_mem_safety_ratio = 0.5;  /* auto-limit fraction of MemAvailabl
 double cuvs_max_stale_fraction     = 0.10; /* deleted-since-build fraction that reroutes to CPU */
 int   cuvs_max_delta_rows          = 10000; /* pending-insert delta cap; 0 disables delta (Phase 3A) */
 int   cuvs_delta_search_mode       = 0;    /* 0=auto, 1=cpu, 2=gpu (Phase 3A-3) */
+int   cuvs_shard_count             = 0;    /* 0/1 = unsharded; >=2 splits index into N GPU shards (Phase 3F) */
 char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty = disabled (Phase 3C) */
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
@@ -214,6 +215,18 @@ _PG_init(void)
         "gpu (2): GPU-only, no CPU fallback (may miss delta rows).",
         &cuvs_delta_search_mode,
         0, 0, 2,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.shard_count",
+        "Number of GPU shards to split a CAGRA index into at build time (Phase 3F).",
+        "0 or 1 keeps the legacy single-GPU unsharded index. A value >= 2 splits "
+        "the index into N standalone CAGRA shard artifacts over contiguous "
+        "build-order ranges; the daemon places shards across GPUs and merges a "
+        "global top-k at query time. Read at CREATE INDEX/REINDEX time only.",
+        &cuvs_shard_count,
+        0, 0, CUVS_SHARDS_MAX,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -868,7 +881,8 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         bs.metric,
         get_index_dir(),
         heap_table_oid,
-        heap_relfilenode);
+        heap_relfilenode,
+        (uint32_t)cuvs_shard_count);
 
     free(bs.vectors);
     free(bs.tids);
@@ -1873,7 +1887,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 32
+#define GPU_STATS_NCOLS 33
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -2003,11 +2017,16 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         values[28] = Int32GetDatum((int32) s->warmup_duration_ms);
         values[29] = Int64GetDatum((int64) s->download_count);
         values[30] = Int64GetDatum((int64) s->cache_miss_count);
-        /* Phase 3E: GPU device */
+        /* Phase 3E: GPU device. For a sharded index the logical row has no
+         * single device (gpu_device_id == 0xFFFFFFFF) -> NULL; per-shard GPUs
+         * are in pg_stat_gpu_shards. */
         if (s->gpu_device_id != 0xFFFFFFFF)
             values[31] = Int32GetDatum((int32) s->gpu_device_id);
         else
             nulls[31] = true;
+
+        /* Phase 3F: shard count (0/1 = unsharded). */
+        values[32] = Int32GetDatum((int32) s->shard_count);
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }
@@ -2082,6 +2101,85 @@ pg_cuvs_gpu_cache_stats(PG_FUNCTION_ARGS)
         }
     }
     /* daemon down (UNAVAILABLE) -> empty result, not an error */
+
+    return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * pg_cuvs_gpu_shard_stats() — per-shard rows for sharded CAGRA indexes in this
+ * database (Phase 3F), backing the pg_stat_gpu_shards view. Zero rows when the
+ * daemon is unreachable or no sharded index exists (same convention as the
+ * other pg_stat_gpu_* views).
+ * ---------------------------------------------------------------- */
+#define GPU_SHARD_NCOLS 12
+#define GPU_SHARD_MAXROWS 1024   /* sum of shards across all sharded indexes */
+
+PG_FUNCTION_INFO_V1(pg_cuvs_gpu_shard_stats);
+Datum
+pg_cuvs_gpu_shard_stats(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx;
+    MemoryContext    oldcontext;
+    CuvsShardStats  *rows;
+    int              n = 0;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    rows = (CuvsShardStats *) palloc(GPU_SHARD_MAXROWS * sizeof(CuvsShardStats));
+    cuvs_ipc_shard_stats(cuvs_socket_path, (uint32_t) MyDatabaseId, 0,
+                         rows, GPU_SHARD_MAXROWS, &n);
+
+    for (int i = 0; i < n; i++)
+    {
+        CuvsShardStats *r = &rows[i];
+        Datum   values[GPU_SHARD_NCOLS];
+        bool    nulls[GPU_SHARD_NCOLS];
+        char   *relname;
+
+        memset(nulls, 0, sizeof(nulls));
+        values[0] = ObjectIdGetDatum((Oid) r->db_oid);
+        values[1] = ObjectIdGetDatum((Oid) r->index_oid);
+
+        relname = get_rel_name((Oid) r->index_oid);
+        if (relname)
+            values[2] = CStringGetTextDatum(relname);
+        else
+            nulls[2] = true;
+
+        values[3] = Int32GetDatum((int32) r->shard_id);
+        values[4] = Int32GetDatum((int32) r->gpu_device_id);
+        values[5] = Int64GetDatum(r->n_vecs);
+        values[6] = Int64GetDatum(r->tid_offset);
+        values[7] = Int64GetDatum((int64) (r->vram_bytes / (1024 * 1024)));
+        values[8] = Int64GetDatum((int64) r->search_count);
+        values[9] = Int64GetDatum((int64) r->error_count);
+        values[10] = BoolGetDatum(r->resident != 0);
+        values[11] = CStringGetTextDatum(cuvs_status_str((int) r->last_status));
+
+        tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+    }
 
     return (Datum) 0;
 }

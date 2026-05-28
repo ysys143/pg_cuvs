@@ -57,14 +57,39 @@ typedef enum WarmupState {
     WARMUP_FAILED       = 5,
 } WarmupState;
 
+/* Phase 3F: one shard of a sharded logical CAGRA index. A shard is a standalone
+ * CAGRA artifact resident on one GPU, covering the contiguous global TID range
+ * [tid_offset, tid_offset + n_vecs). Shard-local item_ids map to global TIDs via
+ * IndexEntry.tids[tid_offset + item_id]. */
+typedef struct ShardEntry {
+    uint32_t        shard_id;
+    CuvsCagraIndex  handle;        /* cuVS opaque index for this shard */
+    int64_t         tid_offset;    /* global TID start offset */
+    int64_t         n_vecs;        /* vectors in this shard */
+    uint32_t        gpu_device_id; /* CUDA device this shard lives on */
+    size_t          vram_bytes;    /* estimated VRAM held by this shard */
+    uint64_t        search_count;  /* OK searches dispatched to this shard */
+    uint64_t        error_count;   /* failed shard searches */
+    uint32_t        last_status;   /* CUVS_STATUS_* of the last shard search */
+    int             valid;         /* 1 once the shard is built/loaded */
+} ShardEntry;
+
 typedef struct IndexEntry {
     uint32_t        db_oid;
     uint32_t        index_oid;
     uint32_t        dim;
     uint32_t        metric;
     int64_t         n_vecs;
-    CuvsCagraIndex  handle;       /* cuVS opaque index */
-    uint64_t       *tids;         /* TID array [n_vecs] */
+    CuvsCagraIndex  handle;       /* cuVS opaque index (unsharded only; NULL if sharded) */
+    uint64_t       *tids;         /* global TID array [n_vecs] (shared by all shards) */
+
+    /* Phase 3F multi-GPU sharding. shard_count <= 1 => unsharded: use `handle`
+     * and `gpu_device_id`. shard_count >= 2 => sharded: `handle` is NULL,
+     * `shards`[shard_count] holds the per-GPU CAGRA artifacts, and
+     * `gpu_device_id` is set to 0xFFFFFFFF (no single device) so LRU eviction
+     * (which matches on exact device id) never partially evicts the index. */
+    int             shard_count;  /* 0/1 = unsharded; >=2 = sharded */
+    ShardEntry     *shards;       /* [shard_count] when sharded; NULL otherwise */
     size_t          vram_bytes;   /* estimated VRAM usage */
     time_t          last_search;  /* for LRU eviction; also stats last_search_at */
     int             valid;
@@ -421,8 +446,23 @@ total_vram_used(int device_id)
 {
     size_t total = 0;
     for (int i = 0; i < g_n_indexes; i++)
-        if (g_indexes[i].valid && g_indexes[i].gpu_device_id == (uint32_t)device_id)
-            total += g_indexes[i].vram_bytes + g_indexes[i].delta_vram_bytes;
+    {
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid)
+            continue;
+        if (e->shard_count >= 2)
+        {
+            /* Sharded: sum only the shards resident on this device. */
+            for (int s = 0; s < e->shard_count; s++)
+                if (e->shards[s].valid &&
+                    e->shards[s].gpu_device_id == (uint32_t)device_id)
+                    total += e->shards[s].vram_bytes;
+        }
+        else if (e->gpu_device_id == (uint32_t)device_id)
+        {
+            total += e->vram_bytes + e->delta_vram_bytes;
+        }
+    }
     return total;
 }
 
@@ -506,6 +546,24 @@ stale_file_path(char *out, size_t outlen,
                 const char *dir, uint32_t db_oid, uint32_t index_oid)
 {
     snprintf(out, outlen, "%s/%u_%u.stale", dir, db_oid, index_oid);
+}
+
+/* Phase 3F: manifest sidecar marking a logical index as sharded; the commit
+ * marker for a sharded build (renamed last). */
+static void
+shards_manifest_path(char *out, size_t outlen,
+                     const char *dir, uint32_t db_oid, uint32_t index_oid)
+{
+    snprintf(out, outlen, "%s/%u_%u.shards", dir, db_oid, index_oid);
+}
+
+/* Phase 3F: per-shard CAGRA artifact, e.g. "<db>_<idx>.s000.cagra". */
+static void
+shard_cagra_path(char *out, size_t outlen,
+                 const char *dir, uint32_t db_oid, uint32_t index_oid,
+                 uint32_t shard_id)
+{
+    snprintf(out, outlen, "%s/%u_%u.s%03u.cagra", dir, db_oid, index_oid, shard_id);
 }
 
 /* Pending-insert delta sidecar (Phase 3B); written by the PG backend, replayed
@@ -756,6 +814,9 @@ fail_cleanup:
 }
 
 /* Forward decls used by save_index. */
+static int crc32_file(const char *path, uint32_t *out);
+static void free_index_shards(IndexEntry *e);
+static IndexEntry *find_index(uint32_t db_oid, uint32_t index_oid);
 static int write_tids_atomic(const char *tids_tmp,
                              int64_t n_vecs, uint32_t dim, uint32_t metric,
                              const uint64_t *tids);
@@ -818,6 +879,155 @@ save_index(IndexEntry *e)
     return 0;
 }
 
+/* Phase 3F: reload a sharded logical index from its `.shards` manifest. The
+ * caller has already read + validated the global `.tids` (thdr, tids). On
+ * success registers a sharded IndexEntry, takes ownership of `tids`, and
+ * returns 0. Returns 1 when no manifest exists (caller uses the unsharded
+ * path; `tids` untouched). Returns -1 (corrupt/mismatch) or -2 (VRAM) on
+ * failure WITHOUT consuming `tids` — fail closed, never a partial index.
+ * Caller holds g_index_mutex. */
+static int
+load_index_sharded(uint32_t db_oid, uint32_t index_oid,
+                   const CuvsTidsHeader *thdr, uint64_t *tids)
+{
+    char manifest_path[512];
+    shards_manifest_path(manifest_path, sizeof(manifest_path), g_index_dir, db_oid, index_oid);
+
+    FILE *mf = fopen(manifest_path, "rb");
+    if (!mf)
+        return 1;   /* no manifest => unsharded */
+
+    CuvsShardsHeader shdr;
+    CuvsShardRecord *recs = NULL;
+    if (cuvs_shards_read(mf, &shdr, &recs) != 0)
+    {
+        fclose(mf);
+        LOG_ERROR("pg_cuvs_server: .shards validation failed for %u/%u, skip (fail closed)\n",
+                  db_oid, index_oid);
+        return -1;
+    }
+    fclose(mf);
+
+    /* Generation + geometry must match the .tids we already validated. */
+    if (shdr.base_tids_crc32 != thdr->body_crc32 ||
+        shdr.n_vecs != thdr->n_vecs ||
+        shdr.dim != thdr->dim ||
+        shdr.metric != thdr->metric)
+    {
+        LOG_ERROR("pg_cuvs_server: .shards generation/geometry mismatch for %u/%u, skip\n",
+                  db_oid, index_oid);
+        free(recs);
+        return -1;
+    }
+
+    if (g_n_indexes >= MAX_INDEXES)
+    {
+        free(recs);
+        return -1;
+    }
+
+    int         sc      = (int)shdr.shard_count;
+    ShardEntry *shards  = calloc((size_t)sc, sizeof(ShardEntry));
+    if (!shards)
+    {
+        free(recs);
+        return -1;
+    }
+
+    int n_gpus  = n_usable_gpus();
+    int ok      = 1;
+    int rc_fail = -1;
+    int i;
+    for (i = 0; i < sc; i++)
+    {
+        size_t needed = estimate_vram_bytes(recs[i].n_vecs, (int)recs[i].dim);
+        int    dev    = usable_gpu(i % n_gpus);   /* re-place on reload */
+        if (ensure_vram(needed, dev) != 0)
+        {
+            int alt = pick_gpu_for_index(needed);
+            if (alt < 0 || ensure_vram(needed, alt) != 0)
+            {
+                rc_fail = -2;   /* VRAM pressure */
+                ok = 0;
+                break;
+            }
+            dev = alt;
+        }
+
+        char sp[512];
+        shard_cagra_path(sp, sizeof(sp), g_index_dir, db_oid, index_oid, recs[i].shard_id);
+
+        /* Verify shard artifact CRC before deserialize (fail closed). */
+        uint32_t acrc = 0;
+        if (crc32_file(sp, &acrc) != 0 || acrc != recs[i].artifact_crc32)
+        {
+            LOG_ERROR("pg_cuvs_server: shard %u artifact crc mismatch for %u/%u, skip\n",
+                      recs[i].shard_id, db_oid, index_oid);
+            ok = 0;
+            break;
+        }
+
+        CuvsCagraIndex h = cuvs_cagra_deserialize(sp, (int)recs[i].dim, dev);
+        if (!h)
+        {
+            ok = 0;
+            break;
+        }
+
+        shards[i].shard_id      = recs[i].shard_id;
+        shards[i].handle        = h;
+        shards[i].tid_offset    = recs[i].tid_offset;
+        shards[i].n_vecs        = recs[i].n_vecs;
+        shards[i].gpu_device_id = (uint32_t)dev;
+        shards[i].vram_bytes    = needed;
+        shards[i].valid         = 1;
+    }
+
+    if (!ok)
+    {
+        for (int j = 0; j < i && j < sc; j++)
+            if (shards[j].valid && shards[j].handle)
+                cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
+        free(shards);
+        free(recs);
+        return rc_fail;   /* fail closed: no partial sharded index registered */
+    }
+
+    IndexEntry *e = &g_indexes[g_n_indexes++];
+    memset(e, 0, sizeof(*e));
+    e->db_oid        = db_oid;
+    e->index_oid     = index_oid;
+    e->dim           = thdr->dim;
+    e->metric        = thdr->metric;
+    e->n_vecs        = thdr->n_vecs;
+    e->handle        = NULL;
+    e->tids          = tids;          /* take ownership */
+    e->vram_bytes    = 0;
+    e->last_search   = time(NULL);
+    e->valid         = 1;
+    e->warmup_state  = WARMUP_HOT;
+    e->gpu_device_id = 0xFFFFFFFFu;    /* sharded: not LRU-evictable */
+    e->shard_count   = sc;
+    e->shards        = shards;
+    reset_entry_stats(e);
+
+    {
+        char stale_path[512];
+        struct stat st;
+        stale_file_path(stale_path, sizeof(stale_path), g_index_dir, db_oid, index_oid);
+        if (stat(stale_path, &st) == 0) { e->stale = 1; e->stale_since = st.st_mtime; }
+        else { e->stale = 0; e->stale_since = 0; }
+    }
+
+    free(recs);
+    LOG_INFO("pg_cuvs_server: loaded sharded index %u/%u (%lld vecs, %d shards)\n",
+             db_oid, index_oid, (long long)thdr->n_vecs, sc);
+    for (int j = 0; j < sc; j++)
+        LOG_INFO("  shard %d -> GPU %u (%lld vecs)\n",
+                 j, e->shards[j].gpu_device_id, (long long)e->shards[j].n_vecs);
+    return 0;
+}
+
 static int
 load_index(uint32_t db_oid, uint32_t index_oid)
 {
@@ -855,6 +1065,22 @@ load_index(uint32_t db_oid, uint32_t index_oid)
                 db_oid, index_oid);
         free(tids);
         return -1;
+    }
+
+    /* Phase 3F: if a `.shards` manifest exists, this is a sharded logical index.
+     * Load via the shard path (which takes ownership of tids on success). A
+     * present-but-invalid manifest fails closed (no unsharded fallback — there
+     * is no single .cagra to fall back to). */
+    {
+        int src = load_index_sharded(db_oid, index_oid, &thdr, tids);
+        if (src == 0)
+            return 0;            /* sharded load OK; tids ownership transferred */
+        if (src < 0)
+        {
+            free(tids);
+            return src;          /* -1 corrupt/mismatch, -2 VRAM: fail closed */
+        }
+        /* src == 1: no manifest -> unsharded path below (tids still owned here) */
     }
 
     /* VRAM make-room: evict LRU resident indexes to fit (tiered cache). Same
@@ -908,6 +1134,8 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->last_search = time(NULL);
     e->valid       = 1;
     e->gpu_device_id = (uint32_t)target_gpu;
+    e->shard_count = 0;     /* unsharded; slot may be reused post-eviction */
+    e->shards      = NULL;
     /* Delta cache starts empty; this slot may carry stale delta fields from a
      * previously evicted index. It is lazily (re)built in handle_search. */
     e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
@@ -954,11 +1182,31 @@ startup_load_indexes(void)
     {
         uint32_t db_oid, index_oid;
         /* Parse filenames of the form "<db_oid>_<index_oid>.cagra" (also
-         * rejects .tids files). See cuvs_parse_index_filename. */
+         * rejects .tids files and Phase 3F shard artifacts). See
+         * cuvs_parse_index_filename. */
         if (cuvs_parse_index_filename(ent->d_name, &db_oid, &index_oid) == 0)
             load_index(db_oid, index_oid);
     }
     closedir(dir);
+
+    /* Phase 3F: sharded indexes have no base "<db>_<idx>.cagra" — discover them
+     * via the ".shards" manifest. load_index dedups against already-loaded
+     * entries and branches to the sharded path when the manifest is present. */
+    dir = opendir(g_index_dir);
+    if (dir)
+    {
+        while ((ent = readdir(dir)) != NULL)
+        {
+            uint32_t db_oid, index_oid;
+            char tail[16] = {0};
+            /* "<db>_<idx>.shards"; %15s after the dot must equal "shards". */
+            if (sscanf(ent->d_name, "%u_%u.%15s", &db_oid, &index_oid, tail) == 3
+                && strcmp(tail, "shards") == 0
+                && !find_index(db_oid, index_oid))
+                load_index(db_oid, index_oid);
+        }
+        closedir(dir);
+    }
 
     /* Phase 3D: second pass — for indexes that have a .relfilenode sidecar
      * but no local .cagra, register as COLD and enqueue background download.
@@ -1108,6 +1356,29 @@ find_index(uint32_t db_oid, uint32_t index_oid)
     return NULL;
 }
 
+/* Phase 3F: bump a per-GPU cache counter for every GPU a logical index
+ * occupies — each shard's GPU for a sharded index, or the single GPU for an
+ * unsharded one. Guards the sharded sentinel gpu_device_id (0xFFFFFFFF) so it
+ * never indexes the per-GPU counter arrays out of bounds. Caller holds the
+ * mutex. */
+static void
+cache_counter_bump(uint64_t *counters, const IndexEntry *e)
+{
+    if (e->shard_count >= 2)
+    {
+        for (int s = 0; s < e->shard_count; s++)
+        {
+            uint32_t g = e->shards[s].gpu_device_id;
+            if (g < CUVS_MAX_GPUS)
+                counters[g]++;
+        }
+    }
+    else if (e->gpu_device_id < CUVS_MAX_GPUS)
+    {
+        counters[e->gpu_device_id]++;
+    }
+}
+
 /* ----------------------------------------------------------------
  * Socket I/O helpers (same as client)
  * ---------------------------------------------------------------- */
@@ -1171,7 +1442,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
     if (e)
     {
-        g_cache_hits[e->gpu_device_id]++;
+        cache_counter_bump(g_cache_hits, e);
     }
     else
     {
@@ -1181,8 +1452,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             e = find_index(cmd->db_oid, cmd->index_oid);
             if (e)
             {
-                g_cache_reloads[e->gpu_device_id]++;
-                g_cache_misses[e->gpu_device_id]++;
+                cache_counter_bump(g_cache_reloads, e);
+                cache_counter_bump(g_cache_misses, e);
             }
         }
         else
@@ -1302,6 +1573,103 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     int k = (int)cmd->k;
+
+    /* Phase 3F: sharded fanout. Search every shard for its top-k, map each
+     * shard-local id to a global TID via the shard's tid_offset, merge all
+     * candidates by distance (metric-aware), and return the global top-k. One
+     * IPC request per logical index; the reply format is unchanged. Delta is
+     * left to the backend CPU merge (delta_merged=0). Fail closed: any shard
+     * search failure returns OOM_FALLBACK (CPU), never a partial result. */
+    if (e->shard_count >= 2)
+    {
+        int sc = e->shard_count;
+        CuvsSearchResult *sraw = malloc((size_t)k * sizeof(CuvsSearchResult));
+        CuvsResult       *cand = malloc((size_t)sc * (size_t)k * sizeof(CuvsResult));
+        CuvsResult       *out  = malloc((size_t)k * sizeof(CuvsResult));
+        if (!sraw || !cand || !out)
+        {
+            free(sraw); free(cand); free(out);
+            munmap(query, vec_bytes);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error(client_fd, "malloc failed");
+            return;
+        }
+
+        int n_total   = 0;
+        int shard_err = 0;
+        for (int s = 0; s < sc; s++)
+        {
+            ShardEntry *se = &e->shards[s];
+            int sk = (int)(se->n_vecs < (int64_t)k ? se->n_vecs : k);
+            if (sk <= 0)
+                continue;
+            int rc = cuvs_cagra_search(se->handle, query, (int)cmd->dim, sk,
+                                       sraw, se->gpu_device_id);
+            if (rc != 0)
+            {
+                se->error_count++;
+                se->last_status = CUVS_STATUS_OOM_FALLBACK;
+                shard_err = 1;
+                break;               /* fail closed: no partial ANN result */
+            }
+            se->search_count++;
+            se->last_status = CUVS_STATUS_OK;
+            for (int j = 0; j < sk; j++)
+            {
+                int64_t id = sraw[j].item_id;
+                if (id < 0 || id >= se->n_vecs)
+                    continue;
+                int64_t gid = se->tid_offset + id;
+                if (gid < 0 || gid >= e->n_vecs)
+                    continue;
+                cand[n_total].tid      = e->tids[gid];
+                cand[n_total].distance = sraw[j].distance;
+                n_total++;
+            }
+        }
+        munmap(query, vec_bytes);
+        free(sraw);
+
+        if (shard_err)
+        {
+            free(cand); free(out);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_OOM_FALLBACK;
+            strncpy(hdr.error, "sharded search failed on a shard; CPU fallback",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, CUVS_STATUS_OOM_FALLBACK, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+
+        g_merge_metric = e->metric;     /* read by delta_cand_cmp under the lock */
+        qsort(cand, (size_t)n_total, sizeof(CuvsResult), delta_cand_cmp);
+        int n_valid = (n_total < k) ? n_total : k;
+        memcpy(out, cand, (size_t)n_valid * sizeof(CuvsResult));
+        free(cand);
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint32_t latency_us = (uint32_t)(
+            (t1.tv_sec - t0.tv_sec) * 1000000 +
+            (t1.tv_nsec - t0.tv_nsec) / 1000);
+        record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
+        e->last_requested_k = cmd->k;
+        e->last_returned_k  = (uint32_t)n_valid;
+        pthread_mutex_unlock(&g_index_mutex);
+
+        CuvsReplyHeader hdr = {0};
+        hdr.status       = CUVS_STATUS_OK;
+        hdr.n_results    = (uint32_t)n_valid;
+        hdr.latency_us   = latency_us;
+        hdr.delta_merged = 0;
+        send_all(client_fd, &hdr, sizeof(hdr));
+        if (n_valid > 0)
+            send_all(client_fd, out, (size_t)n_valid * sizeof(CuvsResult));
+        free(out);
+        return;
+    }
+
     CuvsSearchResult *raw = malloc(k * sizeof(CuvsSearchResult));
     if (!raw)
     {
@@ -1477,6 +1845,46 @@ fsync_path(const char *path)
     return rc;
 }
 
+/* Phase 3F: streaming CRC-32 of a whole file (chunked; never loads the entire
+ * artifact into RAM). Returns 0 and sets *out on success, -1 on open/read error. */
+static int
+crc32_file(const char *path, uint32_t *out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    uint32_t crc = cuvs_crc32_stream_begin();
+    unsigned char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        crc = cuvs_crc32_stream_update(crc, buf, n);
+    int err = ferror(f);
+    fclose(f);
+    if (err)
+        return -1;
+    *out = cuvs_crc32_stream_end(crc);
+    return 0;
+}
+
+/* Phase 3F: free all GPU shard handles of a sharded entry and the shards array.
+ * Caller holds g_index_mutex. Leaves shard_count=0/shards=NULL so the slot can
+ * be reused as an unsharded entry. Does NOT free e->tids (caller owns that). */
+static void
+free_index_shards(IndexEntry *e)
+{
+    if (!e->shards)
+    {
+        e->shard_count = 0;
+        return;
+    }
+    for (int s = 0; s < e->shard_count; s++)
+        if (e->shards[s].valid && e->shards[s].handle)
+            cuvs_cagra_free(e->shards[s].handle, e->shards[s].gpu_device_id);
+    free(e->shards);
+    e->shards = NULL;
+    e->shard_count = 0;
+}
+
 /* ----------------------------------------------------------------
  * Phase 3C: detached upload thread — spawned after OK reply so that
  * CREATE INDEX returns immediately. Upload failure is non-fatal; the
@@ -1524,6 +1932,315 @@ objstore_upload_thread(void *arg)
                  a->db_oid, a->index_oid);
     free(a);
     return NULL;
+}
+
+/* ----------------------------------------------------------------
+ * Phase 3F: sharded BUILD path (cuvs.shard_count >= 2).
+ *
+ * Splits the corpus into `shard_count` contiguous build-order ranges, builds a
+ * standalone CAGRA artifact per shard placed round-robin across usable GPUs,
+ * and commits all-or-nothing: every shard `.cagra.tmp` + global `.tids.tmp` +
+ * `.shards.tmp` are fsynced, then renamed (shard cagras, then .tids, then the
+ * `.shards` manifest LAST as the commit marker). Self-contained: owns `mem`
+ * (munmap) and the client reply. Fail-closed: any failure rolls back all
+ * artifacts and resources and returns an error (CREATE INDEX/REINDEX aborts).
+ *
+ * Builds into LOCAL arrays and registers the entry only on full success — this
+ * avoids holding an IndexEntry* across ensure_vram, whose eviction can shift
+ * g_indexes[] and invalidate the pointer.
+ * ---------------------------------------------------------------- */
+static void
+build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
+              const float *vecs, const uint64_t *tids_in,
+              size_t total, void *mem)
+{
+    int64_t  n_vecs    = cmd->n_vecs;
+    uint32_t dim       = cmd->dim;
+    uint32_t metric    = cmd->metric;
+    size_t   tid_bytes = (size_t)n_vecs * sizeof(uint64_t);
+
+    /* Clamp shard count so every shard holds >= 2 vectors (CAGRA aborts on 1). */
+    int sc = (int)cmd->shard_count;
+    if (sc > CUVS_SHARDS_MAX)
+        sc = CUVS_SHARDS_MAX;
+    if ((int64_t)sc > n_vecs / 2)
+        sc = (int)(n_vecs / 2);
+    if (sc < 2)
+    {
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED,
+                        "shard_count too high for corpus (need >= 2 vectors per shard)");
+        return;
+    }
+    if (sc != (int)cmd->shard_count)
+        LOG_WARN("[build_sharded] clamped shard_count %u -> %d for %lld vecs\n",
+                 cmd->shard_count, sc, (long long)n_vecs);
+
+    const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
+    mkdir(save_dir, 0700);
+
+    /* Host copy of the global TID array (shared by all shards), taken before
+     * we drop the shm mapping. */
+    uint64_t        *new_tids    = malloc(tid_bytes);
+    ShardEntry      *shards      = calloc((size_t)sc, sizeof(ShardEntry));
+    CuvsShardRecord *recs        = calloc((size_t)sc, sizeof(CuvsShardRecord));
+    char           (*shard_tmp)[576]   = malloc((size_t)sc * sizeof(*shard_tmp));
+    char           (*shard_final)[512] = malloc((size_t)sc * sizeof(*shard_final));
+    if (!new_tids || !shards || !recs || !shard_tmp || !shard_final)
+    {
+        free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "sharded build alloc failed");
+        return;
+    }
+    memcpy(new_tids, tids_in, tid_bytes);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    /* --- Build + place each shard over a contiguous range. --- */
+    int64_t base   = n_vecs / sc;
+    int64_t rem    = n_vecs % sc;
+    int64_t off    = 0;
+    int     n_gpus = n_usable_gpus();
+    int     ok     = 1;
+    int     i      = 0;
+    for (i = 0; i < sc; i++)
+    {
+        int64_t shard_n = base + (i < rem ? 1 : 0);
+        size_t  needed  = estimate_vram_bytes(shard_n, (int)dim);
+        int     dev     = usable_gpu(i % n_gpus);   /* round-robin spread */
+
+        shard_cagra_path(shard_final[i], 512, save_dir,
+                         cmd->db_oid, cmd->index_oid, (uint32_t)i);
+        snprintf(shard_tmp[i], 576, "%s.tmp", shard_final[i]);
+
+        if (ensure_vram(needed, dev) != 0)
+        {
+            int alt = pick_gpu_for_index(needed);
+            if (alt < 0 || ensure_vram(needed, alt) != 0)
+            {
+                LOG_WARN("[build_sharded] shard %d (%lld vecs) won't fit on any GPU\n",
+                         i, (long long)shard_n);
+                ok = 0;
+                break;
+            }
+            dev = alt;
+        }
+
+        CuvsCagraIndex h = cuvs_cagra_build(vecs + (size_t)off * dim, shard_n,
+                                            (int)dim, metric, dev);
+        if (!h)
+        {
+            LOG_ERROR("[build_sharded] cuvs_cagra_build failed for shard %d\n", i);
+            ok = 0;
+            break;
+        }
+
+        shards[i].shard_id      = (uint32_t)i;
+        shards[i].handle        = h;
+        shards[i].tid_offset    = off;
+        shards[i].n_vecs        = shard_n;
+        shards[i].gpu_device_id = (uint32_t)dev;
+        shards[i].vram_bytes    = needed;
+        shards[i].valid         = 1;
+
+        if (cuvs_cagra_serialize(h, shard_tmp[i], dev) != 0
+            || fsync_path(shard_tmp[i]) != 0)
+        {
+            LOG_ERROR("[build_sharded] serialize/fsync failed for shard %d\n", i);
+            ok = 0;
+            break;
+        }
+
+        uint32_t acrc = 0;
+        if (crc32_file(shard_tmp[i], &acrc) != 0)
+        {
+            ok = 0;
+            break;
+        }
+        recs[i].shard_id       = (uint32_t)i;
+        recs[i].gpu_device_id  = (uint32_t)dev;
+        recs[i].tid_offset     = off;
+        recs[i].n_vecs         = shard_n;
+        recs[i].dim            = dim;
+        recs[i].metric         = metric;
+        recs[i].artifact_crc32 = acrc;
+        recs[i].reserved       = 0;
+
+        off += shard_n;
+    }
+
+    munmap(mem, total);   /* vecs no longer needed past the build loop */
+
+    if (!ok)
+    {
+        for (int j = 0; j <= i && j < sc; j++)
+        {
+            if (shards[j].valid && shards[j].handle)
+                cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
+            unlink(shard_tmp[j]);
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "sharded build failed");
+        return;
+    }
+
+    /* --- Persist global .tids.tmp + .shards.tmp (fsynced). --- */
+    char tids_final[512], tids_tmp[576], shards_finalp[512], shards_tmp[576];
+    tids_file_path(tids_final, sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
+    shards_manifest_path(shards_finalp, sizeof(shards_finalp), save_dir,
+                         cmd->db_oid, cmd->index_oid);
+    snprintf(tids_tmp,   sizeof(tids_tmp),   "%s.tmp", tids_final);
+    snprintf(shards_tmp, sizeof(shards_tmp), "%s.tmp", shards_finalp);
+
+    uint32_t base_crc = cuvs_crc32(new_tids, tid_bytes);
+
+    int persisted = 0;
+    if (write_tids_atomic(tids_tmp, n_vecs, dim, metric, new_tids) == 0)
+    {
+        FILE *mf = fopen(shards_tmp, "wb");
+        if (mf)
+        {
+            int wok = (cuvs_shards_write(mf, (uint32_t)sc, n_vecs, dim, metric,
+                                         base_crc, recs) == 0);
+            if (wok && fflush(mf) != 0) wok = 0;
+            if (wok && fsync(fileno(mf)) != 0) wok = 0;
+            if (fclose(mf) != 0) wok = 0;
+            if (wok) persisted = 1;
+            else unlink(shards_tmp);
+        }
+        if (!persisted)
+            unlink(tids_tmp);
+    }
+
+    if (!persisted)
+    {
+        for (int j = 0; j < sc; j++)
+        {
+            cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
+            unlink(shard_tmp[j]);
+        }
+        pthread_mutex_unlock(&g_index_mutex);
+        free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "sharded persist failed");
+        return;
+    }
+
+    /* --- Commit: rename shard cagras, then .tids, then .shards LAST. --- */
+    int commit_ok = 1, renamed = 0;
+    for (int j = 0; j < sc; j++)
+    {
+        if (rename(shard_tmp[j], shard_final[j]) != 0) { commit_ok = 0; break; }
+        renamed++;
+    }
+    if (commit_ok && rename(tids_tmp, tids_final) != 0) commit_ok = 0;
+    if (commit_ok && rename(shards_tmp, shards_finalp) != 0) commit_ok = 0;
+
+    if (!commit_ok)
+    {
+        for (int j = 0; j < renamed; j++) unlink(shard_final[j]);
+        unlink(tids_final); unlink(shards_finalp);
+        unlink(tids_tmp);   unlink(shards_tmp);
+        for (int j = renamed; j < sc; j++) unlink(shard_tmp[j]);
+        for (int j = 0; j < sc; j++)
+            cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
+        pthread_mutex_unlock(&g_index_mutex);
+        free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "sharded commit rename failed");
+        return;
+    }
+
+    int dir_fd = open(save_dir, O_RDONLY);
+    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+
+    /* Clear staleness marker and any legacy unsharded .cagra for this OID so a
+     * reload sees only the sharded artifacts. Also remove orphan shard files
+     * left by a prior build with a HIGHER shard count (e.g. REINDEX 4->2). */
+    {
+        char stale_path[512], legacy_cagra[512];
+        stale_file_path(stale_path, sizeof(stale_path), save_dir, cmd->db_oid, cmd->index_oid);
+        unlink(stale_path);
+        index_file_path(legacy_cagra, sizeof(legacy_cagra), save_dir,
+                        cmd->db_oid, cmd->index_oid);
+        unlink(legacy_cagra);
+        for (uint32_t s = (uint32_t)sc; s < CUVS_SHARDS_MAX; s++)
+        {
+            char sp[512];
+            shard_cagra_path(sp, sizeof(sp), save_dir, cmd->db_oid, cmd->index_oid, s);
+            if (unlink(sp) != 0)
+                break;   /* contiguous ids: first miss => no more orphans */
+        }
+    }
+
+    /* --- Register the entry (no more eviction past this point). --- */
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    if (e)
+    {
+        free_delta_cache(e);
+        if (e->shard_count >= 2) free_index_shards(e);
+        else if (e->handle) cuvs_cagra_free(e->handle, e->gpu_device_id);
+        free(e->tids);
+    }
+    else
+    {
+        if (g_n_indexes >= MAX_INDEXES)
+            evict_lru(usable_gpu(0));
+        if (g_n_indexes >= MAX_INDEXES)
+        {
+            /* Registry full but artifacts are durable on disk: a later search
+             * reloads from the .shards manifest. Free GPU resources now. */
+            for (int j = 0; j < sc; j++)
+                cuvs_cagra_free(shards[j].handle, shards[j].gpu_device_id);
+            pthread_mutex_unlock(&g_index_mutex);
+            free(new_tids); free(shards); free(recs); free(shard_tmp); free(shard_final);
+            LOG_WARN("[build_sharded] registry full; %u/%u persisted, will reload on demand\n",
+                     cmd->db_oid, cmd->index_oid);
+            CuvsReplyHeader hdr_ok = {0};
+            hdr_ok.status = CUVS_STATUS_OK;
+            send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+            return;
+        }
+        e = &g_indexes[g_n_indexes++];
+        memset(e, 0, sizeof(*e));
+    }
+
+    e->db_oid       = cmd->db_oid;
+    e->index_oid    = cmd->index_oid;
+    e->dim          = dim;
+    e->metric       = metric;
+    e->n_vecs       = n_vecs;
+    e->handle       = NULL;
+    e->tids         = new_tids;
+    e->vram_bytes   = 0;
+    e->last_search  = time(NULL);
+    e->valid        = 1;
+    e->stale        = 0;
+    e->stale_since  = 0;
+    e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
+    e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+    e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+    e->warmup_state  = WARMUP_HOT;
+    e->gpu_device_id = 0xFFFFFFFFu;   /* sharded: no single device, not LRU-evictable */
+    e->shard_count   = sc;
+    e->shards        = shards;        /* transfer ownership of the local array */
+    reset_entry_stats(e);
+
+    LOG_INFO("pg_cuvs_server: built sharded index %u/%u (%lld vecs, %d shards)\n",
+             cmd->db_oid, cmd->index_oid, (long long)n_vecs, sc);
+    for (int j = 0; j < sc; j++)
+        LOG_INFO("  shard %d -> GPU %u (%lld vecs, %zu MB)\n",
+                 j, e->shards[j].gpu_device_id, (long long)e->shards[j].n_vecs,
+                 e->shards[j].vram_bytes / (1024*1024));
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    /* new_tids ownership moved to e->tids; do not free it here. */
+    free(recs); free(shard_tmp); free(shard_final);
+
+    CuvsReplyHeader hdr_ok = {0};
+    hdr_ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
 }
 
 /* ----------------------------------------------------------------
@@ -1607,6 +2324,15 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     const float    *vecs    = (const float *)mem;
     const uint64_t *tids_in = (const uint64_t *)((const char *)mem + vec_bytes);
+
+    /* Phase 3F: sharded build path. Self-contained (owns munmap + reply).
+     * Default (shard_count 0/1) falls through to the unsharded path below,
+     * byte-identical to pre-3F behavior. */
+    if (cmd->shard_count >= 2)
+    {
+        build_sharded(client_fd, cmd, index_dir, vecs, tids_in, total, mem);
+        return;
+    }
 
     pthread_mutex_lock(&g_index_mutex);
 
@@ -1749,13 +2475,37 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         unlink(stale_path);
     }
 
+    /* Phase 3F: this unsharded build replaces any prior sharded artifacts for
+     * the same OID. Remove the .shards manifest FIRST (so a reload can never
+     * take the sharded path), then the contiguous shard .cagra files. */
+    {
+        char shards_path[512];
+        shards_manifest_path(shards_path, sizeof(shards_path), save_dir,
+                             cmd->db_oid, cmd->index_oid);
+        unlink(shards_path);
+        for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
+        {
+            char sp[512];
+            shard_cagra_path(sp, sizeof(sp), save_dir, cmd->db_oid, cmd->index_oid, s);
+            if (unlink(sp) != 0)
+                break;   /* contiguous ids: first miss => no more shards */
+        }
+    }
+
     LOG_DEBUG("[handle_build] disk commit OK\n");
 
     /* --- Swap into registry --- */
     IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
     if (existing) {
-        cuvs_cagra_free(existing->handle, existing->gpu_device_id);
+        /* Phase 3F: a prior sharded instance is replaced by this unsharded
+         * build — free all its shard handles, not a (NULL) single handle. */
+        if (existing->shard_count >= 2)
+            free_index_shards(existing);
+        else
+            cuvs_cagra_free(existing->handle, existing->gpu_device_id);
         free(existing->tids);
+        existing->shard_count = 0;
+        existing->shards      = NULL;
         existing->gpu_device_id = (uint32_t)target_gpu;
         existing->dim         = cmd->dim;
         existing->metric      = cmd->metric;
@@ -1802,6 +2552,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         e->delta_vecs_host = NULL; e->delta_n_cached = 0;
         e->warmup_state = WARMUP_HOT;
         e->gpu_device_id = (uint32_t)target_gpu;
+        e->shard_count = 0;     /* unsharded; slot may be reused post-eviction */
+        e->shards      = NULL;
         reset_entry_stats(e);
     }
 
@@ -1897,7 +2649,15 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->dim              = e->dim;
         s->metric           = e->metric;
         s->n_vecs           = e->n_vecs;
-        s->vram_bytes       = e->vram_bytes;
+        if (e->shard_count >= 2)
+        {
+            uint64_t vb = 0;
+            for (int s2 = 0; s2 < e->shard_count; s2++)
+                vb += e->shards[s2].vram_bytes;
+            s->vram_bytes = vb;     /* logical index VRAM = sum of shards */
+        }
+        else
+            s->vram_bytes = e->vram_bytes;
         s->resident         = 1;
         s->last_status      = e->last_status;
         s->last_requested_k = e->last_requested_k;
@@ -1922,8 +2682,8 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->warmup_duration_ms = 0;
         s->download_count     = 0;
         s->cache_miss_count   = 0;
-        s->gpu_device_id      = e->gpu_device_id;
-        s->_pad1              = 0;
+        s->gpu_device_id      = e->gpu_device_id;   /* 0xFFFFFFFF when sharded */
+        s->shard_count        = (uint32_t)e->shard_count;
     }
 
     /* Phase 3D: also emit cold (not-yet-resident) entries so operators can
@@ -1949,7 +2709,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->download_count     = (uint32_t)ce->download_count;
         s->cache_miss_count   = ce->cache_miss_count;
         s->gpu_device_id      = 0xFFFFFFFF;
-        s->_pad1              = 0;
+        s->shard_count        = 0;   /* cold entries are reported unsharded */
     }
 
     pthread_mutex_unlock(&g_index_mutex);
@@ -2024,8 +2784,23 @@ handle_cache_stats(int client_fd)
         cs->persist_failures = g_cache_persist_fail[dev];
         cs->resident_count   = 0;
         for (int j = 0; j < g_n_indexes; j++)
-            if (g_indexes[j].valid && g_indexes[j].gpu_device_id == (uint32_t)dev)
+        {
+            IndexEntry *ej = &g_indexes[j];
+            if (!ej->valid)
+                continue;
+            if (ej->shard_count >= 2)
+            {
+                /* Count each shard resident on this device. */
+                for (int s = 0; s < ej->shard_count; s++)
+                    if (ej->shards[s].valid &&
+                        ej->shards[s].gpu_device_id == (uint32_t)dev)
+                        cs->resident_count++;
+            }
+            else if (ej->gpu_device_id == (uint32_t)dev)
+            {
                 cs->resident_count++;
+            }
+        }
         cs->vram_used_bytes  = total_vram_used(dev);
         cs->vram_budget_bytes = g_max_vram_per_gpu[dev];
     }
@@ -2037,6 +2812,73 @@ handle_cache_stats(int client_fd)
     send_all(client_fd, &hdr, sizeof(hdr));
     if (n_rows > 0)
         send_all(client_fd, rows, (size_t)n_rows * sizeof(CuvsCacheStats));
+}
+
+/* ----------------------------------------------------------------
+ * Handle SHARD_STATS command (CUVS_OP_SHARD_STATS): per-shard rows for every
+ * resident sharded index in the requesting database (Phase 3F).
+ * ---------------------------------------------------------------- */
+static void
+handle_shard_stats(int client_fd, const CuvsCmdFrame *cmd)
+{
+    pthread_mutex_lock(&g_index_mutex);
+
+    /* Count shard rows first so we can size the reply buffer. */
+    int total = 0;
+    for (int i = 0; i < g_n_indexes; i++)
+    {
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid || e->shard_count < 2)
+            continue;
+        if (e->db_oid != cmd->db_oid)
+            continue;
+        if (cmd->index_oid != 0 && e->index_oid != cmd->index_oid)
+            continue;
+        total += e->shard_count;
+    }
+
+    CuvsShardStats *rows = (total > 0) ? malloc((size_t)total * sizeof(CuvsShardStats))
+                                       : NULL;
+    int n = 0;
+    if (rows)
+    {
+        for (int i = 0; i < g_n_indexes; i++)
+        {
+            IndexEntry *e = &g_indexes[i];
+            if (!e->valid || e->shard_count < 2)
+                continue;
+            if (e->db_oid != cmd->db_oid)
+                continue;
+            if (cmd->index_oid != 0 && e->index_oid != cmd->index_oid)
+                continue;
+            for (int s = 0; s < e->shard_count; s++)
+            {
+                ShardEntry *se = &e->shards[s];
+                CuvsShardStats *r = &rows[n++];
+                r->db_oid        = e->db_oid;
+                r->index_oid     = e->index_oid;
+                r->shard_id      = se->shard_id;
+                r->gpu_device_id = se->gpu_device_id;
+                r->n_vecs        = se->n_vecs;
+                r->tid_offset    = se->tid_offset;
+                r->vram_bytes    = se->vram_bytes;
+                r->search_count  = se->search_count;
+                r->error_count   = se->error_count;
+                r->resident      = (uint32_t)(se->valid ? 1 : 0);
+                r->last_status   = se->last_status;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status    = CUVS_STATUS_OK;
+    hdr.n_results = (uint32_t)n;
+    send_all(client_fd, &hdr, sizeof(hdr));
+    if (n > 0)
+        send_all(client_fd, rows, (size_t)n * sizeof(CuvsShardStats));
+    free(rows);
 }
 
 /* ----------------------------------------------------------------
@@ -2080,6 +2922,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_CACHE_STATS:
             handle_cache_stats(client_fd);
+            break;
+        case CUVS_OP_SHARD_STATS:
+            handle_shard_stats(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

@@ -24,6 +24,7 @@
 #define CUVS_OP_STATUS    3   /* per-index search stats; index_oid==0 = all in db */
 #define CUVS_OP_MARK_STALE 4  /* flag an index stale after a heap write */
 #define CUVS_OP_CACHE_STATS 5 /* daemon-global VRAM cache counters */
+#define CUVS_OP_SHARD_STATS 6 /* Phase 3F: per-shard stats for sharded indexes */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -60,6 +61,7 @@ typedef struct CuvsCmdFrame {
     char     shm_key[64];   /* shm_open name for payload data */
     uint32_t table_oid;     /* BUILD: heap relation OID (for manifest) */
     uint32_t relfilenode;   /* BUILD: heap relfilenode (heap compat identity, ADR-013) */
+    uint32_t shard_count;   /* BUILD: Phase 3F; 0/1 = unsharded, >=2 = split into N shards */
 } CuvsCmdFrame;
 
 /*
@@ -132,8 +134,9 @@ typedef struct CuvsIndexStats {
     uint32_t download_count;     /* GCS downloads for this index */
     uint64_t cache_miss_count;   /* searches that found this index not resident */
     /* Phase 3E: multi-GPU */
-    uint32_t gpu_device_id;      /* CUDA device this index lives on; 0xFFFFFFFF if cold */
-    uint32_t _pad1;              /* alignment to 8-byte boundary */
+    uint32_t gpu_device_id;      /* CUDA device this index lives on; 0xFFFFFFFF if cold or sharded */
+    /* Phase 3F: 0/1 = unsharded; >=2 = sharded logical index spanning N GPUs */
+    uint32_t shard_count;
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------
@@ -187,7 +190,8 @@ int cuvs_ipc_build(
     uint32_t       metric,
     const char    *index_dir,   /* daemon saves index here */
     uint32_t       table_oid,   /* heap relation OID */
-    uint32_t       relfilenode  /* heap relfilenode (heap compat identity) */
+    uint32_t       relfilenode, /* heap relfilenode (heap compat identity) */
+    uint32_t       shard_count  /* Phase 3F: 0/1 = unsharded, >=2 = N shards */
 );
 
 /*
@@ -227,6 +231,30 @@ typedef struct CuvsCacheStats {
 } CuvsCacheStats;
 
 int cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out,
+                         int max, int *n_out);
+
+/* ----------------------------------------------------------------
+ * SHARD_STATS reply payload (CUVS_OP_SHARD_STATS): one row per shard of every
+ * resident sharded index in the requesting database (Phase 3F). Reply is
+ * CuvsReplyHeader (status=OK, n_results=total shard rows) + N structs.
+ * cmd.index_oid == 0 => all sharded indexes in db; otherwise just that one.
+ * ---------------------------------------------------------------- */
+typedef struct CuvsShardStats {
+    uint32_t db_oid;
+    uint32_t index_oid;
+    uint32_t shard_id;
+    uint32_t gpu_device_id;     /* CUDA device this shard is resident on */
+    int64_t  n_vecs;            /* vectors in this shard */
+    int64_t  tid_offset;        /* global TID start offset of the shard range */
+    uint64_t vram_bytes;        /* estimated VRAM held by this shard */
+    uint64_t search_count;      /* OK searches dispatched to this shard */
+    uint64_t error_count;       /* failed shard searches */
+    uint32_t resident;          /* 1 if the shard handle is loaded */
+    uint32_t last_status;       /* CUVS_STATUS_* of this shard's last search */
+} CuvsShardStats;
+
+int cuvs_ipc_shard_stats(const char *socket_path, uint32_t db_oid,
+                         uint32_t index_oid, CuvsShardStats *out,
                          int max, int *n_out);
 
 /*

@@ -412,6 +412,62 @@ cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out,
 }
 
 /* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_shard_stats (Phase 3F)
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_shard_stats(const char *socket_path, uint32_t db_oid,
+                     uint32_t index_oid, CuvsShardStats *out,
+                     int max, int *n_out)
+{
+    int sock = -1;
+    int rc   = CUVS_STATUS_ERROR;
+
+    if (n_out) *n_out = 0;
+
+    sock = uds_connect(socket_path);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;   /* daemon down -> caller treats as empty */
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_SHARD_STATS,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+    };
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+    if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
+    {
+        int n      = (int)hdr.n_results;
+        int n_copy = (n > max) ? max : n;
+        for (int i = 0; i < n; i++)
+        {
+            CuvsShardStats row;
+            if (recv_all(sock, &row, sizeof(row)) < 0)
+            {
+                rc = CUVS_STATUS_ERROR;
+                if (n_out) *n_out = 0;
+                goto cleanup;
+            }
+            if (i < n_copy)
+                out[i] = row;       /* extra rows beyond max are drained */
+        }
+        if (n_out) *n_out = n_copy;
+    }
+
+cleanup:
+    if (sock >= 0)
+        close(sock);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Public API: cuvs_ipc_mark_stale
  * ---------------------------------------------------------------- */
 int
@@ -454,7 +510,8 @@ cuvs_ipc_build(
     uint32_t       metric,
     const char    *index_dir,
     uint32_t       table_oid,
-    uint32_t       relfilenode)
+    uint32_t       relfilenode,
+    uint32_t       shard_count)
 {
     char shm_key[64];
     int  shm_fd = -1;
@@ -490,6 +547,7 @@ cuvs_ipc_build(
         .n_vecs      = n_vecs,
         .table_oid   = table_oid,
         .relfilenode = relfilenode,
+        .shard_count = shard_count,
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 
