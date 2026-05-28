@@ -249,15 +249,29 @@ sent N bytes  received M bytes  ...
 
 ### Step 2 — GPU VM에서 빌드
 
-conda 환경 활성화 후 `make`를 실행하고 로그를 `/tmp/pg_cuvs_build.log`에 저장한다.
+> [!IMPORTANT]
+> **로컬 터미널에서 실행한다.** VM 안에서 치면 안 된다.
+> `make gpu-build`는 로컬 Makefile이 VM에 SSH로 접속해서 빌드를 대신 실행하는 래퍼다.
+
+**한 줄씩 직접:**
 
 ```bash
-# make gpu-build 가 실제로 하는 것 (Makefile:188):
+# 1. VM에 SSH 접속 (-tt 는 TTY 강제 할당 — make 출력이 실시간으로 보임)
 ssh -tt $GCP_VM "cd ~/pg_cuvs && \
     source ~/miniforge3/bin/activate $CONDA_ENV && \
     make 2>&1 | tee /tmp/pg_cuvs_build.log"
+```
 
-# 또는 래퍼:
+각 부분의 의미:
+- `ssh -tt $GCP_VM` — VM에 접속 (`$GCP_VM` = `ubuntu@<IP>`, `.env.gpu`에서 읽음)
+- `cd ~/pg_cuvs` — sync로 올린 소스 디렉토리로 이동
+- `source ~/miniforge3/bin/activate $CONDA_ENV` — cuVS 헤더/라이브러리가 있는 conda 환경 활성화
+- `make` — PGXS 빌드 (`pg_cuvs.so` + `cuvs_wrapper.o` nvcc 컴파일 포함)
+- `tee /tmp/pg_cuvs_build.log` — 출력을 화면에 보여주면서 로그에도 저장
+
+**make 래퍼 (동일한 동작):**
+
+```bash
 make gpu-build
 ```
 
@@ -265,10 +279,10 @@ make gpu-build
 ```
 gcc ... -shared -o pg_cuvs.so ...
 ```
-**-> 성공:** Step 3으로  
-**-> `cagra.hpp: No such file or directory`:** 원인 A — `$CONDA_ENV` 환경변수가 `.env.gpu`에 있는지 확인  
-**-> `-lcuvs: not found`:** 원인 A — conda env 내 libcuvs.so 존재 여부 확인  
-**-> 기타 컴파일 오류:** `ssh $GCP_VM "tail -50 /tmp/pg_cuvs_build.log"` 로 상세 확인
+**→ 성공:** Step 3으로  
+**→ `cagra.hpp: No such file or directory`:** 원인 A — conda 환경 미활성화  
+**→ `-lcuvs: not found`:** 원인 A — `$CONDA_ENV` 이름이 `.env.gpu`와 다름  
+**→ 기타 컴파일 오류:** `ssh $GCP_VM "tail -50 /tmp/pg_cuvs_build.log"` 로 상세 확인
 
 ---
 
