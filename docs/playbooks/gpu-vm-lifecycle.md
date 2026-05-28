@@ -90,7 +90,7 @@ ssh ubuntu@$NEWIP 'nvidia-smi | head -3'
 
 ```bash
 ssh ubuntu@$NEWIP \
-  'sudo journalctl -u pg-cuvs-server --no-pager -n 20 | grep -i "GPU\|CUDA"'
+  'sudo journalctl -u pg-cuvs-server --no-pager -n 20 | grep -iE "GPU|CUDA"'
 ```
 
 **기대 출력:**
@@ -355,7 +355,7 @@ ssh ubuntu@$NEWIP 'nvidia-smi --query-gpu=index,name --format=csv,noheader'
 
 ```bash
 ssh ubuntu@$NEWIP \
-  'sudo journalctl -u pg-cuvs-server --no-pager -n 30 | grep -iE "GPU [0-9]|listening"'
+  'sudo journalctl -u pg-cuvs-server --no-pager -n 30 | grep -iE "GPU|listening"'
 ```
 **기대 출력:** `GPU 0 (... A100 ...): 40465 MB total` + `listening on /tmp/.s.pg_cuvs`
 
