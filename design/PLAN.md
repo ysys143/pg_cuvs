@@ -627,7 +627,17 @@ Phase 3F 완료 기준:
 - fail-closed: corrupting one shard `.cagra` was caught on reload (`shard 0 artifact crc mismatch ... skip`); the logical index was not registered (0 `pg_stat_gpu_shards` rows) and the query fell back to CPU with correct results (`FAILCLOSED_CPU_CORRECT`).
 - delta/tombstone: INSERT into a sharded table was found via backend CPU delta merge (`DELTA_MATCH`); DELETE excluded the dead TID via snapshot-aware tombstone filtering (same global-TID, backend-side path as unsharded; tombstone result-shortening below k is the pre-existing universal behavior, not sharding-specific).
 - no regressions: PG regression suite (smoke/cpu_fallback/edge_cases) 3/3, full fault-injection integration suite incl. new Scenario 19, and e2e durability smoke all green. `shard_count<=1` default path is byte-identical to pre-3F behavior.
-- 3F-6 (2x A100 hardware acceptance: shard0->GPU0/shard1->GPU1, concurrent benchmark, multi-GPU reload/corruption) remains the Phase 3F completion gate and is pending.
+
+3F-6 verified evidence (2026-05-28, 2x A100 `a2-highgpu-2g` VM `pg-cuvs-dev-mgpu`, us-central1-f):
+- daemon detected GPU 0 and GPU 1 at startup (both A100-SXM4-40GB, warmed up).
+- single logical CAGRA index with `cuvs.shard_count=2` over 4000 vecs placed **shard 0 -> GPU 0, shard 1 -> GPU 1** (`pg_stat_gpu_shards` distinct_gpus=2, contiguous ranges `[0,2000)`/`[2000,4000)`) — true single-index multi-GPU sharding on real hardware.
+- top-k correctness on multi-GPU: sharded fanout == `enable_cuvs=off` CPU exact (`MGPU_TOPK_MATCH`); one query incremented `search_count` on both shard 0 (GPU 0) and shard 1 (GPU 1).
+- concurrent benchmark (`pgbench -j4 -c8 -T10` against the single sharded table): 925 transactions, 0 failed, ~92 TPS; per-shard `search_count` rose +925 on BOTH shards, proving every query dispatched to both GPUs under 8 concurrent clients (real concurrent multi-GPU dispatch, not sequential smoke).
+- multi-GPU restart reload from the `.shards` manifest restored shard 0 -> GPU 0 / shard 1 -> GPU 1 with no rebuild.
+- multi-GPU fail-closed: corrupting the GPU-1 shard artifact was caught on reload (`shard 1 artifact crc mismatch ... skip`), the logical index was not registered (0 `pg_stat_gpu_shards` rows), and the query fell back to CPU with correct results (`MGPU_FAILCLOSED_CPU_OK`).
+- VM stopped after acceptance (`TERMINATED`); machine type `a2-highgpu-2g` (2x A100 40GB, ~$7.35/hr on-demand), ~30 min runtime ≈ $3-4.
+
+Phase 3F status: **COMPLETE**. 3F-1..3F-5 (SW MVP) and 3F-6 (2x A100 hardware acceptance) passed. A single non-partitioned `CREATE INDEX ... USING cagra` with `cuvs.shard_count>=2` now builds, reloads, and serves a single logical index sharded across multiple physical GPUs with global top-k merge, fail-closed durability, and delta/tombstone correctness. The 3F-7 optimizations (parallel fanout, auto shard count, clustering assignment, daemon-side shard delta cache, etc.) move to Phase 3G.
 
 #### Phase 3G — True Sharding Optimization / Productization
 
