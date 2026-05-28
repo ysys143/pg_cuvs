@@ -14,6 +14,50 @@ GPU VM에서 pg_cuvs를 처음 빌드하거나 재빌드할 때 사용한다.
 
 ---
 
+## 0. 전제 조건 — `.env.gpu` 설정
+
+모든 `make gpu-*` 래퍼와 직접 명령은 아래 변수들을 사용한다.  
+`make`는 Makefile의 `-include .env.gpu` + `export`로 자동 로드하지만,  
+**직접 명령을 칠 때는 반드시 먼저 `source .env.gpu`를 실행해야 한다.**
+
+### `.env.gpu` 파일 만들기 (최초 1회)
+
+프로젝트 루트에 `.env.gpu` 파일을 생성한다 (`.gitignore` 대상 — 커밋하지 않는다):
+
+```bash
+# pg_cuvs 프로젝트 루트에서
+cat > .env.gpu << 'EOF'
+GCP_VM=ubuntu@<외부IP>          # VM 외부 IP (stop/start 시 바뀜 — gpu-vm-lifecycle.md 참조)
+GCP_INSTANCE=pg-cuvs-dev        # gcloud 인스턴스 이름
+GCP_ZONE=us-central1-b          # 인스턴스가 있는 zone
+GCP_PROJECT=gpu-experiment-wdl-2026
+CONDA_ENV=rapids                 # VM의 conda 환경 이름
+CUDA_ARCH=sm_80                  # A100 = sm_80, A10 = sm_86
+EOF
+```
+
+> `GCP_VM`의 IP는 VM을 stop/start 할 때마다 바뀐다(ephemeral IP).  
+> IP 확인: `gcloud compute instances describe $GCP_INSTANCE --zone $GCP_ZONE --project $GCP_PROJECT --format='get(networkInterfaces[0].accessConfigs[0].natIP)'`
+
+### 직접 명령 실행 전 환경 변수 로드
+
+```bash
+cd ~/Documents/GitHub/pg_cuvs
+source .env.gpu
+
+# 설정 확인
+echo "VM=$GCP_VM  INSTANCE=$GCP_INSTANCE  ZONE=$GCP_ZONE  CONDA=$CONDA_ENV"
+```
+
+**기대 출력:**
+```
+VM=ubuntu@35.224.x.x  INSTANCE=pg-cuvs-dev  ZONE=us-central1-b  CONDA=rapids
+```
+**→ 빈 값 있음:** `.env.gpu` 파일이 없거나 경로가 다름 — 위의 파일 생성 단계 수행  
+**→ `GCP_VM`의 IP가 틀림:** VM stop/start 후 IP 변경 → `gpu-vm-lifecycle.md` "IP 변경 후"로
+
+---
+
 ## 2. 진단
 
 ### VM 상태 확인
