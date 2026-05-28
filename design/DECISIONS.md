@@ -492,3 +492,26 @@ MVP:
 - 한 번에 full 3G(7개 항목 전부). 거부 — clustering은 recall 실험 성격이라 shippable latency win(parallel fanout)을 지연시킨다. correctness/latency를 먼저 닫고 delta-cache/snapshot은 그 구조 위에 붙인다.
 - parallel fanout을 mutex를 쥔 채 within-query 병렬로만 구현. 보류 — cross-query 직렬화라는 핵심 병목을 못 풀기 때문에 lock-free window(2단계)까지 간다.
 - lock-free window에 inflight refcount + cond-wait drain 추가(원안). 거부 — sharded non-evictable + REINDEX의 PG AccessExclusiveLock 직렬화로 free-during-search race가 지원 workload에서 발생하지 않으므로, 그 machinery는 불가능한 시나리오를 방어하는 over-engineering이고 cond-wait 중 entry 이동 같은 새 동시성 버그를 들여온다. safe-by-construction(스냅샷 + oid re-find) + 불변식 문서화로 대체한다.
+
+## ADR-023 — Phase 3G.1 sharded index DROP cleanup (daemon free + artifact unlink)
+
+**날짜**: 2026-05-28
+
+**문제**: 3G-5 acceptance에서 드러난 누수 — `DROP INDEX`가 데몬에 아무 신호도 보내지 않는다. sharded index는 non-evictable(`gpu_device_id=0xFFFFFFFF`, `find_lru_index`가 skip)이라 DROP 후에도 GPU VRAM에 resident로 남고, on-disk artifact(`.cagra/.tids/.shards/.sNNN.cagra/.delta/.tombstone`)도 `cuvs.index_dir`에 그대로 남아 데몬 재시작 시 dropped index를 zombie로 reload한다. 3G-5에서 dead index가 per-GPU budget을 채워 새 sharded build를 막았다. REINDEX는 이미 정리된다(handle_build existing-entry 경로).
+
+**결정**: DROP commit 시점에 데몬에 통지해 logical index를 VRAM에서 free하고 artifact를 unlink한다.
+- **DROP-notify only**. sharded eviction(VRAM pressure 회수)은 제외 — sharded를 evictable로 만들면 3G-1 lock-free search invariant이 깨져 ADR-022가 버린 inflight refcount/deferred-free를 재도입해야 하므로 3G.1b로 분리한다.
+- **commit 시점 발사**: backend `object_access_hook`이 cagra index의 `OAT_DROP`을 수집하고, `XACT_EVENT_COMMIT` 콜백에서만 `cuvs_ipc_drop`을 보낸다. drop 시점에 보내면 `BEGIN; DROP INDEX; ROLLBACK;`이 살아있는 index의 artifact를 파괴하므로 금지.
+- **DROP은 데몬이 죽어도 실패하지 않는다**: `cuvs_ipc_drop`은 best-effort, 실패 시 backend가 `WARNING`만 남기고 PG DROP은 commit된다. 데몬-down 시 잔존 artifact는 restart/playbook으로 정리.
+- 데몬 `handle_drop`은 AccessExclusiveLock 보장(해당 index에 in-flight search 없음) 하에 `g_index_mutex`로 즉시 free + registry compact + 모든 sidecar unlink. inflight guard 불필요.
+
+**결과**:
+- 새 IPC op `CUVS_OP_DROP_INDEX`(7) + `cuvs_ipc_drop`(mark_stale mirror). backend `object_access_hook` + `XACT_EVENT_COMMIT` 콜백. 데몬 `handle_drop`.
+- 검증: DROP 후 `pg_stat_gpu_shards` 0 rows + VRAM 회수 + restart 후 zombie 없음 + 데몬-down DROP도 성공(WARNING).
+- 알려진 한계: rolled-back SAVEPOINT 내 DROP은 여전히 기록되어 commit 시 통지될 수 있음(REINDEX로 복구; 데몬-down과 동일 등급). `DROP EXTENSION CASCADE`가 AM을 먼저 drop하면 `get_am_oid`가 Invalid → 해당 통지 누락(restart/playbook).
+
+**3G.1b로 분리(eviction policy lock)**: sharded eviction = logical-index whole-unit(`free_index_shards`), per-shard 아님. eviction은 save_index 스킵(derived artifact durable), dirty/pending 시 fail-closed. `evict_lru`/`find_lru_index`는 `inflight>0` sharded를 skip. 구현 시 ADR-022 invariant를 갱신(sharded evictable + inflight 재도입).
+
+**대안**:
+- whole-index eviction을 3G.1에 포함. 보류 — inflight machinery 재도입 비용/리스크가 크고, 관측된 누수(dropped index 누적)는 DROP-notify만으로 해결된다. live-sharded VRAM pressure는 budget/sizing으로 대응.
+- DROP을 drop-time(commit 아님)에 통지. 거부 — rollback 시 살아있는 index artifact 파괴.

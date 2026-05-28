@@ -694,6 +694,14 @@ Phase 3G 완료 기준:
 
 Phase 3G status: **COMPLETE**. 3G-1 parallel fanout(safe-by-construction lock-free window), 3G-2 auto VRAM shard count, 3G-3 `cuvs.shard_overfetch`까지 SW 검증(3G-4)과 2x A100 hardware acceptance(3G-5)를 통과했다. sharded `CREATE INDEX`가 GPU별로 동시에 fanout되어 sequential 대비 per-query latency를 낮추고, `cuvs.shard_count=0`이 VRAM 기준으로 shard 수를 자동 결정하며, recall/fail-closed/delta·tombstone 계약을 유지한다. follow-up(shard-aware GPU delta cache, object-snapshot manifest 확장, degraded partial recall)은 별도 phase로 분리한다.
 
+##### Phase 3G.1 — Sharded index DROP cleanup (hotfix)
+
+3G-5에서 드러난 누수 대응: `DROP INDEX`가 데몬에 통지하지 않아 dropped sharded index가 VRAM/disk에 잔존(non-evictable + restart 시 zombie reload). 결정/설계는 ADR-023.
+- **DROP-notify only**: backend `object_access_hook`이 cagra index DROP을 수집, `XACT_EVENT_COMMIT`에서 `cuvs_ipc_drop`(`CUVS_OP_DROP_INDEX`) 발사. 데몬 `handle_drop`이 free + registry compact + 모든 sidecar(`.cagra/.tids/.shards/.sNNN.cagra/.delta/.tombstone/.stale/.relfilenode`) unlink. DROP은 데몬-down에도 실패하지 않음(WARNING).
+- sharded는 여전히 non-evictable → 3G-1 lock-free invariant 유지(inflight 불필요).
+- **3G.1b(분리)**: whole-index eviction(VRAM pressure 회수). sharded를 evictable로 만들면 inflight refcount/deferred-free 재도입 필요(ADR-022/023). policy: logical-index whole-unit eviction, save_index 스킵(durable), dirty 시 fail-closed.
+- 검증(단일 GPU): DROP 후 `pg_stat_gpu_shards` 0 rows + VRAM 회수 + restart 후 zombie 없음 + 데몬-down DROP 성공. integration Scenario 21.
+
 #### Phase 3H — Operational Playbooks / Runbooks
 
 목표:

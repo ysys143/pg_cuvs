@@ -40,6 +40,9 @@
 #include "utils/snapmgr.h"
 #include "access/xact.h"
 #include "access/transam.h"
+#include "catalog/objectaccess.h"   /* object_access_hook, OAT_DROP (Phase 3G.1) */
+#include "catalog/pg_class.h"       /* RelationRelationId, RELKIND_INDEX, Form_pg_class */
+#include "utils/syscache.h"         /* SearchSysCache1(RELOID) */
 
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock */
@@ -104,6 +107,78 @@ static uint32_t cuvs_last_metric    = 0;
 static int32    cuvs_last_dim       = 0;
 
 void _PG_init(void);
+
+/* ----------------------------------------------------------------
+ * Phase 3G.1: notify the daemon to free + unlink a dropped index.
+ *
+ * PostgreSQL has no per-AM drop callback, so we chain object_access_hook to
+ * observe DROP of a cagra index. We must NOT notify at drop-time (a rolled-back
+ * DROP would destroy a still-live index's artifacts) — instead we record the
+ * dropped index OIDs and fire cuvs_ipc_drop only when the transaction COMMITS.
+ * Daemon-down at commit is non-fatal: WARNING, and cleanup falls to a restart.
+ * (Known edge: a DROP inside a rolled-back SAVEPOINT is still recorded; same
+ * REINDEX recovery as the daemon-down case.)
+ * ---------------------------------------------------------------- */
+static object_access_hook_type prev_object_access_hook = NULL;
+static List *cuvs_pending_drops = NIL;   /* index OIDs, allocated in TopMemoryContext */
+
+static void
+cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
+                   int subId, void *arg)
+{
+    if (prev_object_access_hook)
+        prev_object_access_hook(access, classId, objectId, subId, arg);
+
+    if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
+    {
+        HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum(objectId));
+        if (HeapTupleIsValid(tup))
+        {
+            Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+            if (cf->relkind == RELKIND_INDEX &&
+                cf->relam == get_am_oid("cagra", true) &&
+                OidIsValid(cf->relam))
+            {
+                MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+                cuvs_pending_drops = lappend_oid(cuvs_pending_drops, objectId);
+                MemoryContextSwitchTo(old);
+            }
+            ReleaseSysCache(tup);
+        }
+    }
+}
+
+static void
+cuvs_xact_callback(XactEvent event, void *arg)
+{
+    if (cuvs_pending_drops == NIL)
+        return;
+
+    if (event == XACT_EVENT_COMMIT)
+    {
+        ListCell *lc;
+        foreach(lc, cuvs_pending_drops)
+        {
+            Oid ioid = lfirst_oid(lc);
+            int rc = cuvs_ipc_drop(cuvs_socket_path,
+                                   (uint32_t) MyDatabaseId, (uint32_t) ioid);
+            if (rc != CUVS_STATUS_OK)
+                ereport(WARNING,
+                        (errmsg("pg_cuvs: daemon DROP-notify failed for index %u (status %d)",
+                                ioid, rc),
+                         errhint("GPU VRAM/artifacts for the dropped index may persist "
+                                 "until the daemon restarts.")));
+        }
+    }
+
+    /* Clear on COMMIT, ABORT, or PREPARE — whatever ends the top transaction. */
+    if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
+        event == XACT_EVENT_PREPARE)
+    {
+        list_free(cuvs_pending_drops);
+        cuvs_pending_drops = NIL;
+    }
+}
 
 void
 _PG_init(void)
@@ -292,6 +367,12 @@ _PG_init(void)
         2, 1, 8,
         PGC_SUSET,
         0, NULL, NULL, NULL);
+
+    /* Phase 3G.1: observe DROP INDEX of cagra indexes and notify the daemon to
+     * free + unlink artifacts at transaction commit. */
+    prev_object_access_hook = object_access_hook;
+    object_access_hook = cuvs_object_access;
+    RegisterXactCallback(cuvs_xact_callback, NULL);
 }
 
 /* Resolve cuvs.index_dir: if empty, default to DataDir/cuvs_indexes */

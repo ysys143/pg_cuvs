@@ -2932,6 +2932,77 @@ handle_mark_stale(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Handle DROP_INDEX command (CUVS_OP_DROP_INDEX, Phase 3G.1)
+ *
+ * Fired by the backend's object_access_hook when a DROP INDEX commits. Free the
+ * whole logical index from VRAM (sharded or not), remove it from the resident +
+ * cold registries, and unlink ALL of its on-disk artifacts so a daemon restart
+ * does not reload a dropped index as a zombie. DROP holds AccessExclusiveLock on
+ * the index, so no search can be in-flight on it — safe to free under the mutex
+ * (this is why sharded indexes need no inflight guard here; see ADR-022/023).
+ * Idempotent: a missing index or missing files are not errors.
+ * ---------------------------------------------------------------- */
+static void
+handle_drop(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint32_t db  = cmd->db_oid;
+    uint32_t idx = cmd->index_oid;
+    char     p[512];
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    /* Free the resident entry (if any) and compact the registry. */
+    IndexEntry *e = find_index(db, idx);
+    if (e)
+    {
+        free_delta_cache(e);
+        if (e->shard_count >= 2) free_index_shards(e);
+        else if (e->handle)      cuvs_cagra_free(e->handle, e->gpu_device_id);
+        free(e->tids);
+
+        int slot = (int)(e - g_indexes);
+        for (int i = slot; i < g_n_indexes - 1; i++)
+            g_indexes[i] = g_indexes[i + 1];
+        g_n_indexes--;
+    }
+
+    /* Drop a cold-registry entry too (Phase 3D), if present. */
+    for (int i = 0; i < g_n_cold_indexes; i++)
+        if (g_cold_indexes[i].valid &&
+            g_cold_indexes[i].db_oid == db && g_cold_indexes[i].index_oid == idx)
+        {
+            for (int j = i; j < g_n_cold_indexes - 1; j++)
+                g_cold_indexes[j] = g_cold_indexes[j + 1];
+            g_n_cold_indexes--;
+            break;
+        }
+
+    /* Unlink every per-index artifact so a restart won't reload a zombie. */
+    index_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .cagra */
+    tids_file_path(p, sizeof(p), g_index_dir, db, idx);        unlink(p); /* .tids */
+    shards_manifest_path(p, sizeof(p), g_index_dir, db, idx);  unlink(p); /* .shards */
+    delta_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .delta */
+    stale_file_path(p, sizeof(p), g_index_dir, db, idx);       unlink(p); /* .stale */
+    relfilenode_file_path(p, sizeof(p), g_index_dir, db, idx); unlink(p); /* .relfilenode */
+    snprintf(p, sizeof(p), "%s/%u_%u.tombstone", g_index_dir, db, idx); unlink(p);
+    /* Shard artifacts have contiguous ids; stop at the first missing one. */
+    for (uint32_t s = 0; s < CUVS_SHARDS_MAX; s++)
+    {
+        shard_cagra_path(p, sizeof(p), g_index_dir, db, idx, s);
+        if (unlink(p) != 0)
+            break;
+    }
+
+    LOG_INFO("pg_cuvs_server: dropped index %u/%u (freed + artifacts unlinked)\n", db, idx);
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status = CUVS_STATUS_OK;
+    send_all(client_fd, &hdr, sizeof(hdr));
+}
+
+/* ----------------------------------------------------------------
  * Handle CACHE_STATS command (CUVS_OP_CACHE_STATS): per-GPU counters.
  * Phase 3E: one CuvsCacheStats row per usable GPU device.
  * ---------------------------------------------------------------- */
@@ -3097,6 +3168,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SHARD_STATS:
             handle_shard_stats(client_fd, &cmd);
+            break;
+        case CUVS_OP_DROP_INDEX:
+            handle_drop(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

@@ -25,6 +25,7 @@
 #define CUVS_OP_MARK_STALE 4  /* flag an index stale after a heap write */
 #define CUVS_OP_CACHE_STATS 5 /* daemon-global VRAM cache counters */
 #define CUVS_OP_SHARD_STATS 6 /* Phase 3F: per-shard stats for sharded indexes */
+#define CUVS_OP_DROP_INDEX  7 /* Phase 3G.1: free a dropped index + unlink its artifacts */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -267,6 +268,18 @@ int cuvs_ipc_shard_stats(const char *socket_path, uint32_t db_oid,
  * itself must not fail because the GPU sidecar is unreachable).
  */
 int cuvs_ipc_mark_stale(
+    const char *socket_path,
+    uint32_t    db_oid,
+    uint32_t    index_oid
+);
+
+/*
+ * cuvs_ipc_drop — tell the daemon a DROP INDEX committed (CUVS_OP_DROP_INDEX).
+ * The daemon frees the index from VRAM and unlinks its on-disk artifacts.
+ * Best-effort, like cuvs_ipc_mark_stale: returns CUVS_STATUS_UNAVAILABLE if the
+ * daemon is down — the caller must NOT fail the (already committed) DROP.
+ */
+int cuvs_ipc_drop(
     const char *socket_path,
     uint32_t    db_oid,
     uint32_t    index_oid

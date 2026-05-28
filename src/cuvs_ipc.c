@@ -500,6 +500,34 @@ cuvs_ipc_mark_stale(const char *socket_path, uint32_t db_oid, uint32_t index_oid
 }
 
 /* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_drop (Phase 3G.1)
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_drop(const char *socket_path, uint32_t db_oid, uint32_t index_oid)
+{
+    int sock = uds_connect(socket_path);
+    int rc;
+    CuvsCmdFrame cmd;
+    CuvsReplyHeader hdr;
+
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;   /* daemon down — caller must not fail the DROP */
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op        = CUVS_OP_DROP_INDEX;
+    cmd.db_oid    = db_oid;
+    cmd.index_oid = index_oid;
+
+    rc = CUVS_STATUS_ERROR;
+    if (send_all(sock, &cmd, sizeof(cmd)) == 0
+        && recv_all(sock, &hdr, sizeof(hdr)) == 0)
+        rc = (int) hdr.status;
+
+    close(sock);
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build
  * ---------------------------------------------------------------- */
 int

@@ -1341,6 +1341,70 @@ echo "$OUT" | grep -q 'PAR_FAILCLOSED_OK' \
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS s20;" >/dev/null 2>&1 || true
 
+# --- Scenario 21: DROP INDEX frees daemon VRAM + unlinks artifacts (Phase 3G.1) -
+# DROP INDEX must notify the daemon (object_access_hook -> XACT commit ->
+# cuvs_ipc_drop) so the sharded index leaves the registry and ALL its on-disk
+# artifacts are unlinked — otherwise a restart reloads a dropped index as a
+# zombie. DROP must also succeed when the daemon is down (WARNING only).
+echo "[it] --- Scenario 21: DROP INDEX daemon cleanup (Phase 3G.1) ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+start_test_daemon
+
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS s21;
+CREATE TABLE s21 (id bigint, v vector(16));
+INSERT INTO s21 SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(16)
+    FROM generate_series(1,2000) g, generate_series(1,16) d GROUP BY g;
+SQL
+
+run_sql "SET cuvs.shard_count=2; CREATE INDEX s21_cagra ON s21 USING cagra (v vector_l2_ops);" >/dev/null 2>&1 \
+    && pass "sc21: sharded CREATE INDEX succeeded" \
+    || fail "sc21: sharded CREATE INDEX failed"
+
+# Pre-DROP: use TOTAL shard-row count (robust — a leaked row survives even though
+# a dropped OID's name resolves to NULL in the view). Fresh daemon => only s21.
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards;"
+NB=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+NMAN=$(ls "$TEST_IDX"/*.shards 2>/dev/null | wc -l | tr -d ' ')
+[ "$NB" = "2" ] && [ "$NMAN" -ge 1 ] \
+    && pass "sc21: sharded index resident (2 shard rows) + .shards on disk" \
+    || fail "sc21: pre-DROP state wrong (shard_rows=$NB manifest=$NMAN)"
+
+# DROP -> daemon frees the registry entry + unlinks every artifact.
+run_sql "DROP INDEX s21_cagra;" \
+    && pass "sc21: DROP INDEX succeeded" \
+    || fail "sc21: DROP INDEX failed"
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards;"
+NA=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+NMAN2=$(ls "$TEST_IDX"/*.shards 2>/dev/null | wc -l | tr -d ' ')
+NSC=$(ls "$TEST_IDX"/*.s0??.cagra 2>/dev/null | wc -l | tr -d ' ')
+NTIDS=$(ls "$TEST_IDX"/*.tids 2>/dev/null | wc -l | tr -d ' ')
+[ "$NA" = "0" ] && [ "$NMAN2" = "0" ] && [ "$NSC" = "0" ] && [ "$NTIDS" = "0" ] \
+    && pass "sc21: DROP freed daemon registry + unlinked artifacts" \
+    || fail "sc21: DROP cleanup incomplete (rows=$NA manifest=$NMAN2 shardcagra=$NSC tids=$NTIDS)"
+
+# Restart daemon -> dropped index must NOT reload (no zombie).
+stop_test_daemon
+start_test_daemon
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards;"
+NZ=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$NZ" = "0" ] \
+    && pass "sc21: no zombie after restart (0 shard rows)" \
+    || fail "sc21: dropped index reloaded as zombie ($NZ shard rows)"
+
+# DROP must not fail when the daemon is down (WARNING + commit, no ERROR).
+run_sql "SET cuvs.shard_count=2; CREATE INDEX s21b_cagra ON s21 USING cagra (v vector_l2_ops);" >/dev/null 2>&1 \
+    && pass "sc21: second sharded index built" \
+    || fail "sc21: second sharded build failed"
+stop_test_daemon
+run_sql "DROP INDEX s21b_cagra;" \
+    && pass "sc21: DROP succeeds with daemon down (WARNING, no error)" \
+    || fail "sc21: DROP failed when daemon down"
+
+psql -d "$DB" -c "DROP TABLE IF EXISTS s21;" >/dev/null 2>&1 || true
+
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then
     echo "[PASS] all integration scenarios passed"
