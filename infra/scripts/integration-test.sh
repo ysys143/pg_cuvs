@@ -1405,6 +1405,87 @@ run_sql "DROP INDEX s21b_cagra;" \
 
 psql -d "$DB" -c "DROP TABLE IF EXISTS s21;" >/dev/null 2>&1 || true
 
+# --- Scenario 22: shard-aware GPU delta cache (Phase 3G.3) ---------------------
+# A row INSERTed after build lands in .delta. A sharded query must find it via
+# the daemon's GPU delta cache (delta_search_mode=gpu, delta_merged) and the
+# result must match CPU exact — not rely on the backend CPU delta merge.
+echo "[it] --- Scenario 22: sharded GPU delta cache (Phase 3G.3) ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+start_test_daemon
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS s22;
+CREATE TABLE s22 (id bigint, v vector(16));
+INSERT INTO s22 SELECT g, ('[' || string_agg((random())::text, ',') || ']')::vector(16)
+    FROM generate_series(1,2000) g, generate_series(1,16) d GROUP BY g;
+SQL
+run_sql "SET cuvs.shard_count=2; CREATE INDEX s22_cagra ON s22 USING cagra (v vector_l2_ops);" >/dev/null 2>&1 \
+    && pass "sc22: sharded index built" || fail "sc22: build failed"
+
+# INSERT a row AFTER build -> .delta. Query with its own vector: NN #1 must be it.
+run_sql "INSERT INTO s22 VALUES (999999,
+    (SELECT ('[' || string_agg((random())::text, ',') || ']')::vector(16) FROM generate_series(1,16)));"
+run_sql "SET cuvs.k=10; SET cuvs.parallel_fanout=on; SET enable_cuvs=on; SET enable_seqscan=off;
+CREATE TEMP TABLE d22g AS SELECT id FROM s22 ORDER BY v <-> (SELECT v FROM s22 WHERE id=999999) LIMIT 10;
+SET enable_cuvs=off; SET enable_seqscan=on;
+CREATE TEMP TABLE d22c AS SELECT id FROM s22 ORDER BY v <-> (SELECT v FROM s22 WHERE id=999999) LIMIT 10;
+SELECT CASE WHEN (SELECT bool_or(id=999999) FROM d22g)
+            AND (SELECT array_agg(id ORDER BY id) FROM d22g)=(SELECT array_agg(id ORDER BY id) FROM d22c)
+            THEN 'DELTA_MATCH' ELSE 'DELTA_DIFF' END;"
+echo "$OUT" | grep -q 'DELTA_MATCH' \
+    && pass "sc22: sharded query finds delta-inserted row, matches CPU exact" \
+    || fail "sc22: sharded delta result wrong"
+run_sql "SELECT delta_search_mode FROM pg_stat_gpu_search WHERE index_name='s22_cagra';"
+echo "$OUT" | grep -q 'gpu' \
+    && pass "sc22: daemon GPU-merged the delta on the sharded index (mode=gpu)" \
+    || fail "sc22: delta not GPU-merged on sharded index ('$OUT')"
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS s22;" >/dev/null 2>&1 || true
+
+# --- Scenario 23: sharded whole-unit eviction under VRAM pressure (Phase 3G.4) -
+# A small per-GPU budget forces building B to evict the resident sharded A as a
+# WHOLE unit; querying A then reloads it from the .shards manifest. Proves
+# sharded indexes are evictable (no longer pinned) and reload correctly.
+echo "[it] --- Scenario 23: sharded whole-unit eviction (Phase 3G.4) ---"
+rm -rf "$TEST_IDX"; mkdir -p "$TEST_IDX"
+TEST_VRAM_MB=16 start_test_daemon    # 16 MB/GPU: one ~12.8MB sharded index fits, two don't
+psql -d "$DB" -v ON_ERROR_STOP=1 >/dev/null <<SQL
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+DROP TABLE IF EXISTS s23a; DROP TABLE IF EXISTS s23b;
+CREATE TABLE s23a (id bigint, v vector(64));
+INSERT INTO s23a SELECT g, (SELECT array_agg(random()::real) FROM generate_series(1,64))::vector(64)
+    FROM generate_series(1,40000) g;
+CREATE TABLE s23b (id bigint, v vector(64));
+INSERT INTO s23b SELECT g, (SELECT array_agg(random()::real) FROM generate_series(1,64))::vector(64)
+    FROM generate_series(1,40000) g;
+SQL
+run_sql "SET cuvs.shard_count=2; CREATE INDEX s23a_cagra ON s23a USING cagra (v vector_l2_ops);" >/dev/null 2>&1 \
+    && pass "sc23: sharded index A built" || fail "sc23: A build failed"
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards WHERE index_name='s23a_cagra' AND resident;"
+NA=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$NA" = "2" ] && pass "sc23: A resident (2 shards)" || fail "sc23: A not resident ($NA)"
+
+run_sql "SET cuvs.shard_count=2; CREATE INDEX s23b_cagra ON s23b USING cagra (v vector_l2_ops);" >/dev/null 2>&1 \
+    && pass "sc23: sharded index B built (under VRAM pressure)" || fail "sc23: B build failed"
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards WHERE index_name='s23a_cagra';"
+NAE=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$NAE" = "0" ] \
+    && pass "sc23: A evicted whole-unit when B needed its VRAM (0 shard rows)" \
+    || fail "sc23: sharded A was NOT evicted ($NAE shard rows) — still pinned?"
+
+# Query A -> daemon reloads it from the .shards manifest (re-resident).
+run_sql "SET cuvs.k=10; SET enable_cuvs=on; SET enable_seqscan=off;
+SELECT count(*) FROM (SELECT id FROM s23a ORDER BY v <-> (SELECT v FROM s23a WHERE id=100) LIMIT 10) q;" >/dev/null 2>&1
+run_sql "SELECT count(*) FROM pg_stat_gpu_shards WHERE index_name='s23a_cagra' AND resident;"
+NAR=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
+[ "$NAR" = "2" ] \
+    && pass "sc23: evicted sharded A reloads from manifest on query (2 shards resident)" \
+    || fail "sc23: A did not reload after eviction ($NAR)"
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS s23a; DROP TABLE IF EXISTS s23b;" >/dev/null 2>&1 || true
+
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then
     echo "[PASS] all integration scenarios passed"

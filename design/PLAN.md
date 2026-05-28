@@ -702,6 +702,15 @@ Phase 3G status: **COMPLETE**. 3G-1 parallel fanout(safe-by-construction lock-fr
 - **3G.1b(분리)**: whole-index eviction(VRAM pressure 회수). sharded를 evictable로 만들면 inflight refcount/deferred-free 재도입 필요(ADR-022/023). policy: logical-index whole-unit eviction, save_index 스킵(durable), dirty 시 fail-closed.
 - 검증(단일 GPU): DROP 후 `pg_stat_gpu_shards` 0 rows + VRAM 회수 + restart 후 zombie 없음 + 데몬-down DROP 성공. integration Scenario 21.
 
+##### Phase 3G.2/3G.3/3G.4 — snapshot · delta cache · eviction (ADR-024)
+
+3G follow-up 3종을 닫아 Phase 3G 전체 완료. 설계는 ADR-024.
+- **3G.2 sharded snapshot/warmup**: `.tids`+`.shards`+N `.sNNN.cagra`를 한 set으로 GCS snapshot(`CuvsManifest`에 `shard_count`+`.shards` sha; `cuvs_objstore_upload_sharded` + download 분기). warmup은 atomic `load_index_sharded`로 partial-hot 미노출. heap mismatch/corrupt shard fail-closed. `.delta/.tombstone/.stale` 제외. **GCS transfer round-trip은 bucket 부재로 자동 검증 불가**(3C/3D 동일) — compile + no-regression + download-후-load(Scenario 19)로 커버.
+- **3G.3 shard-aware delta cache**: 글로벌 `.delta`를 shard 0 GPU(`delta_gpu_of`)의 brute-force cache로 올려 fanout merge에 통합 → `delta_merged=1`(GPU 병합), 실패 시 backend CPU merge fallback. Scenario 22(mode=gpu + CPU exact 일치).
+- **3G.4 sharded eviction**: VRAM pressure에서 sharded index를 whole-unit evict(`free_index_shards`, save 스킵), `IndexEntry.inflight` refcount로 lock-free fanout 보호(eviction이 in-flight를 skip). Scenario 23(evict + manifest reload).
+
+Phase 3G status: **COMPLETE (core + follow-up)** — 3G-1..3G-5 core + 3G.1 DROP cleanup + 3G.2/3.3/3.4 follow-up까지 구현/검증(3G.2 GCS transfer만 bucket 의존으로 미자동화). degraded partial recall은 명시적 비채택(fail-closed-only 유지), vector-clustering shard assignment는 제외 항목.
+
 #### Phase 3H — Operational Playbooks / Runbooks
 
 목표:

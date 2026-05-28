@@ -515,3 +515,17 @@ MVP:
 **대안**:
 - whole-index eviction을 3G.1에 포함. 보류 — inflight machinery 재도입 비용/리스크가 크고, 관측된 누수(dropped index 누적)는 DROP-notify만으로 해결된다. live-sharded VRAM pressure는 budget/sizing으로 대응.
 - DROP을 drop-time(commit 아님)에 통지. 거부 — rollback 시 살아있는 index artifact 파괴.
+
+## ADR-024 — Phase 3G.2/3G.3/3G.4 sharded snapshot · delta cache · eviction
+
+**날짜**: 2026-05-28
+
+**결정(3G.2 — sharded object snapshot/warmup)**: 단일 immutable artifact set(`.tids` + `.shards` + N `.sNNN.cagra`)을 GCS에 snapshot한다. `CuvsManifest`에 `shard_count` + `.shards` 파일의 sha256/size를 추가하고, per-shard `.cagra` 무결성은 GCS manifest가 아니라 **load 시점에 `.shards` manifest의 `artifact_crc32`로 검증**(fail-closed)한다. `cuvs_objstore_upload_sharded`가 build 후 detached로 업로드, `cuvs_objstore_download`가 manifest의 `shard_count`로 분기해 전 shard를 받고 `.tids`/`.shards` SHA를 검증한 뒤 atomically 기록한다. warmup은 기존 atomic `load_index_sharded`(전 shard deserialize 성공 후에만 등록) 덕에 partial-hot이 query에 노출되지 않는다. corrupt/missing shard·heap relfilenode mismatch는 fail-closed. `.delta`/`.tombstone`/`.stale`은 snapshot에서 제외(파생/휘발 상태).
+
+**결정(3G.3 — shard-aware GPU delta cache)**: 글로벌 `.delta`(논리 index당 하나)를 데몬 GPU brute-force cache로 올려 sharded fanout merge에 합친다. delta cache는 단일 GPU에 있어야 하므로 sharded는 **shard 0의 GPU**(`delta_gpu_of`)에 둔다. base shard fanout은 lock-free로 두고, delta refresh+search+merge는 re-lock 구간에서 수행(작아서 직렬화 비용 무시 가능). delta cache가 살아있으면 `delta_merged=1`로 데몬이 GPU 병합, 없으면(VRAM 부족/corrupt/generation mismatch) `delta_merged=0`으로 **backend CPU delta merge fallback** 유지 → 항상 정합.
+
+**결정(3G.4 — sharded whole-unit eviction)**: sharded logical index를 VRAM pressure에서 **whole-unit으로 evict**한다(`free_index_shards`로 전 shard + `.tids` + delta cache 해제, `save_index` 스킵 — 모든 artifact가 이미 durable). `find_lru_index`/`evict_lru`가 sharded entry(어느 shard든 해당 device에 있으면)를 후보로 삼되, **`IndexEntry.inflight>0`이면 제외**한다. 3G-1 lock-free fanout은 snapshot 직전 `inflight++`, re-lock 직후 `inflight--`로 보호 — eviction이 in-flight search의 shard handle을 free하지 못한다(ADR-022가 예고한 inflight 재도입). dirty/pending 비durable 상태가 없으므로(전부 디스크) 추가 fail-closed 체크 불요.
+
+**결과**: `CuvsManifest` 확장 + `cuvs_objstore_upload_sharded`; `delta_gpu_of` + sharded fanout delta 병합; `IndexEntry.inflight` + sharded-aware LRU. 검증: 단일 GPU integration Scenario 22(sharded delta=gpu, CPU exact 일치)·23(sharded whole-unit eviction + manifest reload). 3G.2의 GCS transfer round-trip은 bucket이 없어 자동 검증 불가(3C/3D와 동일 상태) — compile + no-regression + download 후 load 경로(Scenario 19)로 커버.
+
+**대안**: delta cache를 shard별로 두기. 거부 — `.delta`는 글로벌 generation(전체 `.tids` CRC) 기준이라 논리 index당 하나가 자연스럽고, shard별 분할은 TID 매핑/정합 복잡도만 키운다. eviction에 deferred-free(cond-wait). 거부 — inflight>0 victim을 단순 skip하면 충분(eviction은 best-effort)하고 cond-wait의 entry-이동 위험을 피한다.

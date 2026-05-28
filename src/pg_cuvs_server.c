@@ -90,6 +90,8 @@ typedef struct IndexEntry {
      * (which matches on exact device id) never partially evicts the index. */
     int             shard_count;  /* 0/1 = unsharded; >=2 = sharded */
     ShardEntry     *shards;       /* [shard_count] when sharded; NULL otherwise */
+    int             inflight;     /* Phase 3G.4: in-flight lock-free sharded searches;
+                                   * >0 blocks whole-unit eviction of this entry */
     size_t          vram_bytes;   /* estimated VRAM usage */
     time_t          last_search;  /* for LRU eviction; also stats last_search_at */
     int             valid;
@@ -621,11 +623,23 @@ delta_cand_cmp(const void *a, const void *b)
     return 0;
 }
 
+/* GPU that hosts the delta brute-force cache for an entry. Unsharded indexes
+ * use their single device; a sharded index has no single device (gpu_device_id
+ * is the 0xFFFFFFFF sentinel), so the global delta cache lives on shard 0's GPU
+ * (Phase 3G.3). Caller holds g_index_mutex (reads e->shards). */
+static uint32_t
+delta_gpu_of(const IndexEntry *e)
+{
+    if (e->shard_count >= 2 && e->shards)
+        return e->shards[0].gpu_device_id;
+    return e->gpu_device_id;
+}
+
 /* Release an entry's GPU delta cache. Caller holds g_index_mutex. */
 static void
 free_delta_cache(IndexEntry *e)
 {
-    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, e->gpu_device_id); e->delta_idx = NULL; }
+    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, delta_gpu_of(e)); e->delta_idx = NULL; }
     if (e->delta_tids) { free(e->delta_tids); e->delta_tids = NULL; }
     if (e->delta_vecs_host) { free(e->delta_vecs_host); e->delta_vecs_host = NULL; }
     e->n_delta          = 0;
@@ -654,6 +668,7 @@ refresh_delta_cache(IndexEntry *e)
     float          *vecs = NULL;
     uint64_t       *tids = NULL;
     char           *rec  = NULL;
+    uint32_t        dg   = delta_gpu_of(e);   /* delta cache GPU (shard 0 if sharded) */
 
     delta_file_path(path, sizeof(path), g_index_dir, e->db_oid, e->index_oid);
     if (stat(path, &st) != 0)
@@ -670,7 +685,7 @@ refresh_delta_cache(IndexEntry *e)
      * failure below does not retry on every search. */
     uint32_t prev_gen    = e->delta_generation;
     int64_t  prev_cached = e->delta_n_cached;
-    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, e->gpu_device_id); e->delta_idx = NULL; }
+    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
     e->n_delta          = 0;
     e->delta_vram_bytes = 0;
     e->delta_mtime      = (int64_t) st.st_mtime;
@@ -709,9 +724,9 @@ refresh_delta_cache(IndexEntry *e)
 
     /* VRAM: best-effort, NON-evicting (never evict a base index for the delta). */
     needed = (size_t) hdr.n_rows * ((size_t) hdr.dim * sizeof(float) + sizeof(uint64_t));
-    if ((g_max_vram_per_gpu[e->gpu_device_id] > 0
-         && total_vram_used(e->gpu_device_id) + needed > g_max_vram_per_gpu[e->gpu_device_id])
-        || needed > gpu_free_vram_bytes(e->gpu_device_id))
+    if ((g_max_vram_per_gpu[dg] > 0
+         && total_vram_used(dg) + needed > g_max_vram_per_gpu[dg])
+        || needed > gpu_free_vram_bytes(dg))
     {
         fclose(f);
         goto fail_cleanup;              /* no spare VRAM -> backend CPU-merges */
@@ -751,9 +766,9 @@ refresh_delta_cache(IndexEntry *e)
                 }
                 if (ok)
                 {
-                    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, e->gpu_device_id); e->delta_idx = NULL; }
+                    if (e->delta_idx) { cuvs_bf_free(e->delta_idx, dg); e->delta_idx = NULL; }
                     e->delta_idx = cuvs_bf_build(e->delta_vecs_host, hdr.n_rows,
-                                                 (int) hdr.dim, hdr.metric, e->gpu_device_id);
+                                                 (int) hdr.dim, hdr.metric, dg);
                     if (e->delta_idx)
                     {
                         e->n_delta          = hdr.n_rows;
@@ -787,7 +802,7 @@ refresh_delta_cache(IndexEntry *e)
         }
         if (ok)
         {
-            e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric, e->gpu_device_id);
+            e->delta_idx = cuvs_bf_build(vecs, hdr.n_rows, (int) hdr.dim, hdr.metric, dg);
             if (e->delta_idx)
             {
                 e->delta_tids       = tids;  tids = NULL;
@@ -1269,18 +1284,40 @@ startup_load_indexes(void)
 /* ----------------------------------------------------------------
  * LRU eviction
  * ---------------------------------------------------------------- */
+/* Is `e` (partly) resident on device_id? Unsharded: its single GPU. Sharded: any
+ * of its shards (Phase 3G.4). */
+static int
+entry_on_device(const IndexEntry *e, int device_id)
+{
+    if (e->shard_count >= 2)
+    {
+        for (int s = 0; s < e->shard_count; s++)
+            if (e->shards[s].valid &&
+                e->shards[s].gpu_device_id == (uint32_t)device_id)
+                return 1;
+        return 0;
+    }
+    return e->gpu_device_id == (uint32_t)device_id;
+}
+
 static IndexEntry *
 find_lru_index(int device_id)
 {
     IndexEntry *lru = NULL;
     for (int i = 0; i < g_n_indexes; i++)
     {
-        if (!g_indexes[i].valid)
+        IndexEntry *e = &g_indexes[i];
+        if (!e->valid)
             continue;
-        if (g_indexes[i].gpu_device_id != (uint32_t)device_id)
+        /* Phase 3G.4: sharded indexes are evictable as a WHOLE UNIT, but never
+         * while a lock-free fanout is mid-flight on them (inflight>0) — that
+         * would free shard handles out from under the search. */
+        if (e->shard_count >= 2 && e->inflight > 0)
             continue;
-        if (!lru || g_indexes[i].last_search < lru->last_search)
-            lru = &g_indexes[i];
+        if (!entry_on_device(e, device_id))
+            continue;
+        if (!lru || e->last_search < lru->last_search)
+            lru = e;
     }
     return lru;
 }
@@ -1293,17 +1330,38 @@ evict_lru(int device_id)
     if (!e)
         return 0;
 
-    if (save_index(e) != 0) {
-        LOG_ERROR("evict_lru: save_index FAILED for %u/%u on GPU %u; aborting eviction "
-                  "(VRAM still holds index)\n",
-                e->db_oid, e->index_oid, e->gpu_device_id);
-        g_cache_persist_fail[device_id]++;
-        return 0;
+    size_t freed;
+    if (e->shard_count >= 2)
+    {
+        /* Sharded: every artifact (.tids/.shards/.sNNN.cagra/.delta/.tombstone)
+         * is already durable on disk, so eviction needs no save — just free the
+         * whole logical index (all shards across their GPUs) as a unit. A later
+         * query reloads it from the .shards manifest. `freed` counts only this
+         * device's shards (what ensure_vram is trying to reclaim here); freeing
+         * also releases the index's shards on other GPUs (bonus). */
+        freed = 0;
+        for (int s = 0; s < e->shard_count; s++)
+            if (e->shards[s].valid &&
+                e->shards[s].gpu_device_id == (uint32_t)device_id)
+                freed += e->shards[s].vram_bytes;
+        free_delta_cache(e);
+        free_index_shards(e);
+        free(e->tids);
     }
-    free_delta_cache(e);
-    cuvs_cagra_free(e->handle, e->gpu_device_id);
-    free(e->tids);
-    size_t freed = e->vram_bytes;
+    else
+    {
+        if (save_index(e) != 0) {
+            LOG_ERROR("evict_lru: save_index FAILED for %u/%u on GPU %u; aborting eviction "
+                      "(VRAM still holds index)\n",
+                    e->db_oid, e->index_oid, e->gpu_device_id);
+            g_cache_persist_fail[device_id]++;
+            return 0;
+        }
+        free_delta_cache(e);
+        cuvs_cagra_free(e->handle, e->gpu_device_id);
+        free(e->tids);
+        freed = e->vram_bytes;
+    }
 
     int idx = (int)(e - g_indexes);
     for (int i = idx; i < g_n_indexes - 1; i++)
@@ -1673,6 +1731,11 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
+        /* Phase 3G.4: mark this entry in-flight so a concurrent eviction (now
+         * that sharded indexes are evictable) cannot free our shard handles
+         * while we search them lock-free. Decremented after the re-lock below. */
+        e->inflight++;
+
         pthread_mutex_unlock(&g_index_mutex);   /* ---- lock-free GPU dispatch ---- */
 
         /* Parallel spawns one worker per non-empty shard; sequential runs them
@@ -1691,12 +1754,12 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             if (args[s].threaded)
                 pthread_join(threads[s], NULL);
 
-        munmap(query, vec_bytes);            /* workers are done reading the query */
-
-        /* Re-acquire the lock to update counters and merge. Re-find by OID since
-         * the struct may have moved (eviction compaction) while we were unlocked.
-         * The g_merge_metric global + qsort run here so the merge stays
-         * serialized; only the GPU dispatch above was concurrent. */
+        /* Keep `query` mapped past the join: the GPU delta search below
+         * (Phase 3G.3) still reads it; munmap after that. Re-acquire the lock to
+         * update counters, refresh+search the delta cache, and merge. Re-find by
+         * OID since the struct may have moved (eviction compaction) while we were
+         * unlocked. The merge (g_merge_metric + qsort) and the small delta BF
+         * search run here under the lock; only the base shard fanout was lock-free. */
         pthread_mutex_lock(&g_index_mutex);
         e = find_index(snap_db, snap_idx);
         if (!e)
@@ -1705,6 +1768,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
              * fail closed to CPU rather than risk touching freed memory. */
             for (int s = 0; s < sc; s++) free(args[s].out);
             free(args); free(threads);
+            munmap(query, vec_bytes);
             pthread_mutex_unlock(&g_index_mutex);
             CuvsReplyHeader hdr = {0};
             hdr.status = CUVS_STATUS_OOM_FALLBACK;
@@ -1713,6 +1777,11 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             send_all(client_fd, &hdr, sizeof(hdr));
             return;
         }
+
+        /* Lock-free window closed: we hold the mutex again and the entry can't be
+         * evicted under us now, so drop the in-flight refcount here (covers every
+         * exit path below). */
+        if (e->inflight > 0) e->inflight--;
 
         /* Record per-shard outcomes; any shard failure fails the whole query
          * closed (CPU fallback), never a partial ANN result. */
@@ -1736,6 +1805,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         {
             for (int s = 0; s < sc; s++) free(args[s].out);
             free(args); free(threads);
+            munmap(query, vec_bytes);
             CuvsReplyHeader hdr = {0};
             hdr.status = CUVS_STATUS_OOM_FALLBACK;
             strncpy(hdr.error, "sharded search failed on a shard; CPU fallback",
@@ -1746,12 +1816,14 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
-        CuvsResult *cand = malloc((size_t) (total_sk > 0 ? total_sk : 1) * sizeof(CuvsResult));
+        /* cand holds base candidates (<= total_sk) plus up to k delta candidates. */
+        CuvsResult *cand = malloc((size_t) (total_sk + (int64_t) k) * sizeof(CuvsResult));
         CuvsResult *out  = malloc((size_t) k * sizeof(CuvsResult));
         if (!cand || !out)
         {
             for (int s = 0; s < sc; s++) free(args[s].out);
             free(args); free(threads); free(cand); free(out);
+            munmap(query, vec_bytes);
             pthread_mutex_unlock(&g_index_mutex);
             send_error(client_fd, "malloc failed");
             return;
@@ -1778,6 +1850,37 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         }
         free(args); free(threads);
 
+        /* Phase 3G.3: shard-aware GPU delta cache. Refresh the resident delta
+         * brute-force index (on shard 0's GPU) from the current `.delta`; if
+         * present, search it and fold its candidates into the same global merge,
+         * so the daemon serves INSERT/UPDATE rows on the GPU path (delta_merged=1)
+         * instead of forcing the backend CPU merge. If the cache is unavailable
+         * (no VRAM / corrupt / generation mismatch), delta_merged stays 0 and the
+         * backend CPU-merges as before — fail-open to correctness. */
+        int delta_merged = 0;
+        refresh_delta_cache(e);
+        if (e->delta_idx && e->n_delta > 0)
+        {
+            int eff_dk = (int) ((int64_t) k < e->n_delta ? (int64_t) k : e->n_delta);
+            CuvsSearchResult *draw = malloc((size_t) eff_dk * sizeof(CuvsSearchResult));
+            if (draw && cuvs_bf_search(e->delta_idx, query, (int) cmd->dim, eff_dk,
+                                       draw, delta_gpu_of(e)) == 0)
+            {
+                for (int i = 0; i < eff_dk; i++)
+                {
+                    int64_t id = draw[i].item_id;
+                    if (id < 0 || id >= e->n_delta) continue;
+                    cand[n_total].tid      = e->delta_tids[id];
+                    cand[n_total].distance = draw[i].distance;
+                    n_total++;
+                }
+                delta_merged = 1;
+                e->delta_merged_count++;
+            }
+            free(draw);
+        }
+        munmap(query, vec_bytes);            /* base + delta searches done with query */
+
         g_merge_metric = e->metric;          /* read by delta_cand_cmp under the lock */
         qsort(cand, (size_t) n_total, sizeof(CuvsResult), delta_cand_cmp);
         int n_valid = (n_total < k) ? n_total : k;
@@ -1797,7 +1900,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         hdr.status       = CUVS_STATUS_OK;
         hdr.n_results    = (uint32_t) n_valid;
         hdr.latency_us   = latency_us;
-        hdr.delta_merged = 0;
+        hdr.delta_merged = (uint32_t) delta_merged;
         send_all(client_fd, &hdr, sizeof(hdr));
         if (n_valid > 0)
             send_all(client_fd, out, (size_t) n_valid * sizeof(CuvsResult));
@@ -2397,6 +2500,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     e->gpu_device_id = 0xFFFFFFFFu;   /* sharded: no single device, not LRU-evictable */
     e->shard_count   = sc;
     e->shards        = shards;        /* transfer ownership of the local array */
+    e->inflight      = 0;             /* Phase 3G.4 */
     reset_entry_stats(e);
 
     LOG_INFO("pg_cuvs_server: built sharded index %u/%u (%lld vecs, %d shards)\n",
