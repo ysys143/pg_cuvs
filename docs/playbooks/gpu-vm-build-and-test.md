@@ -370,6 +370,30 @@ make gpu-postinstall
 
 ---
 
+### Step 5.5 — pg_cuvs_server daemon 시작
+
+`gpu-postinstall`은 PostgreSQL만 재시작한다. **daemon은 별도로 시작해야 한다.**
+
+```bash
+sudo systemctl start pg-cuvs-server
+```
+
+daemon이 준비됐는지 확인:
+
+```bash
+sudo journalctl -u pg-cuvs-server -n 20 --no-pager
+```
+
+**기대 출력:**
+```
+pg_cuvs_server: listening on /tmp/.s.pg_cuvs
+```
+**→ 성공:** Step 6으로  
+**→ `failed` / `exit-code`:** `sudo systemctl status pg-cuvs-server` 로 상세 확인  
+**→ `no CUDA GPUs detected`:** nvidia driver mismatch → `gpu-vm-lifecycle.md` "Driver mismatch 후" Step으로
+
+---
+
 ### Step 6 — 회귀 테스트
 
 ```bash
