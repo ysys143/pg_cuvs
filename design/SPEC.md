@@ -270,23 +270,34 @@ base index.
 
 ---
 
-## 6. Phase 3B — DiskANN / Vamana Local NVMe (Q7)
+## 6. Phase 3B — NVMe Cold Tier / DiskANN Runtime (Q7)
 
-Phase 2 completion does not require DiskANN. DiskANN/Vamana belongs to Product
-Phase 3B, after Phase 3A pending-delta correctness.
+Phase 2 completion does not require a cold tier. It belongs to Product Phase 3B,
+after Phase 3A pending-delta correctness.
+
+> **Spike-corrected (2026-05-29, ADR-025; `design/PHASE_3B_SPIKE.md`).** cuVS Vamana
+> is **build + serialize only** — there is no `cuvsVamanaSearch`; search must be done
+> by Microsoft DiskANN. The cuVS-Vamana → MS-DiskANN **in-memory** round-trip is proven
+> (L2 recall 0.999) but RAM-bound (a *compatibility proof*, not the product path). The
+> cuVS 26.04 **disk/PQFlash** serialize is **NO-GO** (loads in `StaticDiskIndex` but
+> recall collapses ~0.40 vs 0.885 native; on-disk sector layout incompatible). The
+> requirements below are the *target* runtime, to be realized by MS DiskANN native disk
+> path or an own PQFlash-compatible serializer.
 
 **DISKANN-01**
 ```
 When `CREATE INDEX USING diskann` is executed,
 the pg_cuvs_server shall build a Vamana graph using cuVS GPU acceleration
-(`cuvsVamanaBuild`) and serialize it to DiskANN binary format in `cuvs.index_dir`.
+(`cuvs::neighbors::vamana::build`, device-resident) and serialize it in
+DiskANN-compatible format under `cuvs.index_dir`.
 ```
 
 **DISKANN-02**
 ```
 When a similarity query targets a diskann index,
-the pg_cuvs extension shall perform CPU-side Vamana search
-(`cuvsVamanaSearch`) on the NVMe-stored index without loading the full graph into VRAM.
+the pg_cuvs extension shall perform CPU-side search via Microsoft DiskANN
+(`StaticMemoryIndex` for the in-memory tier; a PQFlash/`StaticDiskIndex` path for the
+NVMe cold tier once a compatible serializer exists). cuVS provides no search path.
 ```
 
 **DISKANN-03**

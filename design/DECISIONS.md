@@ -219,7 +219,9 @@
 ## ADR-012 — Phase 3B DiskANN/Vamana: cuVS Vamana 네이티브 방식
 
 **날짜**: 2026-05-23
-**상태**: Phase 2에서 Phase 3B로 이관됨
+**상태**: ~~Phase 2에서 Phase 3B로 이관됨~~ → **ADR-025로 supersede됨** (3B-0a/0b spike,
+2026-05-29): cuVS Vamana in-memory는 compatibility proof only, disk/PQFlash는 NO-GO.
+아래 "두 경로 모두 지원 / CPU Vamana search" 결정은 더 이상 유효하지 않다.
 
 **문제**: 초기 PLAN.md는 "CAGRA로 GPU 빌드 후 HNSW 포맷으로 변환"을 DiskANN 방식으로 언급했다. 그러나 cuVS에 더 직접적인 경로가 있는지 확인이 필요했다. Product Phase 2가 single-node CAGRA core로 고정되면서 DiskANN/Vamana는 Phase 3B로 이관됐다.
 
@@ -529,3 +531,27 @@ MVP:
 **결과**: `CuvsManifest` 확장 + `cuvs_objstore_upload_sharded`; `delta_gpu_of` + sharded fanout delta 병합; `IndexEntry.inflight` + sharded-aware LRU. 검증: 단일 GPU integration Scenario 22(sharded delta=gpu, CPU exact 일치)·23(sharded whole-unit eviction + manifest reload). 3G.2의 GCS transfer round-trip은 bucket이 없어 자동 검증 불가(3C/3D와 동일 상태) — compile + no-regression + download 후 load 경로(Scenario 19)로 커버.
 
 **대안**: delta cache를 shard별로 두기. 거부 — `.delta`는 글로벌 generation(전체 `.tids` CRC) 기준이라 논리 index당 하나가 자연스럽고, shard별 분할은 TID 매핑/정합 복잡도만 키운다. eviction에 deferred-free(cond-wait). 거부 — inflight>0 victim을 단순 skip하면 충분(eviction은 best-effort)하고 cond-wait의 entry-이동 위험을 피한다.
+
+---
+
+## ADR-025 — Phase 3B 재정의: NVMe Cold Tier / DiskANN Runtime (cuVS Vamana disk NO-GO)
+
+**날짜**: 2026-05-29
+**상태**: 채택 (ADR-012를 supersede)
+
+**문제**: ADR-012는 "cuVS Vamana(GPU build) → DiskANN binary → CPU Vamana search"를 Phase 3B 대규모 경로로 결정했다. 그러나 이는 헤더/문서 기반 가정이었고 실제 round-trip 검증이 없었다(GCS의 "문서상 가능 ≠ 동작" 교훈).
+
+**조사 (3B-0a/0b spike, `design/PHASE_3B_SPIKE.md`)**:
+- cuVS Vamana는 **build + serialize 전용**. `cuvsVamanaSearch`는 C/C++ 모두에 없다(namespace free function은 build/serialize/deserialize_codebooks 뿐) → 검색은 MS DiskANN이 한다.
+- **in-memory**: cuVS Vamana → MS DiskANN `StaticMemoryIndex`(CPU) round-trip 성공(L2 recall 0.999). 단 RAM-bound = **compatibility proof일 뿐 제품 경로 아님**.
+- **disk/PQFlash**: codebook 주입(DiskANN PQ pivots + identity rotation matrix)으로 cuVS가 quantized disk index를 emit하지만, MS DiskANN `StaticDiskIndex`에서 **로드는 되나 recall이 붕괴**(~0.40 vs native 0.885). cuVS 26.04 on-disk sector layout(1001 sector)이 PQFlash(417 sector, 24 nodes/sector)와 비호환. **NO-GO.**
+
+**결정**: Phase 3B를 **"NVMe Cold Tier / DiskANN Runtime"**으로 재정의한다.
+- ADR-012의 "Vamana build→DiskANN binary→CPU Vamana search" 제품 경로는 폐기.
+- in-memory Vamana 경로는 *호환성 증명*으로만 유지(원하면 RAM-bound 중간 tier로 제공).
+- true NVMe cold tier는 (a) MS DiskANN **native disk build/search** 통합, 또는 (b) cuVS graph를 **PQFlash-compatible format으로 자체 재직렬화**로 재설계.
+- cold tier 채택 go/no-go는 crossover benchmark/cost(`design/BENCHMARK_CROSSOVER.md`) 결과에 게이트.
+
+**결과**: PLAN.md Phase 3B, SPEC.md §6(DISKANN-01/02) 갱신. SPEC의 `cuvsVamanaSearch` 오기(존재하지 않음) 교정. PQ ingestion contract: cuVS `deserialize_codebooks`는 `_pq_pivots.bin` + `_pq_pivots.bin_rotation_matrix.bin`(OPQ)을 요구 → 비-OPQ DiskANN pivots엔 identity rotation 주입 필요.
+
+**대안**: cuVS 후속 버전에서 disk serialize 재검증(보류, 버전 의존). pgvectorscale StreamingDiskANN 재사용(competitive baseline 비교 후 판단).

@@ -391,23 +391,35 @@ Phase 3A follow-ups:
 - random INSERT/UPDATE/DELETE/query interleaving property test를 더 넓은 데이터 크기와 transaction snapshot 조합으로 확장한다.
 - delta/tombstone cap과 REINDEX 권고를 운영자가 보기 쉬운 alert/playbook 항목으로 묶는다.
 
-#### Phase 3B — DiskANN / Vamana Local NVMe
+#### Phase 3B — NVMe Cold Tier / DiskANN Runtime
+
+> **재정의(2026-05-29, ADR-025).** 3B-0a/0b spike(`design/PHASE_3B_SPIKE.md`)를 반영해
+> "DiskANN/Vamana Local NVMe"에서 "NVMe Cold Tier / DiskANN Runtime"으로 재정의.
 
 목표:
-- VRAM resident CAGRA 한계를 넘는 index를 local NVMe 기반으로 검색한다.
-- CAGRA는 hot set, DiskANN/Vamana는 cold/large set으로 역할을 분리한다.
+- VRAM resident CAGRA 한계를 넘는 large/cold index를 NVMe 기반으로 검색한다.
+- CAGRA는 hot set, cold tier는 large/cold set으로 역할 분리.
 
-구현 항목:
-- `USING diskann` AM 추가.
-- cuVS Vamana GPU build + CPU/NVMe search.
-- local manifest/checksum으로 DiskANN artifact integrity를 검증한다.
-- 같은 column에 hot/cold index가 공존하는 tiered search를 구현한다.
-- tiered search는 metric identity와 top-k merge ordering을 보장한다.
+Spike 결과 (제약):
+- cuVS Vamana는 **build+serialize 전용**이며 자체 search가 없다(`cuvsVamanaSearch` 부재).
+- cuVS Vamana(GPU build) → MS DiskANN `StaticMemoryIndex`(CPU) **in-memory** round-trip은
+  검증됨(L2 recall 0.999). 단 RAM-bound이며 **compatibility proof일 뿐 제품 경로가 아니다.**
+- cuVS 26.04 **disk/PQFlash** serialize는 MS DiskANN에서 로드는 되나 recall 붕괴
+  (~0.40 vs native 0.885) → **NO-GO** (on-disk sector layout 비호환).
+
+구현 방향 (재설계):
+- true NVMe cold tier는 둘 중 하나로 재설계: (a) MS DiskANN **native disk build/search**
+  통합, 또는 (b) cuVS graph를 **PQFlash-compatible format으로 자체 재직렬화**.
+- (선택) cuVS Vamana + MS DiskANN **in-memory** index를 중간(RAM-bound) tier로 제공 가능.
+- cold artifact integrity는 local manifest/checksum으로 검증.
+- hot CAGRA + cold tier 공존 tiered search(metric identity + top-k merge ordering 보장).
 
 Phase 3B 완료 기준:
-- 100M+ vector 또는 VRAM을 초과하는 index를 단일 VRAM resident 전제 없이 검색한다.
-- local NVMe DiskANN/Vamana search가 CAGRA-only path와 동일 metric semantics를 유지한다.
-- hot CAGRA + cold DiskANN tiered search가 동작한다.
+- VRAM 초과 large index를 단일 VRAM resident 전제 없이 검색한다.
+- cold tier search가 CAGRA-only path와 동일 metric semantics를 유지한다.
+- hot CAGRA + cold tier tiered search가 동작한다.
+- (게이트) cold tier 채택 여부는 benchmark/cost(`design/BENCHMARK_CROSSOVER.md`) 결과로
+  go/no-go 결정.
 
 #### Phase 3C — Artifact Manifest / Object Storage-backed Immutable Index Snapshots
 
