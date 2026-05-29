@@ -14,9 +14,13 @@ from common import write_fbin
 
 
 def write_copy(path, a):
+    # numpy C-level per-row text write — feasible for large high-dim cells
+    # (1M x 1536 text is ~14 GB; python per-element join is too slow).
     with open(path, "w") as f:
-        for i, row in enumerate(a):
-            f.write(f"{i}\t[" + ",".join(f"{x:.6g}" for x in row) + "]\n")
+        for i in range(a.shape[0]):
+            f.write(f"{i}\t[")
+            a[i].tofile(f, sep=",", format="%.6g")
+            f.write("]\n")
 
 
 def main():
