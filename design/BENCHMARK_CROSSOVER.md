@@ -138,3 +138,46 @@ avg_latency_us, recall_at_k, cost_per_1M, hw, params_json`.
 - 합성 데이터 비현실성 → 실제 임베딩셋 병행(§5).
 - pg_cuvs는 WAL-logged mutable native index가 아님(write-path 한계) → 비교 시
   "정적/배치 인덱스" 전제임을 명기.
+
+## 11. Pilot 결과 (2026-05-29) — pgvector HNSW vs pg_cuvs CAGRA
+
+조건: `pg-cuvs-dev`(단일 A100-40GB), dim=384, k=10, **clustered** 합성(20 cluster),
+queries=1000, concurrency=8, iso-recall target=0.95(미달 시 sweep 최대값 채택),
+`maintenance_work_mem=2GB`(HNSW build). 원시 데이터: `bench/results/pilot.csv`.
+
+| N | engine | build(s) | p50(us) | avg(us) | QPS(c=8) | recall@10 | param |
+|---|---|---|---|---|---|---|---|
+| 1,000 | HNSW | 0.25 | **224** | 239 | **24,513** | 0.988 | ef=10 |
+| 1,000 | CAGRA | 0.14 | 871 | 886 | 1,864 | 1.000 | k=16 |
+| 10,000 | HNSW | 2.25 | **865** | 893 | **7,862** | 0.985 | ef=80 |
+| 10,000 | CAGRA | 0.33 | 1,146 | 1,163 | 1,270 | 0.995 | k=16 |
+| 100,000 | HNSW | 25.5 | 8,232 | 7,515 | 876 | 0.932 | ef=320 |
+| 100,000 | CAGRA | **2.77** | **1,228** | 1,244 | **1,206** | 0.982 | k=128 |
+
+### 발견
+
+- **Latency crossover ≈ N 10k–100k.** CAGRA는 N과 거의 무관하게 **~1.2ms floor**
+  (IPC + GPU dispatch); HNSW는 N에 따라 224→865→8,232 us로 증가. 작은 N에선 HNSW가
+  빠르고(**H3 확인**), 큰 N에선 CAGRA가 latency 6.7× 우위(**H1 확인, 100k**).
+- **Build은 전 구간 CAGRA 우위** (0.14/0.33/2.77 vs 0.25/2.25/25.5 s; 100k에서 9×) —
+  **H2 확인**.
+- **Recall은 전 구간 CAGRA ≥ HNSW.** 100k에서 HNSW는 ef=320으로도 0.932 포화(거리 집중),
+  CAGRA는 0.982.
+- **QPS는 결이 다름.** CAGRA QPS가 ~1,200–1,900으로 거의 평평 = **단일 GPU daemon의
+  throughput 천장**(동시 요청 직렬화). HNSW QPS는 N에 반비례(24,513→7,862→876). 그래서
+  100k에서 latency는 6.7× 이겨도 QPS는 1.4×뿐 → 동시성 throughput은 daemon이 병목.
+  multi-GPU sharding / `cuvs.parallel_fanout`(Phase 3F)이 이 천장을 올릴 지점.
+
+### "when to use" 1차 결론 (이 슬라이스 한정)
+
+```text
+N <~ 10k, 단일 쿼리 latency / 높은 QPS 중시  -> pgvector HNSW (CPU)
+N >~ 100k, 낮은 tail latency + 빠른 build    -> pg_cuvs CAGRA (GPU)
+높은 동시 QPS가 목표              -> 단일 GPU daemon 천장 주의(멀티-GPU 필요)
+```
+
+### 한계 / 다음
+
+단일 A100·clustered 합성·dim 384·k 10 한 슬라이스. iso-recall은 근사(행별
+`recall_at_k` 병기). 미측정: **H4 cost($/QPS)**, dim 1536, N 1M/10M, 실제 임베딩셋,
+경쟁자(pgvectorscale/VectorChord), multi-GPU sharded CAGRA의 QPS 천장. → full 단계.

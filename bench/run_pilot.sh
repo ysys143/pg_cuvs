@@ -39,7 +39,7 @@ fi
 
 BASE_OPTS="-c enable_seqscan=off"
 psql_base() { PGOPTIONS="$BASE_OPTS" psql -d "$DB" -v ON_ERROR_STOP=1 -At "$@"; }
-psql_tuned() { PGOPTIONS="$BASE_OPTS $(set_param "$1")" psql -d "$DB" -v ON_ERROR_STOP=1 -At; }
+psql_tuned() { local p="$1"; shift; PGOPTIONS="$BASE_OPTS $(set_param "$p")" psql -d "$DB" -v ON_ERROR_STOP=1 -At "$@"; }
 
 # 1. schema + load --------------------------------------------------------
 createdb "$DB" 2>/dev/null || true
@@ -56,8 +56,10 @@ echo "[pilot] loaded N=$(psql -d "$DB" -Atc 'SELECT count(*) FROM items')"
 # 2. build index (timed) --------------------------------------------------
 [ "$ENGINE" = "cagra" ] && export PGOPTIONS="-c cuvs.index_dir=$IDX_DIR"
 t0=$(date +%s.%N)
-psql -d "$DB" -v ON_ERROR_STOP=1 -c \
-  "CREATE INDEX bench_idx ON items USING $AM (v $OPCLASS);"
+psql -d "$DB" -v ON_ERROR_STOP=1 <<SQL
+SET maintenance_work_mem='2GB';
+CREATE INDEX bench_idx ON items USING $AM (v $OPCLASS);
+SQL
 t1=$(date +%s.%N); BUILD_S=$(echo "$t1 - $t0" | bc)
 unset PGOPTIONS
 echo "[pilot] build_s=$BUILD_S"
@@ -86,9 +88,10 @@ echo "[pilot] chosen param=$CHOSEN recall=$CHOSEN_RECALL"
 
 # 4. latency sample (M single queries, client-side \timing) ---------------
 LSQL=$(mktemp); LOUT=$(mktemp)
+QN=$(psql -d "$DB" -Atc 'SELECT count(*) FROM queries')
 { echo "\\timing on";
   for i in $(seq 1 "$M"); do
-    qid=$(( RANDOM % $(psql -d "$DB" -Atc 'SELECT count(*) FROM queries') ));
+    qid=$(( RANDOM % QN ));
     echo "SELECT i.id FROM items i ORDER BY i.v <-> (SELECT v FROM queries WHERE id=$qid) LIMIT $K;";
   done; } > "$LSQL"
 PGOPTIONS="$BASE_OPTS $(set_param "$CHOSEN")" psql -d "$DB" -q -f "$LSQL" 2>&1 \
