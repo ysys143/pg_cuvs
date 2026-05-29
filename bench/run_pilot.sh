@@ -42,8 +42,10 @@ psql_base() { PGOPTIONS="$BASE_OPTS" psql -d "$DB" -v ON_ERROR_STOP=1 -At "$@"; 
 psql_tuned() { local p="$1"; shift; PGOPTIONS="$BASE_OPTS $(set_param "$p")" psql -d "$DB" -v ON_ERROR_STOP=1 -At "$@"; }
 
 # 1. schema + load --------------------------------------------------------
-createdb "$DB" 2>/dev/null || true
-psql -d "$DB" -v ON_ERROR_STOP=1 <<SQL
+# SKIP_LOAD=1: skip if table is pre-loaded externally (e.g. stream-loaded from fbin)
+if [ "${SKIP_LOAD:-0}" != "1" ]; then
+  createdb "$DB" 2>/dev/null || true
+  psql -d "$DB" -v ON_ERROR_STOP=1 <<SQL
 CREATE EXTENSION IF NOT EXISTS $EXT CASCADE;
 DROP TABLE IF EXISTS items, queries;
 CREATE TABLE items(id int PRIMARY KEY, v vector($DIM));
@@ -51,6 +53,7 @@ CREATE TABLE queries(id int PRIMARY KEY, v vector($DIM));
 \copy items(id,v)   FROM '$DATA/base.copy'
 \copy queries(id,v) FROM '$DATA/query.copy'
 SQL
+fi
 echo "[pilot] loaded N=$(psql -d "$DB" -Atc 'SELECT count(*) FROM items')"
 
 # 2. build index (timed) --------------------------------------------------
@@ -58,6 +61,7 @@ echo "[pilot] loaded N=$(psql -d "$DB" -Atc 'SELECT count(*) FROM items')"
 t0=$(date +%s.%N)
 psql -d "$DB" -v ON_ERROR_STOP=1 <<SQL
 SET maintenance_work_mem='2GB';
+DROP INDEX IF EXISTS bench_idx;
 CREATE INDEX bench_idx ON items USING $AM (v $OPCLASS);
 SQL
 t1=$(date +%s.%N); BUILD_S=$(echo "$t1 - $t0" | bc)
