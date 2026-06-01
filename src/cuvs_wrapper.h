@@ -132,6 +132,28 @@ int           cuvs_hnsw_search(CuvsHnswIndex hidx, const float *query,
 void          cuvs_hnsw_free(CuvsHnswIndex hidx);
 
 /*
+ * cuvs_cagra_extract_adjacency — Phase 3J: direct CAGRA→pgvector path.
+ *
+ * Copies the CAGRA graph adjacency list and corpus vectors from GPU VRAM to
+ * caller-allocated CPU buffers (freed by the caller with free()).
+ *
+ * adj_out       : [n_vecs * graph_degree] uint32_t row-major adjacency matrix
+ * vecs_out      : [n_vecs * dim] float32 corpus vectors
+ * n_vecs_out    : number of vectors
+ * graph_degree_out : adjacency list width (CAGRA build parameter)
+ *
+ * Returns 0 on success, -1 on failure (logs to stderr).
+ */
+int cuvs_cagra_extract_adjacency(
+    CuvsCagraIndex  handle,
+    uint32_t      **adj_out,
+    float         **vecs_out,
+    size_t         *n_vecs_out,
+    int            *graph_degree_out,
+    int             device_id
+);
+
+/*
  * cuvs_cagra_serialize / cuvs_cagra_deserialize
  * Persist/restore a CAGRA index to/from a file path using cuVS native format.
  */

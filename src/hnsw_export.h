@@ -20,3 +20,16 @@
  * the sidecar data — do not call this on a live production index.
  */
 Datum pg_cuvs_import_hnsw(PG_FUNCTION_ARGS);
+
+/*
+ * pg_cuvs_import_cagra(cagra_oid regclass, hnsw_oid regclass)
+ *
+ * Phase 3J: direct CAGRA→pgvector HNSW conversion without hnswlib intermediate.
+ * Retrieves the CAGRA adjacency list from the daemon via IPC and writes a flat
+ * pgvector HNSW (all nodes at level 0) directly.  Does NOT require
+ * cuvs.cpu_hnsw_fallback=on; no .hnsw sidecar file is needed.
+ *
+ * Trade-off: flat HNSW may require higher ef_search for equivalent recall vs
+ * pg_cuvs_import_hnsw() which produces a multi-level graph.
+ */
+Datum pg_cuvs_import_cagra(PG_FUNCTION_ARGS);

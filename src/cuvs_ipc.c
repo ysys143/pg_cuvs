@@ -616,3 +616,119 @@ cleanup:
     shm_unlink(shm_key);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * Phase 3J: export CAGRA adjacency list + corpus vectors from daemon.
+ *
+ * Sends CUVS_OP_EXPORT_ADJACENCY; daemon packs adj+vecs+tids into a
+ * shared memory segment and returns its key via the reply header.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_export_adjacency(
+    const char  *socket_path,
+    uint32_t     db_oid,
+    uint32_t     index_oid,
+    uint32_t   **adj_out,
+    float      **vecs_out,
+    uint64_t   **tids_out,
+    size_t      *n_vecs_out,
+    int         *graph_degree_out,
+    int         *dim_out,
+    uint32_t    *metric_out)
+{
+    int  sock = -1;
+    int  shm_fd = -1;
+    int  rc = CUVS_STATUS_ERROR;
+    void *mem = MAP_FAILED;
+
+    /* Long timeout: GPU→CPU copy for large indexes takes 10-30s. */
+    sock = uds_connect_ex(socket_path, 120);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_EXPORT_ADJACENCY,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+    };
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    if (hdr.status != CUVS_STATUS_OK) {
+        rc = (int)hdr.status;
+        goto cleanup;
+    }
+
+    /* Daemon packs: n_vecs=n_results, graph_degree=latency_us, dim=delta_merged,
+     * shm_key in the error[] field (null-terminated, ≤64 chars). */
+    size_t  n_vecs       = (size_t)hdr.n_results;
+    int     graph_degree = (int)hdr.latency_us;
+    int     dim          = (int)hdr.delta_merged;
+    char    reply_shm_key[128];
+    strncpy(reply_shm_key, hdr.error, sizeof(reply_shm_key) - 1);
+    reply_shm_key[sizeof(reply_shm_key) - 1] = '\0';
+
+    if (n_vecs == 0 || graph_degree <= 0 || dim <= 0 || reply_shm_key[0] == '\0') {
+        LOG_ERROR("[export_adjacency] bad reply n=%zu gd=%d dim=%d key='%s'\n",
+                  n_vecs, graph_degree, dim, reply_shm_key);
+        goto cleanup;
+    }
+
+    /* shm layout: [uint32_t n_vecs][uint32_t graph_degree][uint32_t dim][uint32_t pad]
+     *             [adj: n*gd*4][vecs: n*dim*4][tids: n*8] */
+    size_t adj_bytes  = n_vecs * (size_t)graph_degree * sizeof(uint32_t);
+    size_t vecs_bytes = n_vecs * (size_t)dim * sizeof(float);
+    size_t tids_bytes = n_vecs * sizeof(uint64_t);
+    size_t hdr_bytes  = 4 * sizeof(uint32_t);  /* n_vecs, gd, dim, pad */
+    size_t total      = hdr_bytes + adj_bytes + vecs_bytes + tids_bytes;
+
+    shm_fd = shm_open(reply_shm_key, O_RDONLY, 0666);
+    if (shm_fd < 0) {
+        LOG_ERROR("[export_adjacency] shm_open(%s) failed errno=%d\n",
+                  reply_shm_key, errno);
+        goto cleanup;
+    }
+
+    mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
+    if (mem == MAP_FAILED) {
+        LOG_ERROR("[export_adjacency] mmap failed errno=%d\n", errno);
+        goto cleanup;
+    }
+
+    /* Read metric from header slot [3] before the data section. */
+    uint32_t src_metric = ((const uint32_t *)mem)[3];
+
+    /* Copy out to caller-owned buffers. */
+    const char *p = (const char *)mem + hdr_bytes;
+    uint32_t *adj  = (uint32_t *)malloc(adj_bytes);
+    float    *vecs = (float    *)malloc(vecs_bytes);
+    uint64_t *tids = (uint64_t *)malloc(tids_bytes);
+    if (!adj || !vecs || !tids) {
+        free(adj); free(vecs); free(tids);
+        LOG_ERROR("[export_adjacency] malloc failed\n");
+        goto cleanup;
+    }
+    memcpy(adj,  p,                            adj_bytes);
+    memcpy(vecs, p + adj_bytes,                vecs_bytes);
+    memcpy(tids, p + adj_bytes + vecs_bytes,   tids_bytes);
+
+    *adj_out          = adj;
+    *vecs_out         = vecs;
+    *tids_out         = tids;
+    *n_vecs_out       = n_vecs;
+    *graph_degree_out = graph_degree;
+    *dim_out          = dim;
+    if (metric_out) *metric_out = src_metric;
+    rc = CUVS_STATUS_OK;
+
+cleanup:
+    if (mem != MAP_FAILED)  munmap(mem, total);
+    if (shm_fd >= 0)        close(shm_fd);
+    if (reply_shm_key[0])   shm_unlink(reply_shm_key);
+    if (sock >= 0)          close(sock);
+    return rc;
+}

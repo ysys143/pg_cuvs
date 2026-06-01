@@ -235,3 +235,25 @@ COMMENT ON FUNCTION pg_cuvs_import_hnsw(regclass, regclass) IS
   'faster import (~2x); index is lost on crash and must be rebuilt. '
   'Example: SELECT pg_cuvs_import_hnsw(''my_cagra_idx''::regclass, '
   '''my_hnsw_idx''::regclass);';
+
+-- ----------------------------------------------------------------
+-- pg_cuvs_import_cagra(cagra_oid regclass, hnsw_oid regclass)
+-- Phase 3J: direct CAGRA → pgvector HNSW without hnswlib intermediate.
+-- Retrieves CAGRA adjacency + vectors from daemon via IPC; writes flat
+-- pgvector HNSW (all nodes at level 0).  Does NOT require
+-- cuvs.cpu_hnsw_fallback=on.  Supports UNLOGGED target for faster import.
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_import_cagra(cagra_oid regclass, hnsw_oid regclass)
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_import_cagra'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_import_cagra(regclass, regclass) IS
+  'Phase 3J: Direct CAGRA→pgvector HNSW import without hnswlib intermediate. '
+  'Fetches CAGRA adjacency + corpus vectors from daemon via IPC (no .hnsw file). '
+  'Produces a flat HNSW (all nodes at level 0); may need higher ef_search for '
+  'equivalent recall vs pg_cuvs_import_hnsw() which uses multi-level hierarchy. '
+  'Does NOT require cuvs.cpu_hnsw_fallback=on. '
+  'OFFLINE: acquires AccessExclusiveLock; UNLOGGED target skips WAL (~2x faster). '
+  'Example: SELECT pg_cuvs_import_cagra(''my_cagra_idx''::regclass, '
+  '''my_hnsw_idx''::regclass);';

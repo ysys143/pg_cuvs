@@ -733,6 +733,61 @@ cuvs_hnsw_free(CuvsHnswIndex hidx)
 }
 
 /* ----------------------------------------------------------------
+ * Phase 3J: extract CAGRA adjacency list + corpus vectors from VRAM to CPU.
+ * Used by handle_export_adjacency in the daemon to serve pg_cuvs_import_cagra.
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_cagra_extract_adjacency(
+    CuvsCagraIndex  handle,
+    uint32_t      **adj_out,
+    float         **vecs_out,
+    size_t         *n_vecs_out,
+    int            *graph_degree_out,
+    int             device_id)
+{
+    if (!handle || !adj_out || !vecs_out || !n_vecs_out || !graph_degree_out)
+        return -1;
+    CuvsCagraIndexImpl *cimpl = static_cast<CuvsCagraIndexImpl *>(handle);
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+
+        auto graph_view = cimpl->idx.graph();
+        size_t N   = (size_t)graph_view.extent(0);
+        size_t D   = (size_t)graph_view.extent(1);
+        size_t dim = (size_t)cimpl->dataset.extent(1);
+
+        uint32_t *adj  = (uint32_t *)malloc(N * D   * sizeof(uint32_t));
+        float    *vecs = (float    *)malloc(N * dim  * sizeof(float));
+        if (!adj || !vecs) {
+            free(adj); free(vecs);
+            fprintf(stderr, "[cuvs_cagra_extract_adjacency] malloc failed N=%zu D=%zu dim=%zu\n",
+                    N, D, dim);
+            return -1;
+        }
+
+        auto stream = raft::resource::get_cuda_stream(res);
+        raft::copy(adj,  graph_view.data_handle(),      N * D,   stream);
+        raft::copy(vecs, cimpl->dataset.data_handle(),  N * dim, stream);
+        res.sync_stream();
+
+        *adj_out          = adj;
+        *vecs_out         = vecs;
+        *n_vecs_out       = N;
+        *graph_degree_out = (int)D;
+        return 0;
+    } catch (const std::exception &e) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_cagra_extract_adjacency] %s\n", e.what());
+        return -1;
+    } catch (...) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_cagra_extract_adjacency] unknown exception\n");
+        return -1;
+    }
+}
+
+/* ----------------------------------------------------------------
  * Warm-up: pay the one-time GPU init cost (CUDA primary context, RMM pool,
  * cuBLAS/cuSOLVER handles, kernel JIT) at daemon startup instead of on the
  * first client query. Runs a tiny brute-force search; also primes one entry

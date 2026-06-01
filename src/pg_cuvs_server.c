@@ -3292,6 +3292,126 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Handle EXPORT_ADJACENCY command (CUVS_OP_EXPORT_ADJACENCY, Phase 3J).
+ *
+ * Copies the CAGRA graph adjacency list + corpus vectors from GPU VRAM
+ * to a shared memory segment, then replies with the key so the backend
+ * can read the data and write pgvector HNSW pages directly (no .hnsw file).
+ *
+ * Reply header reuse:
+ *   n_results  = n_vecs
+ *   latency_us = graph_degree
+ *   delta_merged = dim
+ *   error[]    = shm_key (null-terminated)
+ * ---------------------------------------------------------------- */
+static void
+handle_export_adjacency(int client_fd, const CuvsCmdFrame *cmd)
+{
+    uint32_t db  = cmd->db_oid;
+    uint32_t idx = cmd->index_oid;
+
+    pthread_mutex_lock(&g_index_mutex);
+    IndexEntry *e = find_index(db, idx);
+    if (!e || !e->valid || !e->handle || e->shard_count >= 2)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_NOT_FOUND,
+                        "index not loaded or sharded (call after CREATE INDEX USING cagra)");
+        return;
+    }
+
+    /* Hold the mutex while extracting from VRAM to prevent eviction. */
+    uint32_t *adj  = NULL;
+    float    *vecs = NULL;
+    size_t    n_vecs;
+    int       graph_degree;
+    int       gpu  = (int)e->gpu_device_id;
+
+    if (cuvs_cagra_extract_adjacency(e->handle, &adj, &vecs, &n_vecs,
+                                      &graph_degree, gpu) != 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        free(adj); free(vecs);
+        send_error(client_fd, "cuvs_cagra_extract_adjacency failed");
+        return;
+    }
+
+    uint32_t dim     = e->dim;
+    uint64_t *tids   = e->tids;   /* owned by daemon; copy below */
+    int64_t   n_vecs_i = e->n_vecs;
+    pthread_mutex_unlock(&g_index_mutex);
+
+    /* Pack into shared memory:
+     *   [uint32_t n_vecs][uint32_t graph_degree][uint32_t dim][uint32_t pad]
+     *   [uint32_t adj[n_vecs * graph_degree]]
+     *   [float    vecs[n_vecs * dim]]
+     *   [uint64_t tids[n_vecs]]
+     */
+    size_t adj_bytes  = (size_t)n_vecs * (size_t)graph_degree * sizeof(uint32_t);
+    size_t vecs_bytes = (size_t)n_vecs * (size_t)dim           * sizeof(float);
+    size_t tids_bytes = (size_t)n_vecs * sizeof(uint64_t);
+    size_t hdr_bytes  = 4 * sizeof(uint32_t);
+    size_t total      = hdr_bytes + adj_bytes + vecs_bytes + tids_bytes;
+
+    /* Generate a unique shm key for this reply. */
+    static int adj_seq = 0;
+    char shm_key[64];
+    snprintf(shm_key, sizeof(shm_key), "/pg_cuvs_adj_%d_%d",
+             (int)getpid(), __atomic_fetch_add(&adj_seq, 1, __ATOMIC_RELAXED));
+
+    int shm_fd = shm_open(shm_key, O_CREAT | O_RDWR, 0666);
+    if (shm_fd < 0)
+    {
+        free(adj); free(vecs);
+        send_error(client_fd, "shm_open failed for export");
+        return;
+    }
+    if (ftruncate(shm_fd, (off_t)total) != 0)
+    {
+        close(shm_fd); shm_unlink(shm_key); free(adj); free(vecs);
+        send_error(client_fd, "ftruncate failed for export");
+        return;
+    }
+    void *mem = mmap(NULL, total, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (mem == MAP_FAILED)
+    {
+        shm_unlink(shm_key); free(adj); free(vecs);
+        send_error(client_fd, "mmap failed for export");
+        return;
+    }
+
+    /* Write header: [n_vecs][graph_degree][dim][metric] */
+    uint32_t *hp = (uint32_t *)mem;
+    hp[0] = (uint32_t)n_vecs;
+    hp[1] = (uint32_t)graph_degree;
+    hp[2] = (uint32_t)dim;
+    hp[3] = e->metric;  /* CUVS_METRIC_* for source metric validation */
+
+    char *dp = (char *)mem + hdr_bytes;
+    memcpy(dp, adj,  adj_bytes);   dp += adj_bytes;
+    memcpy(dp, vecs, vecs_bytes);  dp += vecs_bytes;
+    memcpy(dp, tids, tids_bytes);
+
+    munmap(mem, total);
+    free(adj);
+    free(vecs);
+
+    LOG_INFO("[handle_export_adjacency] %u/%u N=%zu D=%d dim=%u shm=%s\n",
+             db, idx, n_vecs, graph_degree, dim, shm_key);
+
+    /* Reply: encode n_vecs/graph_degree/dim in header fields; shm_key in error[] */
+    CuvsReplyHeader reply = {0};
+    reply.status       = CUVS_STATUS_OK;
+    reply.n_results    = (uint32_t)n_vecs;
+    reply.latency_us   = (uint32_t)graph_degree;
+    reply.delta_merged = (uint32_t)dim;
+    strncpy(reply.error, shm_key, sizeof(reply.error) - 1);
+    send_all(client_fd, &reply, sizeof(reply));
+    (void)n_vecs_i;
+}
+
+/* ----------------------------------------------------------------
  * Handle CACHE_STATS command (CUVS_OP_CACHE_STATS): per-GPU counters.
  * Phase 3E: one CuvsCacheStats row per usable GPU device.
  * ---------------------------------------------------------------- */
@@ -3460,6 +3580,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_DROP_INDEX:
             handle_drop(client_fd, &cmd);
+            break;
+        case CUVS_OP_EXPORT_ADJACENCY:
+            handle_export_adjacency(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

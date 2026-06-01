@@ -26,6 +26,7 @@
 #define CUVS_OP_CACHE_STATS 5 /* daemon-global VRAM cache counters */
 #define CUVS_OP_SHARD_STATS 6 /* Phase 3F: per-shard stats for sharded indexes */
 #define CUVS_OP_DROP_INDEX  7 /* Phase 3G.1: free a dropped index + unlink its artifacts */
+#define CUVS_OP_EXPORT_ADJACENCY 8 /* Phase 3J: export CAGRA adjacency+vecs via shm */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -202,6 +203,36 @@ int cuvs_ipc_build(
     uint32_t       relfilenode, /* heap relfilenode (heap compat identity) */
     uint32_t       shard_count, /* Phase 3F: 0/1 = unsharded, >=2 = N shards */
     uint32_t       use_cpu_hnsw /* Phase 3I-1: 1 = serialize .hnsw sidecar */
+);
+
+/*
+ * cuvs_ipc_export_adjacency — Phase 3J: request CAGRA adjacency list + corpus
+ * vectors from the daemon for a loaded index (CUVS_OP_EXPORT_ADJACENCY).
+ *
+ * Daemon copies the graph and vectors from VRAM to a shared memory segment,
+ * and writes the shm_key into the reply header. The caller receives caller-
+ * owned malloc'd buffers (free() each when done).
+ *
+ * Returns CUVS_STATUS_OK on success, CUVS_STATUS_NOT_FOUND if the index is
+ * not loaded, or CUVS_STATUS_ERROR on other failures.
+ *
+ * shm layout (daemon-written):
+ *   [uint32_t n_vecs]  [uint32_t graph_degree]  [uint32_t dim]  [uint32_t _pad]
+ *   [uint32_t adj[n_vecs * graph_degree]]   row-major CAGRA adjacency
+ *   [float    vecs[n_vecs * dim]]           corpus vectors (row-major float32)
+ *   [uint64_t tids[n_vecs]]                 heap TIDs (block<<16|offset)
+ */
+int cuvs_ipc_export_adjacency(
+    const char  *socket_path,
+    uint32_t     db_oid,
+    uint32_t     index_oid,
+    uint32_t   **adj_out,        /* [n_vecs * graph_degree], caller-freed */
+    float      **vecs_out,       /* [n_vecs * dim],          caller-freed */
+    uint64_t   **tids_out,       /* [n_vecs],                caller-freed */
+    size_t      *n_vecs_out,
+    int         *graph_degree_out,
+    int         *dim_out,
+    uint32_t    *metric_out      /* CUVS_METRIC_* of the source CAGRA index */
 );
 
 /*

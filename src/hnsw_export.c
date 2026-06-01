@@ -1072,12 +1072,323 @@ pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
     free_elem_descs(elems, N, (size_t)M0);
     free(elems);
 
-    index_close(hnsw_rel, ExclusiveLock);
+    index_close(hnsw_rel, AccessExclusiveLock);
 
     ereport(NOTICE,
             (errmsg("pg_cuvs: imported %zu elements (dim=%d, M=%d) from "
                     "\"%s\" into hnsw index %u",
                     N, dim, M, hnsw_path, hnsw_oid)));
+
+    PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * pg_cuvs_import_cagra — Phase 3J: direct CAGRA → pgvector HNSW
+ *
+ * Skips the hnswlib intermediate format entirely. Gets CAGRA adjacency
+ * + corpus vectors from the daemon via IPC, builds a flat pgvector HNSW
+ * (all nodes at level 0), and writes it directly into the target relation.
+ *
+ * Does NOT require cuvs.cpu_hnsw_fallback=on.
+ * Supports UNLOGGED target for faster import (see pg_cuvs_import_hnsw).
+ * ================================================================ */
+extern char *cuvs_socket_path;   /* GUC declared in pg_cuvs.c */
+
+PG_FUNCTION_INFO_V1(pg_cuvs_import_cagra);
+Datum
+pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
+{
+    Oid cagra_oid = PG_GETARG_OID(0);
+    Oid hnsw_oid  = PG_GETARG_OID(1);
+
+    /* ---- 0. pgvector compatibility check ---- */
+    {
+        Oid vec_oid = get_extension_oid("vector", true);
+        if (!OidIsValid(vec_oid))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: pgvector extension is not installed; "
+                            "pg_cuvs_import_cagra requires pgvector 0.5.0+"),
+                     errhint("Run: CREATE EXTENSION vector;")));
+    }
+
+    /* ---- 1. Source CAGRA index: get dim ---- */
+    Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+    int dim = 0;
+    if (RelationGetDescr(cagra_rel)->natts >= 1)
+        dim = (int)TupleDescAttr(RelationGetDescr(cagra_rel), 0)->atttypmod;
+    if (dim <= 0)
+        ereport(ERROR,
+                (errmsg("pg_cuvs: cannot determine vector dimension from cagra "
+                        "index %u", cagra_oid)));
+    index_close(cagra_rel, AccessShareLock);
+
+    /* ---- 1b. Validate target index (AM, dim, metric) ---- */
+    bool hnsw_unlogged = false;
+    uint32_t tgt_metric = CUVS_METRIC_L2;
+    {
+        HeapTuple tup = SearchSysCache1(RELOID, ObjectIdGetDatum(hnsw_oid));
+        if (!HeapTupleIsValid(tup))
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: target relation %u not found", hnsw_oid)));
+        Form_pg_class cf = (Form_pg_class) GETSTRUCT(tup);
+
+        if (cf->relkind != RELKIND_INDEX)
+        {
+            char *name = pstrdup(NameStr(cf->relname));
+            ReleaseSysCache(tup);
+            ereport(ERROR, (errmsg("pg_cuvs: \"%s\" is not an index", name)));
+        }
+        Oid hnsw_amoid = get_am_oid("hnsw", true);
+        if (!OidIsValid(hnsw_amoid) || cf->relam != hnsw_amoid)
+        {
+            char *name = pstrdup(NameStr(cf->relname));
+            ReleaseSysCache(tup);
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: \"%s\" is not a pgvector HNSW index", name)));
+        }
+        /* Dimension check */
+        {
+            int tgt_dim = 0;
+            HeapTuple attup = SearchSysCache2(ATTNUM,
+                                               ObjectIdGetDatum(hnsw_oid),
+                                               Int16GetDatum(1));
+            if (HeapTupleIsValid(attup))
+            {
+                tgt_dim = (int)((Form_pg_attribute)GETSTRUCT(attup))->atttypmod;
+                ReleaseSysCache(attup);
+            }
+            if (tgt_dim > 0 && tgt_dim != dim)
+            {
+                char *name = pstrdup(NameStr(cf->relname));
+                ReleaseSysCache(tup);
+                ereport(ERROR,
+                        (errmsg("pg_cuvs: dimension mismatch: source CAGRA dim=%d "
+                                "but target HNSW \"%s\" dim=%d", dim, name, tgt_dim)));
+            }
+        }
+        /* Opclass → metric */
+        {
+            HeapTuple idxtup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(hnsw_oid));
+            if (HeapTupleIsValid(idxtup))
+            {
+                bool isnull;
+                Datum d = SysCacheGetAttr(INDEXRELID, idxtup,
+                                           Anum_pg_index_indclass, &isnull);
+                if (!isnull)
+                {
+                    oidvector *ov = (oidvector *)DatumGetPointer(d);
+                    HeapTuple opctup = SearchSysCache1(CLAOID,
+                                                        ObjectIdGetDatum(ov->values[0]));
+                    if (HeapTupleIsValid(opctup))
+                    {
+                        const char *nm = NameStr(((Form_pg_opclass)GETSTRUCT(opctup))->opcname);
+                        if (strstr(nm, "cosine"))   tgt_metric = CUVS_METRIC_COSINE;
+                        else if (strstr(nm, "_ip")) tgt_metric = CUVS_METRIC_IP;
+                        ReleaseSysCache(opctup);
+                    }
+                }
+                ReleaseSysCache(idxtup);
+            }
+        }
+        hnsw_unlogged = (cf->relpersistence == RELPERSISTENCE_UNLOGGED);
+        ReleaseSysCache(tup);
+    }
+
+    if (hnsw_unlogged)
+        ereport(NOTICE,
+                (errmsg("pg_cuvs: target HNSW is UNLOGGED — WAL skipped; "
+                        "index must be rebuilt after crash recovery")));
+
+    /* ---- 2. Fetch adjacency + vectors + tids from daemon ---- */
+    if (cuvs_socket_path == NULL || cuvs_socket_path[0] == '\0')
+        ereport(ERROR,
+                (errmsg("pg_cuvs: daemon socket not set (cuvs.socket_path); "
+                        "is pg_cuvs_server running?")));
+
+    uint32_t *adj   = NULL;
+    float    *vecs  = NULL;
+    uint64_t *tids  = NULL;
+    size_t    N;
+    int       graph_degree, ipc_dim;
+    uint32_t  src_metric;
+
+    int rc = cuvs_ipc_export_adjacency(
+        cuvs_socket_path,
+        (uint32_t)MyDatabaseId,
+        (uint32_t)cagra_oid,
+        &adj, &vecs, &tids,
+        &N, &graph_degree, &ipc_dim,
+        &src_metric);
+
+    if (rc != CUVS_STATUS_OK)
+    {
+        ereport(ERROR,
+                (errmsg("pg_cuvs: IPC export_adjacency failed (status=%d); "
+                        "ensure index %u is loaded in daemon", rc, cagra_oid)));
+    }
+
+    /* Metric mismatch check */
+    if (src_metric != tgt_metric)
+    {
+        static const char *mname[] = {"l2", "cosine", "ip"};
+        const char *sm = (src_metric < 3) ? mname[src_metric] : "unknown";
+        const char *tm = (tgt_metric < 3) ? mname[tgt_metric] : "unknown";
+        free(adj); free(vecs); free(tids);
+        ereport(ERROR,
+                (errmsg("pg_cuvs: metric mismatch: source CAGRA uses %s but "
+                        "target HNSW uses %s", sm, tm)));
+    }
+
+    /* ---- 3. Build flat ElemDesc array (all level=0) ---- */
+    /* M0 = level-0 neighbor slots per node (pgvector convention: 2*M).
+     * Truncate CAGRA graph_degree to M0 = min(graph_degree, 64).
+     * M = M0 / 2.  Default aligns with pgvector's HNSW m=16 default. */
+    int M0 = (graph_degree < 64) ? graph_degree : 64;
+    if (M0 % 2 != 0) M0--;          /* must be even for M = M0/2 */
+    if (M0 < 2) M0 = 2;
+    int M  = M0 / 2;
+
+    ElemDesc *elems = (ElemDesc *)calloc(N, sizeof(ElemDesc));
+    if (!elems)
+    {
+        free(adj); free(vecs); free(tids);
+        ereport(ERROR, (errmsg("pg_cuvs: out of memory for element descriptors")));
+    }
+
+    for (size_t i = 0; i < N; i++)
+    {
+        elems[i].level      = 0;
+        elems[i].tid_encoded = tids[i];
+
+        /* Level-0 links: copy up to M0 neighbors from CAGRA adjacency row i */
+        int cnt = (graph_degree < M0) ? graph_degree : M0;
+        elems[i].lv0_count = cnt;
+        if (cnt > 0)
+        {
+            elems[i].lv0_links = (int *)malloc((size_t)cnt * sizeof(int));
+            if (!elems[i].lv0_links)
+            {
+                free_elem_descs(elems, i, (size_t)M0);
+                free(elems); free(adj); free(vecs); free(tids);
+                ereport(ERROR, (errmsg("pg_cuvs: out of memory for lv0_links")));
+            }
+            const uint32_t *row = adj + i * (size_t)graph_degree;
+            for (int j = 0; j < cnt; j++)
+                elems[i].lv0_links[j] = (int)row[j];
+        }
+        /* No upper levels: upper_links = NULL, upper_counts = NULL */
+    }
+    free(adj);
+    free(tids);
+
+    /* ---- 4. Layout pass ---- */
+    for (size_t i = 0; i < N; i++)
+    {
+        uint32_t blkno = (uint32_t)(i + 1);
+        elems[i].elem_blkno  = blkno;
+        elems[i].elem_offno  = 1;
+        elems[i].neigh_blkno = blkno;
+        elems[i].neigh_offno = 2;
+    }
+
+    /* Verify elem+neigh fit on one page (level=0, M0 neighbors). */
+    {
+        size_t esize  = elem_tuple_size((int)ipc_dim);
+        size_t nsize  = neigh_tuple_size(0, M);
+        size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
+        if (needed > (size_t)PGV_USABLE_BYTES)
+        {
+            free_elem_descs(elems, N, (size_t)M0);
+            free(elems); free(vecs);
+            ereport(ERROR,
+                    (errmsg("pg_cuvs: element+neighbor too large for one page "
+                            "(dim=%d M=%d needed=%zu avail=%d)",
+                            ipc_dim, M, needed, PGV_USABLE_BYTES)));
+        }
+    }
+
+    /* ---- 5. Open target HNSW with AccessExclusiveLock and truncate ---- */
+    Relation hnsw_rel = index_open(hnsw_oid, AccessExclusiveLock);
+    {
+        SMgrRelation smgr = RelationGetSmgr(hnsw_rel);
+        BlockNumber  cur  = smgrnblocks(smgr, MAIN_FORKNUM);
+        if (cur > 0)
+        {
+            ForkNumber  forks[1]  = { MAIN_FORKNUM };
+            BlockNumber blocks[1] = { 0 };
+            smgrtruncate(smgr, forks, 1, blocks);
+        }
+        RelationSetTargetBlock(hnsw_rel, InvalidBlockNumber);
+    }
+
+    /* ---- 6. Write metapage (block 0) ---- */
+    {
+        Buffer buf = ReadBuffer(hnsw_rel, P_NEW);
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+        Page page = BufferGetPage(buf);
+        PageInit(page, BLCKSZ, sizeof(PgvHnswPageOpaque));
+
+        PgvHnswPageOpaque *opaque =
+            (PgvHnswPageOpaque *) PageGetSpecialPointer(page);
+        opaque->nextblkno = InvalidBlockNumber;
+        opaque->unused    = 0;
+        opaque->page_id   = PGV_HNSW_PAGE_ID;
+
+        PgvHnswMeta *metap = (PgvHnswMeta *) PageGetContents(page);
+        memset(metap, 0, sizeof(*metap));
+        metap->magicNumber    = PGV_HNSW_MAGIC;
+        metap->version        = PGV_HNSW_VERSION;
+        metap->dimensions     = (uint16_t)ipc_dim;
+        metap->m              = (uint16_t)M;
+        metap->efConstruction = (uint16_t)(M0 * 2);  /* reasonable default */
+        if (N > 0)
+        {
+            metap->entryBlkno = 1;
+            metap->entryOffno = 1;
+            metap->entryLevel = 0;   /* flat HNSW: entrypoint at level 0 */
+        }
+        else
+        {
+            metap->entryBlkno = InvalidBlockNumber;
+            metap->entryOffno = 0;
+            metap->entryLevel = -1;
+        }
+        metap->insertPage = (uint32_t)N;
+
+        ((PageHeader)page)->pd_lower =
+            (uint16_t)(((char *)metap + sizeof(PgvHnswMeta)) - (char *)page);
+
+        MarkBufferDirty(buf);
+        if (!hnsw_unlogged)
+            log_newpage_buffer(buf, true);
+        UnlockReleaseBuffer(buf);
+    }
+
+    /* ---- 7. Write element+neighbor pages ---- */
+    for (size_t i = 0; i < N; i++)
+    {
+        /* Extract vector for this element */
+        const float *vec = vecs + i * (size_t)ipc_dim;
+
+        write_elem_page(hnsw_rel,
+                        elems[i].elem_blkno,
+                        &elems[i],
+                        vec,
+                        ipc_dim, M,
+                        elems, N,
+                        hnsw_unlogged);
+    }
+
+    free(vecs);
+    free_elem_descs(elems, N, (size_t)M0);
+    free(elems);
+
+    index_close(hnsw_rel, AccessExclusiveLock);
+
+    ereport(NOTICE,
+            (errmsg("pg_cuvs: direct import %zu elements (dim=%d, M=%d, "
+                    "graph_degree=%d) from cagra index %u into hnsw index %u",
+                    N, ipc_dim, M, graph_degree, cagra_oid, hnsw_oid)));
 
     PG_RETURN_VOID();
 }
