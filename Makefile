@@ -289,6 +289,28 @@ gpu-bench:
 gpu-bench-1m:
 	$(MAKE) gpu-bench N=1000000 DIM=1536
 
+gpu-cohere:
+	@echo "[gpu-cohere] Launching Cohere 1M benchmark (nohup, async)"
+	ssh $(GCP_VM) "cd ~/pg_cuvs && \
+		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		nohup bash bench/run_cohere.sh \
+			--n $(if $(N),$(N),1000000) \
+			--gpu $(if $(GPU),$(GPU),0) \
+			> /tmp/cohere_bench.log 2>&1 &" && \
+	echo "[gpu-cohere] Started. Poll with:" && \
+	echo "  make gpu-cohere-log" && \
+	echo "  make gpu-cohere-result"
+
+gpu-cohere-log:
+	ssh $(GCP_VM) "tail -50 /tmp/cohere_bench.log"
+
+gpu-cohere-result:
+	@N=$(if $(N),$(N),1000000); \
+	ssh $(GCP_VM) "cat ~/pg_cuvs/bench/results/cohere_N$${N}_summary.csv 2>/dev/null \
+		|| echo 'Not ready yet — check: make gpu-cohere-log'"
+
+.PHONY: gpu-cohere gpu-cohere-log gpu-cohere-result
+
 gpu-shell:
 	ssh -tt $(GCP_VM)
 
