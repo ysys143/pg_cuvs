@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "pr/**", "design/**"]
+  pull_request:
+    branches: [main]
+
+# ── Job 1: CPU-only build + unit tests ────────────────────────────────────
+# Runs on standard GitHub-hosted runners. No CUDA, no GPU, no daemon.
+# Validates: C compilation (pg headers), unit tests (cuvs_util.c helpers).
+# Does NOT build the CUDA wrapper (nvcc absent); nvcc compilation is gated
+# to the GPU job below.
+jobs:
+  build-check:
+    name: Build check + unit tests (CPU)
+    runs-on: ubuntu-22.04
+
+    strategy:
+      matrix:
+        pg: ["16"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-${{ matrix.pg }} \
+              postgresql-server-dev-${{ matrix.pg }} \
+              gcc make
+
+      - name: Compile C sources (no CUDA)
+        run: |
+          PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          CFLAGS=$(${PG_CONFIG} --cflags)
+          INCLUDEDIR=$(${PG_CONFIG} --includedir-server)
+          # Compile each C source to verify no syntax errors.
+          # hnsw_export.c and pg_cuvs.c include PG headers — compile-check only.
+          for f in src/pg_cuvs.c src/cuvs_ipc.c src/hnsw_export.c; do
+            echo "Checking $f ..."
+            gcc -fsyntax-only ${CFLAGS} -I${INCLUDEDIR} -I./src \
+              -DHAVE_LONG_INT_64 -DHAVE_PG_CONFIG_H \
+              $f || exit 1
+          done
+
+      - name: Unit tests (CPU-only, no PG/CUDA required)
+        run: make test-unit
+
+# ── Job 2: Full GPU regression (self-hosted A100 runner) ──────────────────
+# Requires a self-hosted runner with:
+#   - NVIDIA A100 (or compatible) + driver 525+
+#   - CUDA 12+, cuVS/RAPIDS 26.04 (conda env: cuvs_dev)
+#   - PostgreSQL 16 installed + pg_cuvs_server systemd unit
+#   - pgvector installed
+#
+# Triggered on push to main and pr/* branches.
+# Self-hosted runner label: [self-hosted, gpu, a100]
+  gpu-regress:
+    name: GPU regression (installcheck)
+    runs-on: [self-hosted, gpu, a100]
+    # Only run on push (not every PR preview to save GPU time).
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and install
+        run: |
+          source ~/miniforge3/bin/activate cuvs_dev
+          make
+          sudo -E make install
+          sudo make install-server
+
+      - name: Restart services
+        run: |
+          sudo systemctl restart postgresql
+          sudo systemctl restart pg-cuvs-server
+          sleep 3
+
+      - name: Run regression suite (make installcheck)
+        run: |
+          source ~/miniforge3/bin/activate cuvs_dev
+          make installcheck
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-diffs
+          path: test/regression.diffs
+          retention-days: 7
+
+# ── Compatibility matrix (informational) ──────────────────────────────────
+# Component        Tested       Minimum
+# PostgreSQL       16.3         16
+# pgvector         0.8.x        0.5.0
+# NVIDIA CUDA      12.4         12.0
+# cuVS / RAPIDS    26.04        24.12
+# NVIDIA driver    550.x        525
+# GCC              11.4         11
+# Ubuntu           22.04        20.04
