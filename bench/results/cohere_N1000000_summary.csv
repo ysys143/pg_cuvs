@@ -1,0 +1,11 @@
+system,dataset,N,dim,metric,k,param_set,build_time_s,index_bytes,recall,qps,p50_ms,p95_ms,p99_ms,notes
+pg_cuvs_import_hnsw,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),10,ef=512,141.894,8192008192,0.9993,16.9,60.829,93.783,100.781,cagra_build=84.8s import=57.1s total=141.9s
+cagra-hnsw-cpu,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),10,ef=512,11.885,,0.9975,610.9,11.657,16.915,17.986,GPU CAGRA build -> CPU HNSW search
+pg_cuvs,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),10,k=100(fixed),69.089,0,0.9912,226.9,4.355,5.019,5.272,k hardcoded 100 internally (LIMIT not wired to GPU top-k)
+pgvector-hnsw,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),10,ef_search=400,285.351,8185126912,0.9891,45.0,22.183,36.968,40.66,
+pgvector-ivfflat,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),10,probes=128,1388.954,8224776192,0.9766,8.6,115.437,137.495,145.378,
+pg_cuvs_import_hnsw,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),100,ef=512,141.894,8192008192,0.9966,16.9,60.829,93.783,100.781,cagra_build=84.8s import=57.1s total=141.9s
+cagra-hnsw-cpu,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),100,ef=512,11.885,,0.9928,610.9,11.657,16.915,17.986,GPU CAGRA build -> CPU HNSW search
+pgvector-hnsw,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),100,ef_search=400,285.351,8185126912,0.969,45.0,22.183,36.968,40.66,
+pg_cuvs,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),100,k=100(fixed),69.089,0,0.9599,226.9,4.355,5.019,5.272,k hardcoded 100 internally (LIMIT not wired to GPU top-k)
+pgvector-ivfflat,cohere-wiki-en-1024,1000000,1024,cosine(L2-normed),100,probes=128,1388.954,8224776192,0.9557,8.6,115.437,137.495,145.378,

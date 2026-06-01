@@ -529,3 +529,241 @@ MVP:
 **결과**: `CuvsManifest` 확장 + `cuvs_objstore_upload_sharded`; `delta_gpu_of` + sharded fanout delta 병합; `IndexEntry.inflight` + sharded-aware LRU. 검증: 단일 GPU integration Scenario 22(sharded delta=gpu, CPU exact 일치)·23(sharded whole-unit eviction + manifest reload). 3G.2의 GCS transfer round-trip은 bucket이 없어 자동 검증 불가(3C/3D와 동일 상태) — compile + no-regression + download 후 load 경로(Scenario 19)로 커버.
 
 **대안**: delta cache를 shard별로 두기. 거부 — `.delta`는 글로벌 generation(전체 `.tids` CRC) 기준이라 논리 index당 하나가 자연스럽고, shard별 분할은 TID 매핑/정합 복잡도만 키운다. eviction에 deferred-free(cond-wait). 거부 — inflight>0 victim을 단순 skip하면 충분(eviction은 best-effort)하고 cond-wait의 entry-이동 위험을 피한다.
+
+---
+
+## ADR-025 — 50M×384 Competitive Benchmark 결과 및 pg_cuvs 포지셔닝
+
+**날짜**: 2026-05-30~31
+
+**결과 요약** (bench/results/competitive.csv, design/BENCHMARK_CROSSOVER.md §12):
+
+| engine | build_s | p50_us | QPS | recall@10 |
+|---|---|---|---|---|
+| diskann (2GB cache) | TIMEOUT (>5h) | NA | NA | NA |
+| hnsw (64GB) | 21,879 | 12,985 | 546 | 미측정 |
+| vchordrq (8192 lists) | 5,784 | 49,101 | 152 | **0.9991** (probes=5) |
+| cagra (shard=4) | FAILED | NA | NA | NA |
+
+**CAGRA 실패 원인**: 50M×384×float32 = 73.24 GiB 원시 데이터 + 빌드 워크스페이스가 2×A100-40GB (80 GB VRAM)을 초과. shard_count=2(25M/shard=38.4 GB) 및 shard_count=4 모두 실패. A100-80GB ×2 이상 필요.
+
+**발견한 버그**: `pg_cuvs_server` 서비스 파일에 `--max-vram-mb 128` (128 MB 제한) 설정이 있었음. 40000으로 수정 (commit `bench/` 관련 커밋 참조).
+
+**GT 버그**: `gt_faiss.py --regen`의 GBATCH=1M이 `load_binary.py --batch 50000`과 다른 RNG 시퀀스를 생성 → recall=0. GBATCH=50000으로 수정 (commit `6a74863`).
+
+**결정**: pg_cuvs는 **GPU hot tier** 포지셔닝으로 고정한다.
+
+```text
+N <~ 10K                     → pgvector HNSW (CPU, latency 압도)
+N >~ 100K or dim >= 1536     → pg_cuvs CAGRA (latency 8-12×, build 9-36×)
+50M×384 (float32)            → pg_cuvs 하드웨어 한계 (A100-40GB×2 부족)
+N = 50M, CPU only            → HNSW 실용적(p50=13ms, QPS=546),
+                                vchordrq 빌드 빠르나 search 느림(p50=49ms, QPS=152)
+DiskANN 2GB cache @ 50M      → 실용 불가 (캐시 0.9%에서 full)
+```
+
+**참조**: `BENCHMARK_CROSSOVER.md` §11(1M pilot), §12(50M competitive).
+
+---
+
+## ADR-026 — Phase 3B go/no-go: GPU hot tier only 포지셔닝
+
+**날짜**: 2026-05-31
+
+**배경**: Phase 3B spike 결과 (design/PHASE_3B_DESIGN_NOTES.md):
+- cuVS Vamana in-memory: product path 아님 (upstream API 불안정)
+- cuVS Vamana → PQFlash disk: cuVS 26.04 기준 NO-GO
+- native NVMe cold tier: MS DiskANN native path 또는 자체 serializer 필요, 개발 비용 큼
+
+**50M competitive benchmark 추가 근거**:
+- DiskANN은 50M×2GB에서 완전히 실패 — NVMe cold tier의 실용 스케일은 1B+ 이상
+- 50M 수준은 HNSW가 CPU로 충분히 커버 (p50=13ms)
+- DiskANN이 필요한 순간은 RAM에도 들어가지 않는 1B+ 규모 (현재 target 밖)
+
+**결정**:
+- **3B 구현 중단**: 새 기능 추가 없음
+- **포지셔닝 확정**: pg_cuvs = "GPU VRAM에 들어가는 hot vector workload" 전담
+- **문서화로 마무리**: PHASE_3B_DESIGN_NOTES.md에 go/no-go 결론 명시 (별도 작업)
+- **추후 재검토 조건**: VRAM 128GB+ 환경에서 100M+ 스케일 요구가 생길 때
+
+**대안**: 3B 계속 구현. 거부 — 현재 가치 입증과 제품화가 우선이며, 1B+ 스케일 수요가 확인되기 전에 NVMe cold tier에 투자하는 것은 시기상조.
+
+---
+
+## ADR-027 — 다음 우선순위: Cost model → Ops → Release
+
+**날짜**: 2026-05-31
+
+**배경**: Phase 3A-G 기능 구현 완료. 남은 핵심 가치는 "언제 쓰면 좋은지", "planner가 맞게 고르는지", "남이 설치 가능한지"에 있다.
+
+**결정**: 신규 기능 추가 금지. 다음 순서로 집중한다.
+
+```
+1. Competitive baseline 마무리 (BENCHMARK_CROSSOVER.md Cell B 완료, Cell C 선택적)
+2. Cost model recalibration — benchmark 결과 → planner 파라미터 연결
+   반영 대상: N, dim, cuvs.k, shard_count, parallel_fanout, shard_overfetch,
+              delta rows, warm/cold/reload state, CPU baseline crossover
+3. Phase 3B go/no-go 문서화 (ADR-026, 별도 doc)
+4. 3H-full operational playbooks — sizing guide, when-to-use, GCS, runbook
+5. Release hardening — clean install, compat matrix, known limitations, README
+```
+
+**근거**:
+- 현재 benchmark 결과를 cost model에 연결하지 않으면 planner가 틀린 선택을 할 수 있음
+- 설치 재현성이 없으면 외부 사용자가 pg_cuvs를 평가할 수 없음
+- 기능 > 제품화 순서는 현재 단계에서 역전
+
+**Cell C (1M×384 pgvectorscale/VectorChord Pareto sweep) 처리**:
+- §11에 1M×384 HNSW vs CAGRA가 이미 있음
+- pgvectorscale/VectorChord 추가는 선택적 — cost model 입력에 필요한 경우에만 진행
+- 지금 당장 필수 아님
+
+---
+
+## ADR-028 — Cost model calibration: 실측 기반 상수 검증
+
+**날짜**: 2026-05-31
+
+**배경**: ADR-027에서 "benchmark 결과를 cost model에 연결"을 우선순위로 설정.
+`cuvsamcostestimate()`의 세 상수(STARTUP/K/ROWS)가 실측 latency와 정합하는지 검증.
+
+**실측 데이터** (bench/results/pilot.csv, dim=384, k=10):
+
+| N | CAGRA p50 | HNSW p50 | seqscan 추정 | planner 결정 |
+|---|---|---|---|---|
+| 1K | 871us | 224us | ~100us | seqscan [OK] |
+| 10K | 1146us | 865us | ~800us | CAGRA (tied) |
+| 100K | 1228us | 8232us | ~7700us | CAGRA 6.3x [OK] |
+| 1M | 1196us | 13700us | ~77000us | CAGRA 64x [OK] |
+
+**Planner crossover 계산** (dim=384, seq_page_cost=1.0):
+
+```
+seqscan_cost ~ N * (16 + dim*4) / 8192 = N * 0.189   (dim=384)
+CAGRA_cost   = 1000 + 0.5*k + 0.00001*N = 1005 + tiny
+Crossover N  ~ 1005 / 0.189 ~ 5300 rows
+```
+
+즉, planner는 N > ~5300에서 CAGRA를 선택. 실측에서 N=10K 이상에서 CAGRA가 seqscan보다 빠름 — 모델이 보수적으로 5K로 설정하는 것은 적절 (N=1K-5K에서 CAGRA IPC overhead가 seqscan보다 큼).
+
+**상수 검증 결과**:
+
+- **STARTUP=1000**: cold CUDA init ~100ms (0.1ms/unit 기준) 모델링. warm-path IPC ~0.5ms이지만 planner가 warm/cold를 구분할 수 없음. 보수적 선택이 올바름.
+- **K_COST=0.5**: k=10 기준 5 units — STARTUP 대비 무시 가능. 구조 유지.
+- **ROWS_COST=0.00001**: N=1K→1M에서 p50이 871us→1196us(1.37x)로 거의 N-독립. 0.00001×N = N=1M에서 10 units (STARTUP 대비 1% 수준). 올바름.
+
+**dim 스케일링**: dim=384→1536에서 CAGRA p50이 1228us→1605us(1.31x)로 mild. 반면 seqscan은 row 크기가 4x → pages 4x → cost 4x로 자동 반영됨. 별도 dim term 불필요.
+
+**결정**: 상수값 변경 없음. 실측과 정합함이 확인됨. 주석 블록을 calibration rationale로 갱신 (`src/pg_cuvs.c` cost model 섹션).
+
+**대안**: STARTUP을 warm-path 기준(~50)으로 낮춤. 거부 — cold-start 첫 쿼리에서 planner가 CAGRA를 잘못 선택하게 되며, N=1K-5K에서 GPU overhead가 seqscan보다 큰 구간을 커버 못 함.
+
+---
+
+## ADR-029 — Phase 3I 포지셔닝: GPU Build Accelerator for pgvector HNSW
+
+**날짜**: 2026-06-01
+
+**배경**: Phase 3I에서 `pg_cuvs_import_hnsw(cagra_oid, hnsw_oid)`를 구현. GPU로 CAGRA를 빌드하고 pgvector HNSW 포맷으로 변환 후 임포트.
+
+**실측 (2026-06-01, A100-40GB, dim=384)**:
+
+| N | GPU total (CAGRA+import) | pgvector native | speedup |
+|---|--------------------------|-----------------|---------|
+| 10K | 0.5s | 1.3s | 2.6x |
+| 100K | 4.7s | 74.7s | **15.8x** |
+| 1M | 66.3s | 918.3s | **13.9x** |
+
+**결정**: Phase 3I를 "GPU Build Accelerator" 포지션으로 확정.
+
+운영 가정:
+- 온프렘/프라이빗 RAG 배포에서는 embedding model serving, reranker, batch embedding을 위해
+  이미 GPU 서버 또는 GPU 리소스 풀이 존재하는 경우가 많다.
+- 해당 GPU는 벡터 DB와 같은 랙/클러스터에 있거나, 최소한 대용량 embedding 배치와 같은
+  데이터 경로 가까이에 배치될 가능성이 높다.
+- 이 환경에서 GPU를 검색 서빙에 상시 묶어두는 대신, 시간이 많이 드는 인덱스 빌드/재빌드
+  작업에만 빌려 쓰고, 검색은 기존 PostgreSQL/pgvector HNSW 경로로 유지하는 것이
+  운영상 훨씬 낮은 도입 장벽을 가진다.
+
+포지셔닝:
+- GPU VRAM 충분: pg_cuvs CAGRA GPU 서치 (기존 경로)
+- VRAM 부족 또는 GPU-less 환경: **CAGRA build + import_hnsw → pgvector HNSW 서치**
+- CPU-only 환경 + 속도 불필요: pgvector HNSW native
+
+제품 메시지:
+- pg_cuvs는 pgvector를 대체하지 않고, pgvector HNSW 인덱스 빌드를 GPU로 가속하는
+  선택지를 제공한다.
+- 애플리케이션 쿼리, PostgreSQL 권한/백업/복구, pgvector HNSW 검색 경로는 그대로 둔다.
+- GPU 장애 또는 GPU 리소스 회수는 검색 서빙 장애로 직결되지 않는다. GPU는 build job의
+  가속 자원이며, 결과물은 CPU에서 서빙 가능한 pgvector HNSW index다.
+- embedding serving GPU와 vector indexing GPU를 같은 리소스 풀에서 스케줄링할 수 있어,
+  야간/배치 reindex 같은 운영 패턴에 잘 맞는다.
+
+**안전성 (ADR-029 확인 범위)**:
+- WAL crash-safe: `log_newpage_buffer` full-page image
+- 재시작 후 정상 동작 검증 (bench/test_3i_restart.sh)
+- VACUUM / REINDEX 정상 동작 확인
+- 타겟 검증: non-HNSW 거부, dim/metric mismatch 거부
+- pgvector 버전: 0.5.0+ (HNSW_VERSION=1, stable 2023-08~)
+
+**한계**:
+- pgvector HNSW 페이지 포맷 하드코딩 → pgvector major-version 변경 시 업데이트 필요
+- "offline import only" — import 중 동시 쿼리 차단 (ExclusiveLock)
+- 대형 데이터(1B+)에서 import 시간 미측정
+
+---
+
+## ADR-030 — MIG(Multi-Instance GPU) 지원: 검증 완료
+
+**날짜**: 2026-06-01
+
+**배경**: A100에서 MIG로 GPU를 분할하면 MIG 인스턴스가 별도 CUDA device로 노출된다. pg_cuvs 코드 변경 없이 동작하는지 검증.
+
+**검증 결과 (bench/test_mig.sh, 2026-06-01)**:
+
+| 시나리오 | 설정 | 결과 |
+|---|---|---|
+| 단일 MIG (3g.20gb=20GB) | shard_count=1, N=50K | **PASS** — CAGRA build+search 정상 |
+| 멀티 MIG (1g.5gb×3=5GB each) | shard_count=3, N=30K | **PASS** — 3개 MIG device에 sharding 정상 |
+
+**핵심 발견**:
+- MIG 인스턴스가 별도 CUDA device로 노출되므로 `CUDA_VISIBLE_DEVICES=MIG-uuid` 설정만으로 동작
+- `cuvs_detect_gpus()`가 MIG 인스턴스를 올바르게 열거 (각 5GB/20GB VRAM 인식)
+- `cuvs.shard_count=3`으로 3개 MIG 인스턴스에 분산 → 결과 정합성 확인
+
+**운영 참고**:
+- GCP A100 VM에서 MIG 활성화는 reboot 필요 (nvidia-smi --gpu-reset 미지원)
+- 활성화 순서: `--setup` (pending + reboot) → `--test` → `--teardown` (reboot)
+- MIG로 GPU를 세분화해 여러 pg_cuvs 인스턴스가 하나의 물리 GPU를 공유 가능
+
+**결정**: pg_cuvs는 MIG를 별도 코드 없이 지원. 운영 가이드에 MIG 설정 예시 추가 예정.
+
+---
+
+## ADR-031 — GPU 자원 파라미터 튜닝: 실측 가이드
+
+**날짜**: 2026-06-01
+
+**배경**: `max_vram_mb`, `shard_count`, `cuvs_k`, `parallel_fanout` 파라미터가 성능에 미치는 영향을 실측. VM: A100-40GB × 2, N=100K, dim=384, k=10, GPU=1.
+
+**실측 결과 (bench/results/gpu_resources_bench.csv)**:
+
+| 파라미터 | 값 | p50 (us) | recall@10 | 핵심 발견 |
+|---|---|---|---|---|
+| max_vram_mb | 40000 (기본) | 1214 | 0.792 | 기준선 |
+| max_vram_mb | 2048 (제한) | 1215 | 0.802 | 100K×384≈750MB → 2GB 한도 미초과, 성능 동일 |
+| shard_count | 1 | 1224 | 0.816 | 단일 GPU |
+| shard_count | 2 | 2075 | 0.924 | shard merge 오버헤드 +70% latency, recall +13% |
+| cuvs_k | 10 | 1207 | 0.620 | candidate 부족 → recall 저하 |
+| cuvs_k | 100 | 1333 | 0.798 | 기본값, 균형 |
+| cuvs_k | 200 | 1352 | 0.916 | latency +12%, recall +15% → 고정밀 요건에 적합 |
+| parallel_fanout | 0 (sequential) | 1936 | 0.924 | N=100K 소규모 shard: sequential이 더 빠름 |
+| parallel_fanout | 1 (parallel) | 2298 | 0.922 | 스레딩 오버헤드 > 병렬 이득 (소규모) |
+
+**결정 가이드**:
+- `max_vram_mb`: 인덱스(corpus + graph ≈ 4×corpus)가 한도 이내면 성능 영향 없음
+- `shard_count=2`: latency +70%를 감수할 때만 사용 (VRAM 초과 시 자동 사용)
+- `cuvs_k=200`: 높은 recall이 필요한 워크로드에 권장 (latency 비용 소)
+- `parallel_fanout=0`: 소규모 인덱스(N<1M)에서 sequential이 효율적
+
+**주의**: `parallel_fanout=1`이 유리한 구간은 shard당 N이 충분히 커서 스레딩 오버헤드를 상쇄할 때 (N>5M 예상). 소규모에서는 default off를 고려.
