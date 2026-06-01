@@ -553,3 +553,38 @@ nohup bash bench/run_cohere.sh --n 1000000 --gpu 0 > /tmp/cohere_bench.log 2>&1 
 
 > **주의**: `pg_cuvs_server` 바이너리 업데이트는 `make install-server` 별도 필요.
 > `make install`만으로는 `.so`만 갱신되며, HNSW 사이드카 직렬화 등 데몬 기능이 반영되지 않는다.
+
+---
+
+## §17 — Phase 3J: Direct CAGRA→pgvector 성능 비교
+
+**날짜**: 2026-06-01  
+**환경**: pg-cuvs-dev (단일 A100-40GB), N=1,000,000, dim=1024, Cohere Wikipedia 1024d  
+**비교**: `pg_cuvs_import_cagra` (direct, hnswlib 없음) vs `pg_cuvs_import_hnsw` (hnswlib 경유)
+
+### 측정 결과
+
+| 경로 | CAGRA build | import | **합계** | recall@10 (ef=200) | QPS |
+|------|-------------|--------|----------|-------------------|-----|
+| `pg_cuvs_import_cagra` (direct) | 55.7s (sidecar 없음) | 63.3s | **119.0s** | 0.9963 | 41.4 |
+| `pg_cuvs_import_hnsw` (hnswlib) | 83.4s (sidecar 포함) | 57.3s | **140.7s** | 0.9962 | 40.4 |
+| pgvector native HNSW build | — | — | 285s | baseline | — |
+
+**전체 speedup**: 1.18x (direct vs hnswlib) → native 대비 **2.4x**
+
+### 분석
+
+**직접 경로가 1.18x 빠른 이유**: from_cagra() CPU 변환 ~28s(=83.4-55.7)를 제거.
+
+**import 단계는 direct가 6s 느린 이유**: IPC 경유 GPU→CPU 벡터 전송(~4.25GB)이 .hnsw 파일 읽기보다 느림.
+
+**recall/QPS는 사실상 동일**: flat HNSW(level 0만) ≈ multi-level HNSW for CAGRA-built graphs. 계층 없이도 CAGRA 그래프 품질이 충분해 탐색 성능 차이 없음.
+
+### 선택 가이드
+
+| 요구사항 | 권장 경로 |
+|----------|----------|
+| 가장 빠른 import, recall 동일 | `pg_cuvs_import_cagra` + UNLOGGED (~96s) |
+| multi-level HNSW 품질 보장 | `pg_cuvs_import_hnsw` (~140s) |
+| 가장 안전한 (WAL crash recovery) | `pg_cuvs_import_hnsw` + LOGGED |
+| cpu_hnsw_fallback 경로 필요 | `pg_cuvs_import_hnsw` (사이드카 재사용) |
