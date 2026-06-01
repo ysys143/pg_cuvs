@@ -54,6 +54,7 @@
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
+#include "hnsw_export.h"
 
 PG_MODULE_MAGIC;
 
@@ -86,6 +87,7 @@ int   cuvs_delta_search_mode       = 0;    /* 0=auto, 1=cpu, 2=gpu (Phase 3A-3) 
 int   cuvs_shard_count             = 0;    /* 0 = auto (Phase 3G); 1 = unsharded; >=2 = N GPU shards (Phase 3F) */
 int   cuvs_shard_overfetch         = 0;    /* per-shard request k = k + this; recall slop at scale (Phase 3G) */
 bool  cuvs_parallel_fanout         = true; /* dispatch shards concurrently in the daemon (Phase 3G) */
+bool  cuvs_cpu_hnsw_fallback       = false; /* Phase 3I-1: prefer CPU HNSW over GPU CAGRA */
 char *cuvs_snapshot_uri            = NULL;  /* "gs://bucket[/prefix]" — empty = disabled (Phase 3C) */
 char *cuvs_cluster_id              = NULL;  /* multi-node identifier for GCS path (Phase 3C) */
 char *cuvs_gcs_key_file            = NULL;  /* service account JSON path; "" = instance metadata (Phase 3C) */
@@ -328,6 +330,17 @@ _PG_init(void)
         "and as a kill switch). No effect on unsharded indexes. Read per SEARCH.",
         &cuvs_parallel_fanout,
         true,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "cuvs.cpu_hnsw_fallback",
+        "Serve queries from the CPU HNSW sidecar instead of GPU CAGRA (Phase 3I-1).",
+        "When on, the daemon loads the .hnsw sidecar built alongside the CAGRA index "
+        "and searches it on CPU.  Useful for GPU-less testing or when latency "
+        "requirements allow CPU serving.  Default off.",
+        &cuvs_cpu_hnsw_fallback,
+        false,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -663,16 +676,40 @@ cuvs_pread_all(int fd, off_t off, void *buf, size_t len)
 }
 
 /* ----------------------------------------------------------------
- * Cost model
+ * Cost model (ADR-028)
  *
- * startup_cost=1000 models UDS round-trip + CUDA context overhead.
- * Total cost is dominated by the requested top-k, not table size (ADR-003).
+ * Calibrated against pilot benchmarks (bench/results/pilot.csv), dim=384, k=10:
+ *
+ *   N=1K:    CAGRA p50= 871us,  seqscan ~  100us  -> seqscan wins (correct)
+ *   N=10K:   CAGRA p50=1146us,  seqscan ~  800us  -> GPU ~tied  (acceptable)
+ *   N=100K:  CAGRA p50=1228us,  seqscan ~ 7700us  -> GPU 6.3x  [OK]
+ *   N=1M:    CAGRA p50=1196us,  seqscan ~77000us  -> GPU 64x   [OK]
+ *
+ * Planner crossover (dim=384, seq_page_cost=1.0):
+ *   seqscan_cost ~ N * (16 + dim*4) / 8192  ->  N * 0.189 at dim=384
+ *   CAGRA_cost   = STARTUP + K_COST*k + ROWS_COST*N
+ *   Crossover N  ~ STARTUP / 0.189  ~  5300 rows
+ *
+ * STARTUP_COST=1000 models the cold-path CUDA context initialisation
+ * (~100ms on first query after a backend start).  Warm-path IPC round-trip
+ * is ~0.5ms but the planner cannot distinguish warm vs cold.  The
+ * conservative 1000 also ensures seqscan wins below ~5K rows, consistent
+ * with the pilot: CAGRA p50=871us at N=1K where seqscan is ~100us.
+ *
+ * ROWS_COST=0.00001 reflects CAGRA's near-N-independence: p50 grows from
+ * 871us (N=1K) to 1196us (N=1M) -- only 1.37x for a 1000x row increase.
+ * The non-zero term lets seqscan compete at N->0 without a hard cutoff.
+ *
+ * dim scaling is implicit: wider rows produce more pages, so seqscan cost
+ * grows automatically; CAGRA p50 rises only mildly (1228us at dim=384 ->
+ * 1605us at dim=1536 for N=100K, 1.31x), meaning GPU advantage widens
+ * at higher dimensions without any explicit dim term.
  * ---------------------------------------------------------------- */
 #define CUVS_STARTUP_COST      1000.0
-/* KNN returns ~k rows regardless of table size, so cost is dominated by the
- * requested top-k (cuvs.k), with only a weak table-size term. This keeps the
- * GPU path preferred over seqscan+sort on large tables. */
+/* CAGRA returns k rows regardless of N; the k-term keeps this cost above
+ * a pure-selectivity estimate and below seqscan for any practical k. */
 #define CUVS_K_COST            0.5
+/* Tiny N-term: CAGRA is ~N-independent but must not beat seqscan at N->0. */
 #define CUVS_ROWS_COST         0.00001
 
 /* PG16 amcostestimate is a direct C function pointer, not a SQL function.
@@ -989,7 +1026,8 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         get_index_dir(),
         heap_table_oid,
         heap_relfilenode,
-        (uint32_t)cuvs_shard_count);
+        (uint32_t)cuvs_shard_count,
+        cuvs_cpu_hnsw_fallback ? 1 : 0);  /* Phase 3I-1: serialize .hnsw sidecar */
 
     free(bs.vectors);
     free(bs.tids);
@@ -1407,6 +1445,7 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             dim, k, metric,
             (uint32_t)cuvs_shard_overfetch,
             cuvs_parallel_fanout ? 1 : 0,
+            cuvs_cpu_hnsw_fallback ? 1 : 0,  /* Phase 3I-1 */
             ss->tids,
             ss->distances,
             &ss->n_results,
@@ -1996,7 +2035,7 @@ pg_cuvs_last_search_metric(PG_FUNCTION_ARGS)
  * the view must stay queryable while the daemon restarts. (See plan: a
  * future liveness column can distinguish "down" from "idle".)
  * ---------------------------------------------------------------- */
-#define GPU_STATS_NCOLS 33
+#define GPU_STATS_NCOLS 34
 
 static const char *
 cuvs_metric_name(uint32_t metric)
@@ -2136,6 +2175,11 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
 
         /* Phase 3F: shard count (0/1 = unsharded). */
         values[32] = Int32GetDatum((int32) s->shard_count);
+
+        /* Phase 3I-1: last search mode for this index. */
+        values[33] = CStringGetTextDatum(
+            s->search_mode == 1 ? "cpu_hnsw" :
+            s->search_mode == 2 ? "cpu_fallback" : "gpu_cagra");
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

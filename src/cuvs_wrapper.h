@@ -113,6 +113,25 @@ int cuvs_cagra_search(
 void cuvs_cagra_free(CuvsCagraIndex index, int device_id);
 
 /*
+ * cuVS CPU HNSW index (Phase 3I-1)
+ *
+ * After CAGRA build, cuvs_hnsw_serialize() converts the GPU graph to a
+ * CPU hnswlib index and writes it to `path` (.hnsw sidecar).  The daemon
+ * can then load and search it without a GPU when cpu_hnsw_fallback is on.
+ */
+typedef void *CuvsHnswIndex;
+
+int           cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx,
+                                   const char *path, int device_id);
+CuvsHnswIndex cuvs_hnsw_deserialize(const char *path, int dim,
+                                     uint32_t metric, int device_id);
+/* ef <= 0 => use max(200, k) */
+int           cuvs_hnsw_search(CuvsHnswIndex hidx, const float *query,
+                                int dim, int k, int ef,
+                                CuvsSearchResult *out);
+void          cuvs_hnsw_free(CuvsHnswIndex hidx);
+
+/*
  * cuvs_cagra_serialize / cuvs_cagra_deserialize
  * Persist/restore a CAGRA index to/from a file path using cuVS native format.
  */

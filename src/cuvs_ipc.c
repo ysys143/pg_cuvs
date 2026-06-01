@@ -213,6 +213,7 @@ cuvs_ipc_search(
     uint32_t      metric,
     uint32_t      shard_overfetch,
     int           parallel_fanout,
+    uint32_t      use_cpu_hnsw,
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
@@ -250,6 +251,7 @@ cuvs_ipc_search(
         .n_vecs          = 0,
         .shard_overfetch = shard_overfetch,
         .parallel_fanout = (uint32_t)(parallel_fanout ? 1 : 0),
+        .use_cpu_hnsw    = use_cpu_hnsw,
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 
@@ -543,7 +545,8 @@ cuvs_ipc_build(
     const char    *index_dir,
     uint32_t       table_oid,
     uint32_t       relfilenode,
-    uint32_t       shard_count)
+    uint32_t       shard_count,
+    uint32_t       use_cpu_hnsw)
 {
     char shm_key[64];
     int  shm_fd = -1;
@@ -570,16 +573,17 @@ cuvs_ipc_build(
     }
 
     CuvsCmdFrame cmd = {
-        .op          = CUVS_OP_BUILD,
-        .db_oid      = db_oid,
-        .index_oid   = index_oid,
-        .k           = 0,
-        .metric      = metric,
-        .dim         = (uint32_t)dim,
-        .n_vecs      = n_vecs,
-        .table_oid   = table_oid,
-        .relfilenode = relfilenode,
-        .shard_count = shard_count,
+        .op           = CUVS_OP_BUILD,
+        .db_oid       = db_oid,
+        .index_oid    = index_oid,
+        .k            = 0,
+        .metric       = metric,
+        .dim          = (uint32_t)dim,
+        .n_vecs       = n_vecs,
+        .table_oid    = table_oid,
+        .relfilenode  = relfilenode,
+        .shard_count  = shard_count,
+        .use_cpu_hnsw = use_cpu_hnsw,  /* Phase 3I-1: 1 = serialize .hnsw sidecar */
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
 

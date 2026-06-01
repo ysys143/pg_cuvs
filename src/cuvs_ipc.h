@@ -65,6 +65,7 @@ typedef struct CuvsCmdFrame {
     uint32_t shard_count;   /* BUILD: Phase 3F; 0=auto (3G), 1=unsharded, >=2 = N shards */
     uint32_t shard_overfetch; /* SEARCH: Phase 3G; per-shard request k = k + this (recall slop) */
     uint32_t parallel_fanout; /* SEARCH: Phase 3G; 1 = dispatch shards concurrently, 0 = sequential */
+    uint32_t use_cpu_hnsw;  /* SEARCH: Phase 3I-1; 1 = use CPU HNSW instead of GPU CAGRA */
 } CuvsCmdFrame;
 
 /*
@@ -140,6 +141,8 @@ typedef struct CuvsIndexStats {
     uint32_t gpu_device_id;      /* CUDA device this index lives on; 0xFFFFFFFF if cold or sharded */
     /* Phase 3F: 0/1 = unsharded; >=2 = sharded logical index spanning N GPUs */
     uint32_t shard_count;
+    /* Phase 3I-1: 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback */
+    uint32_t search_mode;
 } CuvsIndexStats;
 
 /* ----------------------------------------------------------------
@@ -169,6 +172,7 @@ int cuvs_ipc_search(
     uint32_t      metric,
     uint32_t      shard_overfetch, /* Phase 3G: per-shard k+slop; ignored if unsharded */
     int           parallel_fanout, /* Phase 3G: 1=concurrent shard dispatch, 0=sequential */
+    uint32_t      use_cpu_hnsw,    /* Phase 3I-1: 1=prefer CPU HNSW over GPU CAGRA */
     uint64_t     *tids_out,
     float        *dist_out,
     int          *n_out,
@@ -196,7 +200,8 @@ int cuvs_ipc_build(
     const char    *index_dir,   /* daemon saves index here */
     uint32_t       table_oid,   /* heap relation OID */
     uint32_t       relfilenode, /* heap relfilenode (heap compat identity) */
-    uint32_t       shard_count  /* Phase 3F: 0/1 = unsharded, >=2 = N shards */
+    uint32_t       shard_count, /* Phase 3F: 0/1 = unsharded, >=2 = N shards */
+    uint32_t       use_cpu_hnsw /* Phase 3I-1: 1 = serialize .hnsw sidecar */
 );
 
 /*

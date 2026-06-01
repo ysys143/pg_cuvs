@@ -123,7 +123,8 @@ CREATE FUNCTION pg_cuvs_gpu_search_stats(
     OUT download_count     bigint,
     OUT cache_miss_count   bigint,
     OUT gpu_device_id      integer,
-    OUT shard_count        integer
+    OUT shard_count        integer,
+    OUT search_mode        text
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_search_stats'
@@ -210,3 +211,27 @@ COMMENT ON VIEW pg_stat_gpu_shards IS
   'GPU CAGRA per-shard view (Phase 3F): which GPU each shard of a sharded '
   'logical index is resident on, its global TID range, VRAM, and per-shard '
   'search/error counts. Empty for unsharded indexes or while the daemon is down.';
+
+-- ----------------------------------------------------------------
+-- pg_cuvs_import_hnsw(cagra_oid regclass, hnsw_oid regclass)
+-- Phase 3I-2: read .hnsw sidecar (hnswlib binary) written alongside a
+-- CAGRA index and bulk-write a pgvector-compatible HNSW index into an
+-- existing pgvector HNSW relation.  The target relation is truncated and
+-- fully rebuilt from the sidecar; call this only on an offline index.
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_import_hnsw(cagra_oid regclass, hnsw_oid regclass)
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_import_hnsw'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_import_hnsw(regclass, regclass) IS
+  'Phase 3I-2: Import the hnswlib binary sidecar written alongside a CAGRA '
+  'index into an existing pgvector HNSW index relation. '
+  'OFFLINE OPERATION: acquires AccessExclusiveLock on the target HNSW index, '
+  'blocking all concurrent queries against it until the transaction commits. '
+  'Requires pgvector 0.5.0+. Validates AM type, dimension, and metric before '
+  'truncating. Crash-safe via WAL full-page images (log_newpage_buffer). '
+  'UNLOGGED target: if the target HNSW index is UNLOGGED, WAL is skipped for '
+  'faster import (~2x); index is lost on crash and must be rebuilt. '
+  'Example: SELECT pg_cuvs_import_hnsw(''my_cagra_idx''::regclass, '
+  '''my_hnsw_idx''::regclass);';

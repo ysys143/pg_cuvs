@@ -1,0 +1,18 @@
+-- pg_cuvs upgrade: 0.1.0 → 0.2.0
+--
+-- This file is intentionally minimal.  It exists as a placeholder so
+-- `ALTER EXTENSION pg_cuvs UPDATE TO '0.2.0'` succeeds once the 0.2.0
+-- release is ready.  Actual migration steps will be added here when
+-- 0.2.0 features are finalized.
+--
+-- Upgrade notes:
+--   - pg_cuvs_import_hnsw is unchanged; no migration needed.
+--   - GUCs added in 0.2.0 get their defaults on first use; no ALTER needed.
+--   - If pg_stat_gpu_search column layout changes, drop and recreate the view:
+--       DROP VIEW IF EXISTS pg_stat_gpu_search;
+--       CREATE VIEW pg_stat_gpu_search AS ...;  -- new definition
+--
+-- Usage:
+--   ALTER EXTENSION pg_cuvs UPDATE TO '0.2.0';
+
+-- (no-op for now)

@@ -12,21 +12,23 @@
 # ---- PGXS configuration -------------------------------------------------
 EXTENSION      = pg_cuvs
 EXTVERSION     = 0.1.0
-DATA           = sql/pg_cuvs--$(EXTVERSION).sql
+DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
+                 sql/pg_cuvs--0.1.0--0.2.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback hnsw_import hnsw_edge_cases
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
 CUDA_ARCH     ?= sm_80
 NVCC_FLAGS    ?= -O3 --compiler-options '-fPIC' -arch=$(CUDA_ARCH) -std=c++17 \
-                 -DRAFT_SYSTEM_LITTLE_ENDIAN=1
+                 -DRAFT_SYSTEM_LITTLE_ENDIAN=1 \
+                 -DCUVS_BUILD_CAGRA_HNSWLIB
 
 # cuVS / RAPIDS install root (conda env activates default)
 CUVS_PREFIX   ?= $(CONDA_PREFIX)
@@ -143,6 +145,20 @@ test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_i
 	./test-unit
 
 .PHONY: test-unit
+
+# ---- No-GPU regression target -------------------------------------------
+# Runs the subset of tests that do NOT require a live GPU daemon.
+# Currently this is just the C-level unit tests (test-unit).
+#
+# All pgregress tests (smoke, cpu_fallback, hnsw_import, …) require a running
+# pg_cuvs_server daemon and therefore a GPU.  Use `make installcheck` on the
+# GPU VM for the full suite.
+#
+# Intended for CI jobs on standard (CPU-only) runners — see .github/workflows/ci.yml.
+installcheck-nogpu: test-unit
+	@echo "[OK] No-GPU checks passed (test-unit)"
+
+.PHONY: installcheck-nogpu
 
 # ---- Benchmark harness (Phase 1.5 #5) ----------------------------------
 # Parameterized large-dataset benchmark. Runs the bash harness; N/DIM/K/M

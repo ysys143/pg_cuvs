@@ -123,6 +123,10 @@ typedef struct IndexEntry {
     char            last_error[128];
     WarmupState      warmup_state;     /* Phase 3D: WARMUP_HOT for resident indexes */
     uint32_t        gpu_device_id;    /* Phase 3E: which CUDA device this index lives on */
+
+    /* Phase 3I-1: CPU HNSW fallback. Loaded lazily when use_cpu_hnsw=1. */
+    CuvsHnswIndex   hnsw_idx;        /* NULL until first cpu_hnsw search request */
+    uint32_t        last_search_mode; /* 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -540,6 +544,14 @@ tids_file_path(char *out, size_t outlen,
                const char *dir, uint32_t db_oid, uint32_t index_oid)
 {
     snprintf(out, outlen, "%s/%u_%u.tids", dir, db_oid, index_oid);
+}
+
+/* Phase 3I-1: CPU HNSW fallback sidecar. */
+static void
+hnsw_file_path(char *out, size_t outlen,
+               const char *dir, uint32_t db_oid, uint32_t index_oid)
+{
+    snprintf(out, outlen, "%s/%u_%u.hnsw", dir, db_oid, index_oid);
 }
 
 /* Sidecar marking an index stale; persists staleness across daemon restarts. */
@@ -1363,6 +1375,9 @@ evict_lru(int device_id)
         freed = e->vram_bytes;
     }
 
+    /* Phase 3I-1: free CPU HNSW sidecar (RAM-only; no VRAM). */
+    if (e->hnsw_idx) { cuvs_hnsw_free(e->hnsw_idx); e->hnsw_idx = NULL; }
+
     int idx = (int)(e - g_indexes);
     for (int i = idx; i < g_n_indexes - 1; i++)
         g_indexes[i] = g_indexes[i+1];
@@ -1908,6 +1923,75 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* Phase 3I-1: CPU HNSW path — bypass GPU CAGRA when requested. */
+    if (cmd->use_cpu_hnsw)
+    {
+        /* Lazy-load the .hnsw sidecar into RAM (held in e->hnsw_idx). */
+        if (!e->hnsw_idx)
+        {
+            char hp[512];
+            hnsw_file_path(hp, sizeof(hp), g_index_dir, e->db_oid, e->index_oid);
+            e->hnsw_idx = cuvs_hnsw_deserialize(hp, (int)e->dim, e->metric,
+                                                 (int)e->gpu_device_id);
+            if (!e->hnsw_idx)
+                LOG_WARN("[handle_search] HNSW sidecar not loadable for %u/%u; "
+                         "using GPU CAGRA\n", e->db_oid, e->index_oid);
+        }
+        if (e->hnsw_idx)
+        {
+            CuvsSearchResult *hraw = malloc((size_t)k * sizeof(CuvsSearchResult));
+            if (!hraw)
+            {
+                munmap(query, vec_bytes);
+                pthread_mutex_unlock(&g_index_mutex);
+                send_error(client_fd, "malloc failed");
+                return;
+            }
+            int hret = cuvs_hnsw_search(e->hnsw_idx, query, (int)cmd->dim,
+                                         k, 0, hraw);
+            if (hret == 0)
+            {
+                CuvsResult *hresults = malloc((size_t)k * sizeof(CuvsResult));
+                int hn_valid = 0;
+                if (hresults)
+                {
+                    for (int i = 0; i < k; i++)
+                    {
+                        int64_t id = hraw[i].item_id;
+                        if (id < 0 || id >= e->n_vecs) continue;
+                        hresults[hn_valid].tid      = e->tids[id];
+                        hresults[hn_valid].distance = hraw[i].distance;
+                        hn_valid++;
+                    }
+                }
+                free(hraw);
+                munmap(query, vec_bytes);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                uint32_t hlat = (uint32_t)((t1.tv_sec  - t0.tv_sec)  * 1000000 +
+                                           (t1.tv_nsec - t0.tv_nsec) / 1000);
+                record_search_stat(e, CUVS_STATUS_OK, hlat, NULL);
+                e->last_requested_k  = cmd->k;
+                e->last_returned_k   = (uint32_t)hn_valid;
+                e->last_search_mode  = 1; /* cpu_hnsw */
+                pthread_mutex_unlock(&g_index_mutex);
+                CuvsReplyHeader hdr = {0};
+                hdr.status     = CUVS_STATUS_OK;
+                hdr.n_results  = (uint32_t)hn_valid;
+                hdr.latency_us = hlat;
+                send_all(client_fd, &hdr, sizeof(hdr));
+                if (hn_valid > 0 && hresults)
+                    send_all(client_fd, hresults,
+                             (size_t)hn_valid * sizeof(CuvsResult));
+                free(hresults);
+                return;
+            }
+            /* HNSW search failed -> fall through to GPU CAGRA. */
+            free(hraw);
+            LOG_WARN("[handle_search] cuvs_hnsw_search failed for %u/%u; "
+                     "retrying with GPU CAGRA\n", e->db_oid, e->index_oid);
+        }
+    }
+
     CuvsSearchResult *raw = malloc(k * sizeof(CuvsSearchResult));
     if (!raw)
     {
@@ -2017,6 +2101,7 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
     e->last_requested_k = cmd->k;
     e->last_returned_k  = (uint32_t)n_valid;
+    e->last_search_mode = 0; /* gpu_cagra */
 
     pthread_mutex_unlock(&g_index_mutex);
 
@@ -2847,6 +2932,23 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     LOG_DEBUG("[handle_build] disk commit OK\n");
 
+    /* Phase 3I-1: write CPU HNSW fallback sidecar — only when the backend
+     * requested it (cuvs.cpu_hnsw_fallback=on or a 3I import_hnsw flow).
+     * Skipping this for CAGRA-only builds avoids ~30s of from_cagra() CPU
+     * work that would never be used. */
+    if (cmd->use_cpu_hnsw)
+    {
+        char hnsw_path[512];
+        hnsw_file_path(hnsw_path, sizeof(hnsw_path), save_dir,
+                       cmd->db_oid, cmd->index_oid);
+        if (cuvs_hnsw_serialize(new_handle, hnsw_path, target_gpu) != 0)
+            LOG_WARN("[handle_build] HNSW fallback sidecar not saved for %u/%u\n",
+                     cmd->db_oid, cmd->index_oid);
+        else
+            LOG_INFO("pg_cuvs_server: saved HNSW fallback %u/%u\n",
+                     cmd->db_oid, cmd->index_oid);
+    }
+
     /* --- Swap into registry --- */
     IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
     if (existing) {
@@ -2873,6 +2975,9 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         /* The rebuilt base obsoletes the old delta cache (the backend unlinks
          * .delta on a successful build); drop the resident GPU delta now. */
         free_delta_cache(existing);
+        /* Phase 3I-1: drop cached CPU HNSW (new sidecar was just written). */
+        if (existing->hnsw_idx) { cuvs_hnsw_free(existing->hnsw_idx); existing->hnsw_idx = NULL; }
+        existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
     } else {
         if (g_n_indexes >= MAX_INDEXES)
@@ -2907,6 +3012,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
         e->gpu_device_id = (uint32_t)target_gpu;
         e->shard_count = 0;     /* unsharded; slot may be reused post-eviction */
         e->shards      = NULL;
+        e->hnsw_idx    = NULL;  /* Phase 3I-1: loaded lazily on first cpu_hnsw request */
+        e->last_search_mode = 0;
         reset_entry_stats(e);
     }
 
@@ -3037,6 +3144,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->cache_miss_count   = 0;
         s->gpu_device_id      = e->gpu_device_id;   /* 0xFFFFFFFF when sharded */
         s->shard_count        = (uint32_t)e->shard_count;
+        s->search_mode        = e->last_search_mode; /* Phase 3I-1 */
     }
 
     /* Phase 3D: also emit cold (not-yet-resident) entries so operators can

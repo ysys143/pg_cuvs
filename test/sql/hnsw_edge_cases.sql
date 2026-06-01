@@ -1,0 +1,145 @@
+-- hnsw_edge_cases.sql — Phase 3I safety/edge-case coverage.
+--
+-- Tests:
+--   1. Small index (n_vecs < 16): no .hnsw sidecar generated;
+--      cpu_hnsw_fallback=on gracefully degrades to GPU CAGRA (no error).
+--   2. Non-HNSW target: pg_cuvs_import_hnsw rejected before truncation.
+--   3. Dimension mismatch: pg_cuvs_import_hnsw rejected before truncation.
+--
+-- REQUIRES: pg_cuvs_server running with GPU, cuvs.index_dir writable.
+-- NOTE: No \set ON_ERROR_STOP on — expected errors use BEGIN/SAVEPOINT/ROLLBACK.
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- ============================================================
+-- Case 1: small index (4 vecs) — no .hnsw sidecar generated.
+-- cpu_hnsw_fallback=on must NOT error; must fall back to GPU.
+-- ============================================================
+CREATE TABLE ec_small (id bigint, embedding vector(4));
+INSERT INTO ec_small VALUES (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),
+                             (3,'[0,0,1,0]'),(4,'[0,0,0,1]');
+CREATE INDEX ec_small_cagra ON ec_small USING cagra (embedding vector_l2_ops);
+
+SET enable_seqscan = off;
+SET cuvs.cpu_hnsw_fallback = on;
+
+-- Must return results without error (GPU CAGRA fallback).
+SELECT count(*) AS small_rows
+FROM (SELECT id FROM ec_small
+      ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 4) s;
+
+-- search_mode must be 'gpu_cagra' — .hnsw was not created (n_vecs < 16).
+SELECT search_mode
+FROM pg_stat_gpu_search
+WHERE index_name = 'ec_small_cagra';
+
+RESET cuvs.cpu_hnsw_fallback;
+RESET enable_seqscan;
+DROP TABLE ec_small;
+
+-- ============================================================
+-- Case 2: pg_cuvs_import_hnsw with non-HNSW target (btree).
+-- Expect: ERROR "not a pgvector HNSW index".
+-- ============================================================
+CREATE TABLE ec_nothnsw (id bigint, embedding vector(4));
+INSERT INTO ec_nothnsw SELECT i, ('[' || (i*0.05) || ',0,0,0]')::vector
+                        FROM generate_series(1,20) i;
+CREATE INDEX ec_nothnsw_cagra ON ec_nothnsw USING cagra (embedding vector_l2_ops);
+CREATE INDEX ec_nothnsw_btree ON ec_nothnsw (id);
+
+BEGIN;
+SAVEPOINT sp_nothnsw;
+SELECT pg_cuvs_import_hnsw('ec_nothnsw_cagra'::regclass,
+                             'ec_nothnsw_btree'::regclass);
+ROLLBACK TO SAVEPOINT sp_nothnsw;
+COMMIT;
+
+DROP TABLE ec_nothnsw;
+
+-- ============================================================
+-- Case 3: pg_cuvs_import_hnsw with dimension mismatch.
+-- Expect: ERROR "dimension mismatch".
+-- ============================================================
+CREATE TABLE ec_src4 (id bigint, embedding vector(4));
+CREATE TABLE ec_tgt2 (id bigint, embedding vector(2));
+INSERT INTO ec_src4 SELECT i, ('[' || (i*0.05) || ',0,0,0]')::vector
+                    FROM generate_series(1,20) i;
+INSERT INTO ec_tgt2 VALUES (1,'[1,0]'),(2,'[0,1]');
+
+CREATE INDEX ec_src4_cagra ON ec_src4 USING cagra (embedding vector_l2_ops);
+CREATE INDEX ec_tgt2_hnsw  ON ec_tgt2 USING hnsw  (embedding vector_l2_ops);
+
+BEGIN;
+SAVEPOINT sp_dimmatch;
+SELECT pg_cuvs_import_hnsw('ec_src4_cagra'::regclass,
+                             'ec_tgt2_hnsw'::regclass);
+ROLLBACK TO SAVEPOINT sp_dimmatch;
+COMMIT;
+
+DROP TABLE ec_src4;
+DROP TABLE ec_tgt2;
+
+-- ============================================================
+-- Case 4: pg_cuvs_import_hnsw with opclass/metric mismatch.
+-- CAGRA built with L2, target HNSW built with cosine.
+-- Expect: ERROR "metric mismatch".
+-- ============================================================
+CREATE TABLE ec_metric (id bigint, embedding vector(4));
+INSERT INTO ec_metric SELECT i, ('[' || (i*0.05) || ',0,0,0]')::vector
+                       FROM generate_series(1,20) i;
+-- cpu_hnsw_fallback=on during build so the .hnsw sidecar is created,
+-- allowing pg_cuvs_import_hnsw to reach the metric-mismatch check.
+SET cuvs.cpu_hnsw_fallback = on;
+CREATE INDEX ec_metric_cagra ON ec_metric USING cagra (embedding vector_l2_ops);
+SET cuvs.cpu_hnsw_fallback = off;
+CREATE INDEX ec_metric_hnsw  ON ec_metric USING hnsw  (embedding vector_cosine_ops);
+
+BEGIN;
+SAVEPOINT sp_metric;
+SELECT pg_cuvs_import_hnsw('ec_metric_cagra'::regclass,
+                             'ec_metric_hnsw'::regclass);
+ROLLBACK TO SAVEPOINT sp_metric;
+COMMIT;
+
+DROP TABLE ec_metric;
+
+-- ============================================================
+-- Case 5: VACUUM on imported HNSW — must complete without error.
+-- ============================================================
+CREATE TABLE ec_ddl (id bigint, embedding vector(4));
+INSERT INTO ec_ddl SELECT i, ('[' || (i*0.05) || ',0,0,0]')::vector
+                   FROM generate_series(1,20) i;
+-- cpu_hnsw_fallback=on during build so the .hnsw sidecar is created.
+SET cuvs.cpu_hnsw_fallback = on;
+CREATE INDEX ec_ddl_cagra ON ec_ddl USING cagra (embedding vector_l2_ops);
+SET cuvs.cpu_hnsw_fallback = off;
+CREATE INDEX ec_ddl_hnsw  ON ec_ddl USING hnsw  (embedding vector_l2_ops);
+SET client_min_messages = 'warning';
+SELECT pg_cuvs_import_hnsw('ec_ddl_cagra'::regclass, 'ec_ddl_hnsw'::regclass);
+SET client_min_messages = 'notice';
+
+VACUUM ec_ddl;
+
+-- HNSW still queryable after VACUUM.
+SET enable_cuvs = off;
+SELECT count(*) AS post_vacuum_rows
+FROM (SELECT id FROM ec_ddl ORDER BY embedding <-> '[0.5,0,0,0]'::vector LIMIT 5) s;
+SET enable_cuvs = on;
+
+-- ============================================================
+-- Case 6: REINDEX on imported HNSW — rebuilds via pgvector path.
+-- ============================================================
+REINDEX INDEX ec_ddl_hnsw;
+
+-- Still queryable after REINDEX.
+SET enable_cuvs = off;
+SELECT count(*) AS post_reindex_rows
+FROM (SELECT id FROM ec_ddl ORDER BY embedding <-> '[0.5,0,0,0]'::vector LIMIT 5) s;
+SET enable_cuvs = on;
+
+DROP TABLE ec_ddl;
+
+-- Cleanup.
+DROP EXTENSION pg_cuvs;

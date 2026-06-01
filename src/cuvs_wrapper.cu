@@ -15,6 +15,7 @@
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
+#include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
 #include <raft/core/device_resources.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
@@ -139,6 +140,15 @@ struct CuvsCagraIndexImpl {
 /* Forward decl: defined below, but cuvs_brute_force_search / cuvs_bf_build (above
  * the definition) need the metric -> cuVS DistanceType mapping. */
 static cuvs::distance::DistanceType cuvs_distance_type(uint32_t metric);
+
+/* Phase 3I-1: CPU HNSW index (hnswlib-backed via cuVS).
+ * from_cagra() returns unique_ptr; deserialize() returns raw ptr via out-param.
+ * We store a raw ptr and delete in cuvs_hnsw_free. */
+struct CuvsHnswIndexImpl {
+    cuvs::neighbors::hnsw::index<float> *idx; /* owned; delete in free */
+    int     dim;
+    uint32_t metric;
+};
 
 /* Opaque resident brute-force index (Phase 3B delta cache). Like CAGRA, the
  * dataset must outlive the index, so we retain d_corpus alongside it; n bounds
@@ -591,6 +601,135 @@ cuvs_cagra_free(CuvsCagraIndex index, int device_id)
             fprintf(stderr, "[cuvs_cagra_free] cudaSetDevice(%d) failed\n", device_id);
         delete static_cast<CuvsCagraIndexImpl *>(index);
     }
+}
+
+/* ----------------------------------------------------------------
+ * Phase 3I-1 — CPU HNSW fallback index
+ *
+ * cuvs_hnsw_serialize: convert a resident CAGRA GPU index to CPU HNSW
+ * (hnswlib format) and write to disk.  Called once after a successful CAGRA
+ * build; non-fatal if it fails (daemon continues with GPU-only serving).
+ *
+ * cuvs_hnsw_deserialize: load a .hnsw sidecar from disk.  Called lazily in
+ * handle_search when use_cpu_hnsw=1 is requested and the index is not yet in
+ * RAM.  hnswlib itself is CPU-threaded; the raft resource is only needed for
+ * the cuVS API wrapper, not for GPU work.
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_hnsw_serialize(CuvsCagraIndex cagra_idx, const char *path, int device_id)
+{
+    if (!cagra_idx || !path) return -1;
+    CuvsCagraIndexImpl *cimpl = static_cast<CuvsCagraIndexImpl *>(cagra_idx);
+    /* hnswlib aborts on very small graphs; skip serialization rather than crash.
+     * The CAGRA index remains functional for GPU search. */
+    if (cimpl->idx.size() < 16) {
+        fprintf(stderr, "[cuvs_hnsw_serialize] skip: n_vecs=%zu < 16 (too small for hnswlib)\n",
+                cimpl->idx.size());
+        return 0;
+    }
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+        cuvs::neighbors::hnsw::index_params hparams;
+        /* CPU hierarchy produces an hnswlib-compatible file on disk,
+         * required for both Phase 3I-1 (cuVS CPU search) and 3I-2
+         * (pgvector bulk import via our own hnswlib parser). */
+        hparams.hierarchy = cuvs::neighbors::hnsw::HnswHierarchy::CPU;
+        auto hnsw = cuvs::neighbors::hnsw::from_cagra(
+            res, hparams, cimpl->idx);
+        res.sync_stream();
+        cuvs::neighbors::hnsw::serialize(res, std::string(path), *hnsw);
+        return 0;
+    } catch (const std::exception &e) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_serialize] %s\n", e.what());
+        return -1;
+    } catch (...) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_serialize] unknown exception\n");
+        return -1;
+    }
+}
+
+extern "C" CuvsHnswIndex
+cuvs_hnsw_deserialize(const char *path, int dim, uint32_t metric, int device_id)
+{
+    if (!path) return nullptr;
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+        cuvs::neighbors::hnsw::index_params hparams;
+        hparams.hierarchy = cuvs::neighbors::hnsw::HnswHierarchy::CPU;
+        cuvs::neighbors::hnsw::index<float> *loaded = nullptr;
+        cuvs::neighbors::hnsw::deserialize(res, hparams, std::string(path),
+                                           dim, cuvs_distance_type(metric),
+                                           &loaded);
+        if (!loaded) return nullptr;
+        CuvsHnswIndexImpl *impl = new CuvsHnswIndexImpl;
+        impl->idx    = loaded;
+        impl->dim    = dim;
+        impl->metric = metric;
+        return impl;
+    } catch (const std::exception &e) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_deserialize] %s\n", e.what());
+        return nullptr;
+    } catch (...) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_deserialize] unknown exception\n");
+        return nullptr;
+    }
+}
+
+/* Single-query CPU HNSW search.  ef <= 0 uses max(200, k). */
+extern "C" int
+cuvs_hnsw_search(CuvsHnswIndex hidx, const float *query, int dim,
+                 int k, int ef, CuvsSearchResult *out)
+{
+    if (!hidx || !query || !out || k <= 0) return -1;
+    CuvsHnswIndexImpl *impl = static_cast<CuvsHnswIndexImpl *>(hidx);
+    PooledRes _pr(0);   /* raft API requires a resource; hnswlib ignores CUDA */
+    try {
+        raft::device_resources &res = _pr.get();
+        cuvs::neighbors::hnsw::search_params sparams;
+        sparams.ef = (ef > 0) ? ef : std::max(200, k);
+
+        /* search() returns uint64_t neighbors (hnswlib labels). */
+        std::vector<uint64_t> h_nb((size_t)k, UINT64_MAX);
+        std::vector<float>    h_dist((size_t)k, 0.0f);
+
+        auto q_view = raft::make_host_matrix_view<const float, int64_t>(
+            query, (int64_t)1, (int64_t)impl->dim);
+        auto n_view = raft::make_host_matrix_view<uint64_t, int64_t>(
+            h_nb.data(), (int64_t)1, (int64_t)k);
+        auto d_view = raft::make_host_matrix_view<float, int64_t>(
+            h_dist.data(), (int64_t)1, (int64_t)k);
+
+        cuvs::neighbors::hnsw::search(res, sparams, *impl->idx,
+                                       q_view, n_view, d_view);
+        for (int i = 0; i < k; i++) {
+            out[i].item_id  = (int64_t)h_nb[i];   /* item_id is int64 in CuvsSearchResult */
+            out[i].distance = h_dist[i];
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_search] %s\n", e.what());
+        return -1;
+    } catch (...) {
+        _pr.poison();
+        fprintf(stderr, "[cuvs_hnsw_search] unknown exception\n");
+        return -1;
+    }
+}
+
+extern "C" void
+cuvs_hnsw_free(CuvsHnswIndex hidx)
+{
+    if (!hidx) return;
+    CuvsHnswIndexImpl *impl = static_cast<CuvsHnswIndexImpl *>(hidx);
+    delete impl->idx;   /* raw ptr returned by deserialize / released from unique_ptr */
+    delete impl;
 }
 
 /* ----------------------------------------------------------------
