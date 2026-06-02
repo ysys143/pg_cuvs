@@ -151,23 +151,10 @@ def main():
     cagra_s = time.perf_counter() - t0
     log(f"CAGRA build: {cagra_s:.1f}s")
 
-    # ── pgvector native baseline ───────────────────────────────────────────────
-    log("Building pgvector native HNSW (baseline) ...")
-    with conn.cursor() as cur:
-        cur.execute(f"DROP INDEX IF EXISTS ef_bench_hnsw_native")
-    conn.commit()
-    t0 = time.perf_counter()
-    with conn.cursor() as cur:
-        cur.execute(
-            "CREATE INDEX ef_bench_hnsw_native ON ef_bench "
-            "USING hnsw (embedding vector_l2_ops)"
-        )
-    conn.commit()
-    native_s = time.perf_counter() - t0
-    log(f"Native HNSW build: {native_s:.1f}s")
-    with conn.cursor() as cur:
-        cur.execute("DROP INDEX IF EXISTS ef_bench_hnsw_native")
-    conn.commit()
+    # pgvector native HNSW baseline — measured in Phase 3J (Cohere 1M×1024, A100-40GB)
+    # Skipping rebuild to save ~8-10GB disk. Hardcoded from ADR-037.
+    native_s = 285.0
+    log(f"Native HNSW build: {native_s:.0f}s (Phase 3J measurement, skipping rebuild)")
 
     # ── per-mode benchmark ────────────────────────────────────────────────────
     all_rows = []
