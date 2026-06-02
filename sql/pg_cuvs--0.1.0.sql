@@ -256,6 +256,27 @@ RETURNS void
 AS '$libdir/pg_cuvs', 'pg_cuvs_import_cagra'
 LANGUAGE C;
 
+-- ----------------------------------------------------------------
+-- pg_cuvs_import(cagra_oid, mode) — unified GPU import (no CPU HNSW build)
+-- Creates HNSW index on parent table WITHOUT running pgvector's CPU ambuild.
+-- mode: 'nsw'|'hnsw'|'hnswlib'|'hnswlib_file'
+-- Returns: OID of newly created HNSW index (regclass).
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_import(
+    cagra_oid regclass,
+    mode      text DEFAULT 'hnsw'
+)
+RETURNS regclass
+AS '$libdir/pg_cuvs', 'pg_cuvs_import'
+LANGUAGE C;
+
+COMMENT ON FUNCTION pg_cuvs_import(regclass, text) IS
+  'Unified GPU import: creates pgvector HNSW index WITHOUT running '
+  'pgvector CPU build (285s eliminated). Uses INDEX_CREATE_SKIP_BUILD. '
+  'mode: nsw (flat NSW), hnsw (hierarchical+heuristic), '
+  'hnswlib (/dev/shm, no disk), hnswlib_file (disk sidecar). '
+  'Returns OID of the newly created HNSW index.';
+
 COMMENT ON FUNCTION pg_cuvs_import_cagra(regclass, regclass, text) IS
   'Phase 3J: Direct CAGRA graph import into pgvector HNSW format. '
   'Fetches CAGRA adjacency + corpus vectors from daemon via IPC (no .hnsw file, '

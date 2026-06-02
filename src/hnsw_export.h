@@ -33,6 +33,13 @@ Datum pg_cuvs_import_hnsw(PG_FUNCTION_ARGS);
  * pg_cuvs_import_hnsw() which produces a multi-level graph.
  */
 /*
- * mode: 'nsw' = flat (level 0 only), 'hnsw' = hierarchical (level assignment)
+ * mode: 'nsw' = flat (level 0 only), 'hnsw' = hierarchical (heuristic selection)
  */
 Datum pg_cuvs_import_cagra(PG_FUNCTION_ARGS);
+
+/*
+ * pg_cuvs_import(cagra_oid, mode) — unified GPU import.
+ * Creates HNSW index on parent table WITHOUT calling pgvector CPU build.
+ * Returns OID of new HNSW index.
+ */
+Datum pg_cuvs_import(PG_FUNCTION_ARGS);

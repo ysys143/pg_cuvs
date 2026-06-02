@@ -44,9 +44,13 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/builtins.h"
+#include "catalog/index.h"       /* index_create, INDEX_CREATE_SKIP_BUILD, BuildIndexInfo */
 #include "commands/defrem.h"     /* get_am_oid */
+#include "executor/spi.h"        /* SPI_connect, SPI_exec, SPI_finish */
 #include "commands/extension.h"  /* get_extension_oid */
 #include "miscadmin.h"
+#include "nodes/pg_list.h"       /* list_make1 */
+#include "access/genam.h"        /* GetSysCacheOid3 */
 
 #include <math.h>
 #include <stdio.h>
@@ -1574,4 +1578,169 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
                     cagra_oid, hnsw_oid)));
 
     PG_RETURN_VOID();
+}
+
+/* ================================================================
+ * pg_cuvs_import — unified GPU import: creates HNSW WITHOUT CPU build.
+ *
+ * Uses INDEX_CREATE_SKIP_BUILD so pgvector's CPU ambuild() is never called.
+ * The 285s CPU HNSW build is eliminated entirely.
+ *
+ * Usage: SELECT pg_cuvs_import('my_cagra'::regclass, 'hnsw');
+ * Returns: OID of the newly created HNSW index (regclass).
+ * ================================================================ */
+
+/* ---- find HNSW opclass OID by metric ---- */
+static Oid
+find_hnsw_opclass_oid(uint32_t metric)
+{
+    const char *opcname;
+    switch (metric) {
+        case CUVS_METRIC_COSINE: opcname = "vector_cosine_ops"; break;
+        case CUVS_METRIC_IP:     opcname = "vector_ip_ops";     break;
+        default:                  opcname = "vector_l2_ops";     break;
+    }
+    Oid hnsw_amoid = get_am_oid("hnsw", true);
+    if (!OidIsValid(hnsw_amoid))
+        ereport(ERROR, (errmsg("pg_cuvs: pgvector hnsw AM not found")));
+
+    Relation    opcrel = table_open(OperatorClassRelationId, AccessShareLock);
+    SysScanDesc sc     = systable_beginscan(opcrel, InvalidOid, false, NULL, 0, NULL);
+    HeapTuple   tup;
+    Oid         result = InvalidOid;
+    while (HeapTupleIsValid(tup = systable_getnext(sc))) {
+        Form_pg_opclass opc = (Form_pg_opclass) GETSTRUCT(tup);
+        if (opc->opcmethod == hnsw_amoid &&
+            strcmp(NameStr(opc->opcname), opcname) == 0) {
+            result = opc->oid;
+            break;
+        }
+    }
+    systable_endscan(sc);
+    table_close(opcrel, AccessShareLock);
+
+    if (!OidIsValid(result))
+        ereport(ERROR,
+                (errmsg("pg_cuvs: HNSW opclass '%s' not found; install pgvector",
+                        opcname)));
+    return result;
+}
+
+/* ---- detect CAGRA metric from its opclass name ---- */
+static uint32_t
+cagra_index_metric(Oid cagra_oid)
+{
+    HeapTuple idxtup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(cagra_oid));
+    if (!HeapTupleIsValid(idxtup)) return CUVS_METRIC_L2;
+    bool isnull = false;
+    Datum d   = SysCacheGetAttr(INDEXRELID, idxtup, Anum_pg_index_indclass, &isnull);
+    oidvector *ov = (oidvector *) DatumGetPointer(d);
+    Oid cagra_opc = ov->values[0];
+    ReleaseSysCache(idxtup);
+
+    HeapTuple opctup = SearchSysCache1(CLAOID, ObjectIdGetDatum(cagra_opc));
+    if (!HeapTupleIsValid(opctup)) return CUVS_METRIC_L2;
+    const char *nm = NameStr(((Form_pg_opclass) GETSTRUCT(opctup))->opcname);
+    uint32_t metric = CUVS_METRIC_L2;
+    if (strstr(nm, "cosine"))   metric = CUVS_METRIC_COSINE;
+    else if (strstr(nm, "_ip")) metric = CUVS_METRIC_IP;
+    ReleaseSysCache(opctup);
+    return metric;
+}
+
+/* ---- create empty HNSW on parent table, no CPU build ---- */
+static Oid
+create_empty_hnsw(Oid cagra_oid)
+{
+    HeapTuple ix_tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(cagra_oid));
+    if (!HeapTupleIsValid(ix_tup))
+        ereport(ERROR, (errmsg("pg_cuvs: CAGRA index %u not found", cagra_oid)));
+    Oid heap_oid = ((Form_pg_index) GETSTRUCT(ix_tup))->indrelid;
+    ReleaseSysCache(ix_tup);
+
+    uint32_t metric       = cagra_index_metric(cagra_oid);
+    Oid      hnsw_opclass = find_hnsw_opclass_oid(metric);
+
+    Relation heap_rel  = table_open(heap_oid, ShareLock);
+    Relation cagra_rel = index_open(cagra_oid, AccessShareLock);
+
+    AttrNumber col_attnum = cagra_rel->rd_index->indkey.values[0];
+    Form_pg_attribute att = TupleDescAttr(heap_rel->rd_att, col_attnum - 1);
+    char  *col_name  = pstrdup(NameStr(att->attname));
+    Oid    collation = att->attcollation;
+    int16  coloption = 0;
+
+    IndexInfo *iinfo = BuildIndexInfo(cagra_rel);
+    iinfo->ii_Predicate      = NIL;
+    iinfo->ii_PredicateState = NULL;
+
+    index_close(cagra_rel, AccessShareLock);
+
+    char *idx_name = psprintf("pg_cuvs_hnsw_%u", cagra_oid);
+
+    /* INDEX_CREATE_SKIP_BUILD: catalog entries created, ambuild() skipped.
+     * pgvector CPU build (285s for 1M×1024) is never called. */
+    Oid hnsw_oid = index_create(
+        heap_rel,
+        idx_name,
+        InvalidOid,
+        InvalidOid,
+        InvalidOid,
+        InvalidRelFileNumber,
+        iinfo,
+        list_make1(makeString(col_name)),
+        get_am_oid("hnsw", false),
+        DEFAULTTABLESPACE_OID,
+        &collation,
+        &hnsw_opclass,
+        &coloption,
+        NULL,
+        (Datum) 0,
+        INDEX_CREATE_SKIP_BUILD,
+        0,
+        false,
+        true,
+        NULL);
+
+    table_close(heap_rel, ShareLock);
+    CommandCounterIncrement();
+    return hnsw_oid;
+}
+
+PG_FUNCTION_INFO_V1(pg_cuvs_import);
+Datum
+pg_cuvs_import(PG_FUNCTION_ARGS)
+{
+    Oid         cagra_oid = PG_GETARG_OID(0);
+    const char *mode = (PG_NARGS() >= 2 && !PG_ARGISNULL(1)) ?
+                       text_to_cstring(PG_GETARG_TEXT_PP(1)) : "hnsw";
+
+    /* Create empty HNSW on parent table — no CPU build! */
+    Oid hnsw_oid = create_empty_hnsw(cagra_oid);
+
+    /* Fill with GPU-built graph via existing import functions */
+    char *sql;
+    if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
+        sql = psprintf(
+            "SELECT pg_cuvs_import_cagra('%u'::regclass, '%u'::regclass, '%s'::text)",
+            cagra_oid, hnsw_oid, mode);
+    else if (strcmp(mode, "hnswlib") == 0)
+        sql = psprintf(
+            "SELECT pg_cuvs_import_hnsw('%u'::regclass, '%u'::regclass, true)",
+            cagra_oid, hnsw_oid);
+    else
+        sql = psprintf(
+            "SELECT pg_cuvs_import_hnsw('%u'::regclass, '%u'::regclass, false)",
+            cagra_oid, hnsw_oid);
+
+    SPI_connect();
+    int spi_rc = SPI_exec(sql, 0);
+    SPI_finish();
+
+    if (spi_rc < 0)
+        ereport(ERROR,
+                (errmsg("pg_cuvs_import: SPI failed (rc=%d) for mode='%s'",
+                        spi_rc, mode)));
+
+    PG_RETURN_OID(hnsw_oid);
 }
