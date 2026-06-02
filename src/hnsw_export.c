@@ -59,6 +59,9 @@
 #include "cuvs_util.h"
 #include "hnsw_export.h"
 
+/* GUC declared in pg_cuvs.c — socket path for daemon IPC */
+extern char *cuvs_socket_path;
+
 /* ----------------------------------------------------------------
  * pgvector HNSW on-disk constants (must match pgvector source)
  * ---------------------------------------------------------------- */
@@ -1119,7 +1122,6 @@ pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
  * Does NOT require cuvs.cpu_hnsw_fallback=on.
  * Supports UNLOGGED target for faster import (see pg_cuvs_import_hnsw).
  * ================================================================ */
-extern char *cuvs_socket_path;   /* GUC declared in pg_cuvs.c */
 
 /* ----------------------------------------------------------------
  * Squared L2 distance between two float32 vectors.
