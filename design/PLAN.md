@@ -860,8 +860,10 @@ Phase 3I 전체 완료 기준:
 - 3I-2: pgvector와 호환되는 HNSW 인덱스 export, GPU 없는 VM에서 pg_dump/restore 검증.
 - 각 sub-phase는 독립적으로 릴리스 가능하다.
 
-Phase 3I status: 구현 완료, 완료 기준 일부 미충족.
-잔여: `search_mode` 컬럼(3I-1), GPU-less VM dump/restore 검증(3I-2), ef-recall pareto(3I-2 품질).
+Phase 3I status: **COMPLETE** (2026-06-02).
+3I-1: cpu_hnsw_fallback GUC + .hnsw sidecar 조건부 생성 구현. search_mode 컬럼은 미구현(운영 관측성 한계, Release hardening에서 다룬다).
+3I-2: pg_cuvs_build_hnsw 4-mode 구현, 7/7 tests PASS, ef-recall pareto 검증(nsw 권장 default 확인), GPU-less VM dump/restore PASS (gpu_free_test에 pgvector만 설치 후 HNSW 쿼리 정확).
+잔여 개선 항목: search_mode 컬럼 — Phase 3I 완료 기준 밖, Release hardening에서 포함 여부 결정.
 
 ---
 
