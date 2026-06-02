@@ -1,21 +1,21 @@
--- hnsw_import.sql — Phase 3I-2: cuVS HNSW -> pgvector adapter.
+-- hnsw_import.sql — pg_cuvs_build_hnsw: GPU HNSW creation without CPU build.
 --
--- Verifies that pg_cuvs_import_hnsw():
+-- Verifies that pg_cuvs_build_hnsw():
 --   1. Function is registered.
---   2. Reads .hnsw sidecar + .tids and writes pgvector HNSW pages.
---   3. Resulting HNSW index returns correct top-2 for deterministic test vectors.
+--   2. Creates pgvector HNSW WITHOUT pgvector CPU build (INDEX_CREATE_SKIP_BUILD).
+--   3. Resulting HNSW returns correct top-2 for deterministic test vectors.
 --
 -- REQUIRES: pg_cuvs_server running with GPU, cuvs.index_dir writable.
--- NOTE: 20 vectors used so n_vecs >= 16 (HNSW serialization threshold).
+-- NOTE: 20 vectors used so n_vecs >= 16 (CAGRA graph threshold).
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS vector;
 NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
 -- Function registered?
-SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_import_hnsw';
-       proname       
----------------------
- pg_cuvs_import_hnsw
+SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_build_hnsw';
+      proname       
+--------------------
+ pg_cuvs_build_hnsw
 (1 row)
 
 -- Setup: 20-vector 4-dim table. Query [1,0.5,0,0] has unambiguous top-2.
@@ -42,28 +42,22 @@ INSERT INTO hnsw_import_test VALUES
     (18, '[0,0.3,0.3,0.3]'),
     (19, '[0.25,0.25,0.25,0.25]'),
     (20, '[0.9,0.1,0,0]');
--- Build CAGRA index. cpu_hnsw_fallback=on tells the daemon to serialize the
--- .hnsw sidecar — required for pg_cuvs_import_hnsw to read it.
-SET cuvs.cpu_hnsw_fallback = on;
+-- Build CAGRA index (no cpu_hnsw_fallback needed for nsw mode).
 CREATE INDEX cagra_import_idx ON hnsw_import_test
     USING cagra (embedding vector_l2_ops);
-SET cuvs.cpu_hnsw_fallback = off;
--- Create empty pgvector HNSW target (same dimensions, same M=16 default).
-CREATE INDEX pgvec_hnsw_idx ON hnsw_import_test
-    USING hnsw (embedding vector_l2_ops);
--- Import GPU-built graph into pgvector HNSW.
--- Suppress the NOTICE (contains variable OIDs/paths, unsuitable for exact match).
+-- pg_cuvs_build_hnsw: creates HNSW directly, no pgvector CPU build.
+-- Suppress NOTICE (contains variable OIDs).
 SET client_min_messages = 'warning';
-SELECT pg_cuvs_import_hnsw('cagra_import_idx'::regclass,
-                             'pgvec_hnsw_idx'::regclass);
- pg_cuvs_import_hnsw 
----------------------
- 
+SELECT pg_cuvs_build_hnsw('cagra_import_idx'::regclass) IS NOT NULL AS hnsw_created;
+ hnsw_created 
+--------------
+ t
 (1 row)
 
 SET client_min_messages = 'notice';
 -- Disable GPU path so we prove the pgvector HNSW index is used.
 SET enable_cuvs = off;
+SET enable_seqscan = off;
 -- Query via pgvector HNSW: top-2 is id=20 (dist=0.41) then id=1 (dist=0.50).
 SELECT id FROM hnsw_import_test
 ORDER BY embedding <-> '[1,0.5,0,0]'::vector
@@ -75,6 +69,7 @@ LIMIT 2;
 (2 rows)
 
 SET enable_cuvs = on;
+RESET enable_seqscan;
 -- Cleanup.
 DROP TABLE hnsw_import_test;
 DROP EXTENSION pg_cuvs;
