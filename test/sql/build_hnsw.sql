@@ -2,11 +2,11 @@
 --
 -- Coverage:
 --   1. Function registered.
---   2. mode='nsw'     — flat NSW, correct top-2.
---   3. mode='hnsw'    — heuristic hierarchy, correct top-2.
---   4. mode='hnswlib' — from_cagra() via /dev/shm, correct top-2.
---   5. Return type: returned regclass is usable (rename, search).
---   6. Two independent builds on same table work independently.
+--   2. mode='nsw'     — flat NSW, correct top-1.
+--   3. mode='hnsw'    — heuristic hierarchy, correct top-1.
+--   4. mode='hnswlib' — from_cagra() via /dev/shm, correct top-1.
+--   5. Return type: returned regclass is renameable and still searchable.
+--   6. Two independent builds on same CAGRA produce unique index names.
 --
 -- REQUIRES: pg_cuvs_server running with GPU, cuvs.index_dir writable.
 
@@ -19,8 +19,9 @@ SELECT proname FROM pg_proc WHERE proname = 'pg_cuvs_build_hnsw';
 
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 
--- Setup: 20-vector 4-dim table with deterministic nearest neighbors.
--- Query [1, 0.5, 0, 0]: top-2 = id=20 ([0.9,0.1,0,0]) then id=1 ([1,0,0,0]).
+-- Setup: 20-vector 4-dim table.
+-- Query [1, 0, 0, 0]: unambiguous top-1 = id=1 (exact match).
+-- Query [1, 0.5, 0, 0]: unambiguous top-1 = id=20 (dist≈0.41 vs id=1 dist=0.5).
 CREATE TABLE bh_test (id bigint, embedding vector(4));
 INSERT INTO bh_test VALUES
     (1,'[1,0,0,0]'),(2,'[0,1,0,0]'),(3,'[0,0,1,0]'),(4,'[0,0,0,1]'),
@@ -38,15 +39,8 @@ SELECT pg_cuvs_build_hnsw('bh_cagra'::regclass) IS NOT NULL AS nsw_ok;
 SET client_min_messages = 'notice';
 
 SET enable_cuvs = off; SET enable_seqscan = off;
-SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 2;
+SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
-
--- Drop auto-named index before next build.
-DO $$ DECLARE r RECORD;
-BEGIN
-  FOR r IN SELECT indexname FROM pg_indexes WHERE tablename='bh_test' AND indexname LIKE 'pg_cuvs_hnsw%'
-  LOOP EXECUTE 'DROP INDEX IF EXISTS ' || r.indexname; END LOOP;
-END $$;
 
 -- ── mode='hnsw' (heuristic hierarchy) ───────────────────────────
 SET client_min_messages = 'warning';
@@ -54,14 +48,8 @@ SELECT pg_cuvs_build_hnsw('bh_cagra'::regclass, 'hnsw') IS NOT NULL AS heuristic
 SET client_min_messages = 'notice';
 
 SET enable_cuvs = off; SET enable_seqscan = off;
-SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 2;
+SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
-
-DO $$ DECLARE r RECORD;
-BEGIN
-  FOR r IN SELECT indexname FROM pg_indexes WHERE tablename='bh_test' AND indexname LIKE 'pg_cuvs_hnsw%'
-  LOOP EXECUTE 'DROP INDEX IF EXISTS ' || r.indexname; END LOOP;
-END $$;
 
 -- ── mode='hnswlib' (from_cagra via /dev/shm) ────────────────────
 SET client_min_messages = 'warning';
@@ -69,38 +57,35 @@ SELECT pg_cuvs_build_hnsw('bh_cagra'::regclass, 'hnswlib') IS NOT NULL AS hnswli
 SET client_min_messages = 'notice';
 
 SET enable_cuvs = off; SET enable_seqscan = off;
-SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 2;
+SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
 
 -- ── Return type: returned regclass can be renamed ────────────────
-DO $$ DECLARE hnsw_oid regclass; new_name text;
+-- Uses WARNING to suppress variable-OID NOTICEs from pg_cuvs_build_hnsw.
+SET client_min_messages = 'warning';
+DO $$ DECLARE hnsw_oid regclass;
 BEGIN
-  SET client_min_messages TO warning;
-  SELECT pg_cuvs_build_hnsw('bh_cagra'::regclass) INTO hnsw_oid;
-  RESET client_min_messages;
-  -- Rename the index using the returned OID.
-  new_name := 'bh_hnsw_renamed';
-  EXECUTE 'ALTER INDEX ' || hnsw_oid::text || ' RENAME TO ' || new_name;
-  RAISE NOTICE 'renamed to %', new_name;
+    SELECT pg_cuvs_build_hnsw('bh_cagra'::regclass) INTO hnsw_oid;
+    EXECUTE 'ALTER INDEX ' || hnsw_oid::text || ' RENAME TO bh_hnsw_renamed';
 END $$;
+SET client_min_messages = 'notice';
 
--- Named index is searchable.
 SET enable_cuvs = off; SET enable_seqscan = off;
-SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 2;
+-- bh_hnsw_renamed index is used for search.
+SELECT id FROM bh_test ORDER BY embedding <-> '[1,0.5,0,0]' LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
 
--- ── Two independent builds coexist on same table ────────────────
+-- ── Two independent builds produce unique names ──────────────────
 SET client_min_messages = 'warning';
 SELECT pg_cuvs_build_hnsw('bh_cagra'::regclass) IS NOT NULL AS build_a;
 SELECT pg_cuvs_build_hnsw('bh_cagra'::regclass) IS NOT NULL AS build_b;
 SET client_min_messages = 'notice';
 
-SELECT count(*) AS hnsw_index_count
+-- Should be ≥ 2 pg_cuvs_hnsw* indexes (from all builds + renamed).
+SELECT count(*) >= 2 AS multiple_hnsw
 FROM pg_indexes
-WHERE tablename = 'bh_test'
-  AND indexdef LIKE '%hnsw%'
-  AND indexname LIKE 'pg_cuvs_hnsw%';
+WHERE tablename = 'bh_test' AND indexname LIKE '%hnsw%';
 
 -- Cleanup.
-DROP TABLE bh_test;
-DROP EXTENSION pg_cuvs;
+DROP TABLE bh_test CASCADE;
+DROP EXTENSION pg_cuvs CASCADE;

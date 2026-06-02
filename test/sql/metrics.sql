@@ -77,5 +77,5 @@ ORDER BY embedding <#> '[0.707,0.707,0,0]'::vector LIMIT 1;
 RESET enable_cuvs; RESET enable_seqscan;
 
 -- Cleanup.
-DROP TABLE met_test;
-DROP EXTENSION pg_cuvs;
+DROP TABLE met_test CASCADE;
+DROP EXTENSION pg_cuvs CASCADE;

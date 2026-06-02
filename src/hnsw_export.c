@@ -1664,7 +1664,10 @@ create_empty_hnsw(Oid cagra_oid)
 
     index_close(cagra_rel, AccessShareLock);
 
-    char *idx_name = psprintf("pg_cuvs_hnsw_%u", cagra_oid);
+    /* Include a sequence so multiple calls with the same CAGRA produce unique names. */
+    static int hnsw_build_seq = 0;
+    char *idx_name = psprintf("pg_cuvs_hnsw_%u_%d", cagra_oid,
+                               __atomic_fetch_add(&hnsw_build_seq, 1, __ATOMIC_RELAXED));
 
     /* INDEX_CREATE_SKIP_BUILD: catalog entries created, ambuild() skipped.
      * pgvector CPU build (285s for 1M×1024) is never called. */
