@@ -243,10 +243,14 @@ COMMENT ON FUNCTION pg_cuvs_import_hnsw(regclass, regclass) IS
 -- pgvector HNSW (all nodes at level 0).  Does NOT require
 -- cuvs.cpu_hnsw_fallback=on.  Supports UNLOGGED target for faster import.
 -- ----------------------------------------------------------------
-CREATE FUNCTION pg_cuvs_import_cagra(cagra_oid regclass, hnsw_oid regclass)
+CREATE FUNCTION pg_cuvs_import_cagra(
+    cagra_oid regclass,
+    hnsw_oid  regclass,
+    mode      text DEFAULT 'hnsw'
+)
 RETURNS void
 AS '$libdir/pg_cuvs', 'pg_cuvs_import_cagra'
-LANGUAGE C STRICT;
+LANGUAGE C;
 
 COMMENT ON FUNCTION pg_cuvs_import_cagra(regclass, regclass) IS
   'Phase 3J: Direct CAGRA graph import into pgvector HNSW format. '

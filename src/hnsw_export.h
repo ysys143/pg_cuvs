@@ -32,4 +32,7 @@ Datum pg_cuvs_import_hnsw(PG_FUNCTION_ARGS);
  * Trade-off: flat HNSW may require higher ef_search for equivalent recall vs
  * pg_cuvs_import_hnsw() which produces a multi-level graph.
  */
+/*
+ * mode: 'nsw' = flat (level 0 only), 'hnsw' = hierarchical (level assignment)
+ */
 Datum pg_cuvs_import_cagra(PG_FUNCTION_ARGS);

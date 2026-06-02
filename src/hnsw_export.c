@@ -1094,12 +1094,33 @@ pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
  * ================================================================ */
 extern char *cuvs_socket_path;   /* GUC declared in pg_cuvs.c */
 
+/* ----------------------------------------------------------------
+ * Level assignment helper for HNSW mode.
+ * Uses geometric distribution: level = floor(-log(r) / log(M)).
+ * Matches hnswlib / from_cagra() convention.
+ * ---------------------------------------------------------------- */
+static int
+cagra_assign_level(int M, unsigned int *seed)
+{
+    double mL = 1.0 / log((double)(M > 1 ? M : 2));
+    /* (0,1) exclusive to avoid log(0) */
+    double r = ((double)rand_r(seed) + 1.0) / ((double)RAND_MAX + 2.0);
+    int lv   = (int)(-log(r) * mL);
+    return (lv > 16) ? 16 : lv;   /* cap to avoid degenerate indexes */
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_import_cagra);
 Datum
 pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
 {
     Oid cagra_oid = PG_GETARG_OID(0);
     Oid hnsw_oid  = PG_GETARG_OID(1);
+
+    /* mode: 'nsw' (flat, default) or 'hnsw' (hierarchical) */
+    const char *mode = "hnsw";
+    if (PG_NARGS() >= 3 && !PG_ARGISNULL(2))
+        mode = text_to_cstring(PG_GETARG_TEXT_PP(2));
+    bool do_hierarchy = (strcmp(mode, "hnsw") == 0);
 
     /* ---- 0. pgvector compatibility check ---- */
     {
@@ -1239,14 +1260,13 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
                         "target HNSW uses %s", sm, tm)));
     }
 
-    /* ---- 3. Build flat ElemDesc array (all level=0) ---- */
-    /* M0 = level-0 neighbor slots per node (pgvector convention: 2*M).
-     * Truncate CAGRA graph_degree to M0 = min(graph_degree, 64).
-     * M = M0 / 2.  Default aligns with pgvector's HNSW m=16 default. */
+    /* ---- 3. Build ElemDesc array ---- */
+    /* M0 = level-0 neighbor slots (pgvector: 2*M).
+     * Clamp graph_degree to M0 = min(graph_degree, 64); M = M0/2. */
     int M0 = (graph_degree < 64) ? graph_degree : 64;
-    if (M0 % 2 != 0) M0--;          /* must be even for M = M0/2 */
+    if (M0 % 2 != 0) M0--;
     if (M0 < 2) M0 = 2;
-    int M  = M0 / 2;
+    int M = M0 / 2;
 
     ElemDesc *elems = (ElemDesc *)calloc(N, sizeof(ElemDesc));
     if (!elems)
@@ -1255,28 +1275,75 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
         ereport(ERROR, (errmsg("pg_cuvs: out of memory for element descriptors")));
     }
 
+    int    max_level  = 0;
+    size_t entry_elem = 0;
+
+    if (do_hierarchy)
+    {
+        /* ---- 3a. Assign levels (geometric distribution, same as hnswlib) ---- */
+        unsigned int seed = (unsigned int)(N * 31337u ^ (size_t)M * 13u);
+        for (size_t i = 0; i < N; i++)
+        {
+            elems[i].level = cagra_assign_level(M, &seed);
+            if (elems[i].level > max_level)
+            {
+                max_level  = elems[i].level;
+                entry_elem = i;
+            }
+        }
+    }
+    /* else: all elems[i].level remain 0 (calloc'd), max_level=0, entry_elem=0 */
+
+    /* ---- 3b. Level-0 and upper-level links ---- */
     for (size_t i = 0; i < N; i++)
     {
-        elems[i].level      = 0;
         elems[i].tid_encoded = tids[i];
+        const uint32_t *row = adj + i * (size_t)graph_degree;
 
-        /* Level-0 links: copy up to M0 neighbors from CAGRA adjacency row i */
-        int cnt = (graph_degree < M0) ? graph_degree : M0;
-        elems[i].lv0_count = cnt;
-        if (cnt > 0)
+        /* Level 0: up to M0 CAGRA neighbors */
+        int cnt0 = (graph_degree < M0) ? graph_degree : M0;
+        elems[i].lv0_count = cnt0;
+        if (cnt0 > 0)
         {
-            elems[i].lv0_links = (int *)malloc((size_t)cnt * sizeof(int));
+            elems[i].lv0_links = (int *)malloc((size_t)cnt0 * sizeof(int));
             if (!elems[i].lv0_links)
             {
                 free_elem_descs(elems, i, (size_t)M0);
                 free(elems); free(adj); free(vecs); free(tids);
                 ereport(ERROR, (errmsg("pg_cuvs: out of memory for lv0_links")));
             }
-            const uint32_t *row = adj + i * (size_t)graph_degree;
-            for (int j = 0; j < cnt; j++)
+            for (int j = 0; j < cnt0; j++)
                 elems[i].lv0_links[j] = (int)row[j];
         }
-        /* No upper levels: upper_links = NULL, upper_counts = NULL */
+
+        /* Upper levels (only when do_hierarchy and level > 0) */
+        int lv = elems[i].level;
+        if (do_hierarchy && lv > 0)
+        {
+            elems[i].upper_links  = (int **)calloc((size_t)lv, sizeof(int *));
+            elems[i].upper_counts = (int  *)calloc((size_t)lv, sizeof(int));
+            if (!elems[i].upper_links || !elems[i].upper_counts)
+            {
+                free_elem_descs(elems, i + 1, (size_t)M0);
+                free(elems); free(adj); free(vecs); free(tids);
+                ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper_links")));
+            }
+            for (int l = 1; l <= lv; l++)
+            {
+                int cntM = (graph_degree < M) ? graph_degree : M;
+                elems[i].upper_links[l - 1]  = (int *)malloc((size_t)cntM * sizeof(int));
+                elems[i].upper_counts[l - 1] = cntM;
+                if (!elems[i].upper_links[l - 1])
+                {
+                    free_elem_descs(elems, i + 1, (size_t)M0);
+                    free(elems); free(adj); free(vecs); free(tids);
+                    ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper_links[%d]", l)));
+                }
+                /* Use first M CAGRA neighbors (nearest-first in NSG) */
+                for (int j = 0; j < cntM; j++)
+                    elems[i].upper_links[l - 1][j] = (int)row[j];
+            }
+        }
     }
     free(adj);
     free(tids);
@@ -1291,10 +1358,10 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
         elems[i].neigh_offno = 2;
     }
 
-    /* Verify elem+neigh fit on one page (level=0, M0 neighbors). */
+    /* Verify elem+neigh fit on one page (worst-case: max_level, M neighbors). */
     {
         size_t esize  = elem_tuple_size((int)ipc_dim);
-        size_t nsize  = neigh_tuple_size(0, M);
+        size_t nsize  = neigh_tuple_size(max_level, M);
         size_t needed = esize + 2 * PGV_ITEM_OVERHEAD + nsize + 2 * PGV_ITEM_OVERHEAD;
         if (needed > (size_t)PGV_USABLE_BYTES)
         {
@@ -1302,8 +1369,8 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
             free(elems); free(vecs);
             ereport(ERROR,
                     (errmsg("pg_cuvs: element+neighbor too large for one page "
-                            "(dim=%d M=%d needed=%zu avail=%d)",
-                            ipc_dim, M, needed, PGV_USABLE_BYTES)));
+                            "(dim=%d M=%d max_level=%d needed=%zu avail=%d)",
+                            ipc_dim, M, max_level, needed, PGV_USABLE_BYTES)));
         }
     }
 
@@ -1343,9 +1410,10 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
         metap->efConstruction = (uint16_t)(M0 * 2);  /* reasonable default */
         if (N > 0)
         {
-            metap->entryBlkno = 1;
+            /* entry_elem is the node with highest level (0 for flat NSW) */
+            metap->entryBlkno = elems[entry_elem].elem_blkno;
             metap->entryOffno = 1;
-            metap->entryLevel = 0;   /* flat HNSW: entrypoint at level 0 */
+            metap->entryLevel = (int16_t)max_level;
         }
         else
         {
@@ -1387,8 +1455,10 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
 
     ereport(NOTICE,
             (errmsg("pg_cuvs: direct import %zu elements (dim=%d, M=%d, "
-                    "graph_degree=%d) from cagra index %u into hnsw index %u",
-                    N, ipc_dim, M, graph_degree, cagra_oid, hnsw_oid)));
+                    "graph_degree=%d, max_level=%d, mode=%s) "
+                    "from cagra index %u into hnsw index %u",
+                    N, ipc_dim, M, graph_degree, max_level, mode,
+                    cagra_oid, hnsw_oid)));
 
     PG_RETURN_VOID();
 }
