@@ -1096,6 +1096,70 @@ pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
 extern char *cuvs_socket_path;   /* GUC declared in pg_cuvs.c */
 
 /* ----------------------------------------------------------------
+ * Squared L2 distance between two float32 vectors.
+ * Used by heuristic_select_neighbors; squared form is sufficient
+ * for comparisons (monotone with actual L2).
+ * ---------------------------------------------------------------- */
+static float
+vec_dist_sq(const float *a, const float *b, int dim)
+{
+    float d = 0.0f;
+    for (int k = 0; k < dim; k++)
+    {
+        float diff = a[k] - b[k];
+        d += diff * diff;
+    }
+    return d;
+}
+
+/* ----------------------------------------------------------------
+ * HNSW heuristic neighbor selection (Algorithm 4, Malkov & Yashunin 2018).
+ *
+ * For each candidate c (processed nearest-first to q), add c to the
+ * result only if d(q, c) < d(c, s) for ALL s already selected.
+ * This ensures selected neighbors cover diverse directions from q rather
+ * than clustering in one region.
+ *
+ * candidates    : CAGRA neighbor indices, assumed approximately sorted by
+ *                 distance to q (NSG adjacency is nearest-first in practice).
+ * n_candidates  : number of candidates
+ * M             : max neighbors to select
+ * out_selected  : output array of size >= M
+ * returns       : number of neighbors selected (<= M)
+ * ---------------------------------------------------------------- */
+static int
+heuristic_select_neighbors(
+    const float *query_vec,
+    const float *all_vecs,
+    int          dim,
+    const int   *candidates,
+    int          n_candidates,
+    int          M,
+    int         *out_selected)
+{
+    int n_sel = 0;
+    for (int i = 0; i < n_candidates && n_sel < M; i++)
+    {
+        int          c     = candidates[i];
+        const float *c_vec = all_vecs + (size_t)c * dim;
+        float        d_q_c = vec_dist_sq(query_vec, c_vec, dim);
+
+        /* c is kept only if it is closer to q than to every selected s */
+        bool dominated = false;
+        for (int j = 0; j < n_sel && !dominated; j++)
+        {
+            const float *s_vec = all_vecs + (size_t)out_selected[j] * dim;
+            if (vec_dist_sq(c_vec, s_vec, dim) <= d_q_c)
+                dominated = true;
+        }
+
+        if (!dominated)
+            out_selected[n_sel++] = c;
+    }
+    return n_sel;
+}
+
+/* ----------------------------------------------------------------
  * Level assignment helper for HNSW mode.
  * Uses geometric distribution: level = floor(-log(r) / log(M)).
  * Matches hnswlib / from_cagra() convention.
@@ -1329,21 +1393,39 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
                 free(elems); free(adj); free(vecs); free(tids);
                 ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper_links")));
             }
+            /* Convert CAGRA uint32_t adjacency to int candidates for heuristic */
+            int *cand_buf = (int *)malloc((size_t)graph_degree * sizeof(int));
+            if (!cand_buf)
+            {
+                free_elem_descs(elems, i + 1, (size_t)M0);
+                free(elems); free(adj); free(vecs); free(tids);
+                ereport(ERROR, (errmsg("pg_cuvs: out of memory for heuristic candidates")));
+            }
+            for (int j = 0; j < graph_degree; j++)
+                cand_buf[j] = (int)row[j];
+
             for (int l = 1; l <= lv; l++)
             {
-                int cntM = (graph_degree < M) ? graph_degree : M;
-                elems[i].upper_links[l - 1]  = (int *)malloc((size_t)cntM * sizeof(int));
-                elems[i].upper_counts[l - 1] = cntM;
+                elems[i].upper_links[l - 1]  = (int *)malloc((size_t)M * sizeof(int));
                 if (!elems[i].upper_links[l - 1])
                 {
+                    free(cand_buf);
                     free_elem_descs(elems, i + 1, (size_t)M0);
                     free(elems); free(adj); free(vecs); free(tids);
                     ereport(ERROR, (errmsg("pg_cuvs: out of memory for upper_links[%d]", l)));
                 }
-                /* Use first M CAGRA neighbors (nearest-first in NSG) */
-                for (int j = 0; j < cntM; j++)
-                    elems[i].upper_links[l - 1][j] = (int)row[j];
+                /* Heuristic neighbor selection: diverse coverage of directions */
+                int n_sel = heuristic_select_neighbors(
+                    vecs + (size_t)i * ipc_dim,
+                    vecs,
+                    ipc_dim,
+                    cand_buf,
+                    graph_degree,
+                    M,
+                    elems[i].upper_links[l - 1]);
+                elems[i].upper_counts[l - 1] = n_sel;
             }
+            free(cand_buf);
         }
     }
     free(adj);
