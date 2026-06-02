@@ -46,7 +46,6 @@
 #include "utils/builtins.h"
 #include "catalog/index.h"       /* index_create, INDEX_CREATE_SKIP_BUILD, BuildIndexInfo */
 #include "commands/defrem.h"     /* get_am_oid */
-#include "executor/spi.h"        /* SPI_connect, SPI_exec, SPI_finish */
 #include "commands/extension.h"  /* get_extension_oid */
 #include "miscadmin.h"
 #include "nodes/pg_list.h"       /* list_make1 */
@@ -454,16 +453,13 @@ write_elem_page(Relation rel,
 /* ================================================================
  * Main SQL function
  * ================================================================ */
-PG_FUNCTION_INFO_V1(pg_cuvs_import_hnsw);
-Datum
-pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
+/* Internal helper: fill an existing HNSW index from hnswlib sidecar.
+ * Called by pg_cuvs_build_hnsw() for modes 'hnswlib' and 'hnswlib_file'.
+ * use_shm=true  → daemon runs from_cagra() → /dev/shm (no disk I/O)
+ * use_shm=false → reads pre-built .hnsw sidecar from index_dir */
+static void
+fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
 {
-    Oid  cagra_oid = PG_GETARG_OID(0);
-    Oid  hnsw_oid  = PG_GETARG_OID(1);
-    /* Optional 3rd arg: use_shm boolean (DEFAULT false).
-     * When true, from_cagra() is run in the daemon and the .hnsw is written
-     * to /dev/shm/ (no disk I/O) instead of the on-disk index_dir sidecar. */
-    bool use_shm  = (PG_NARGS() >= 3 && !PG_ARGISNULL(2)) ? PG_GETARG_BOOL(2) : false;
 
     /* ---- 0. pgvector compatibility check ---- */
     /* pg_cuvs_import_hnsw is pinned to pgvector HNSW_VERSION=1 (stable since
@@ -1112,8 +1108,6 @@ pg_cuvs_import_hnsw(PG_FUNCTION_ARGS)
     /* Clean up /dev/shm file after successful import */
     if (use_shm)
         unlink(hnsw_path);
-
-    PG_RETURN_VOID();
 }
 
 /* ================================================================
@@ -1208,17 +1202,13 @@ cagra_assign_level(int M, unsigned int *seed)
     return (lv > 16) ? 16 : lv;   /* cap to avoid degenerate indexes */
 }
 
-PG_FUNCTION_INFO_V1(pg_cuvs_import_cagra);
-Datum
-pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
+/* Internal helper: fill an existing HNSW index from CAGRA adjacency via IPC.
+ * Called by pg_cuvs_build_hnsw() for modes 'nsw' and 'hnsw'.
+ * mode='nsw'  → flat NSW (no hierarchy, level 0 only)
+ * mode='hnsw' → hierarchical with heuristic neighbor selection */
+static void
+fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
 {
-    Oid cagra_oid = PG_GETARG_OID(0);
-    Oid hnsw_oid  = PG_GETARG_OID(1);
-
-    /* mode: 'nsw' (flat, default) or 'hnsw' (hierarchical) */
-    const char *mode = "hnsw";
-    if (PG_NARGS() >= 3 && !PG_ARGISNULL(2))
-        mode = text_to_cstring(PG_GETARG_TEXT_PP(2));
     bool do_hierarchy = (strcmp(mode, "hnsw") == 0);
 
     /* ---- 0. pgvector compatibility check ---- */
@@ -1576,8 +1566,6 @@ pg_cuvs_import_cagra(PG_FUNCTION_ARGS)
                     "from cagra index %u into hnsw index %u",
                     N, ipc_dim, M, graph_degree, max_level, mode,
                     cagra_oid, hnsw_oid)));
-
-    PG_RETURN_VOID();
 }
 
 /* ================================================================
@@ -1721,7 +1709,7 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
     /* Create empty HNSW on parent table — INDEX_CREATE_SKIP_BUILD, no CPU build */
     Oid hnsw_oid = create_empty_hnsw(cagra_oid);
 
-    /* Dispatch to implementation functions by mode.
+    /* Dispatch to internal C helpers — no SQL/SPI overhead.
      *
      * RECOMMENDED modes:
      *   'nsw'     — flat NSW via IPC adjacency. 117s, 2.4x speedup.
@@ -1732,33 +1720,15 @@ pg_cuvs_build_hnsw(PG_FUNCTION_ARGS)
      * HIDDEN modes (kept for research, not recommended):
      *   'hnsw'         — direct hierarchy with heuristic neighbor selection.
      *                    Currently 144s with no quality gain over 'nsw'.
-     *                    Retained pending future improvement of level assignment
-     *                    (proper heuristic could eventually match hnswlib quality).
-     *   'hnswlib_file' — uses on-disk .hnsw sidecar from build time.
-     *                    Superceded by 'hnswlib' (shm path, same quality, no disk I/O).
+     *                    Retained pending future improvement of level assignment.
+     *   'hnswlib_file' — on-disk .hnsw sidecar; superceded by 'hnswlib' (shm).
      */
-    char *sql;
     if (strcmp(mode, "nsw") == 0 || strcmp(mode, "hnsw") == 0)
-        sql = psprintf(
-            "SELECT pg_cuvs_import_cagra('%u'::regclass, '%u'::regclass, '%s'::text)",
-            cagra_oid, hnsw_oid, mode);
+        fill_hnsw_from_cagra_ipc(cagra_oid, hnsw_oid, mode);
     else if (strcmp(mode, "hnswlib") == 0)
-        sql = psprintf(
-            "SELECT pg_cuvs_import_hnsw('%u'::regclass, '%u'::regclass, true)",
-            cagra_oid, hnsw_oid);
+        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, true);
     else  /* hnswlib_file */
-        sql = psprintf(
-            "SELECT pg_cuvs_import_hnsw('%u'::regclass, '%u'::regclass, false)",
-            cagra_oid, hnsw_oid);
-
-    SPI_connect();
-    int spi_rc = SPI_exec(sql, 0);
-    SPI_finish();
-
-    if (spi_rc < 0)
-        ereport(ERROR,
-                (errmsg("pg_cuvs_build_hnsw: SPI failed (rc=%d) for mode='%s'",
-                        spi_rc, mode)));
+        fill_hnsw_from_hnswlib(cagra_oid, hnsw_oid, false);
 
     PG_RETURN_OID(hnsw_oid);
 }

@@ -212,49 +212,6 @@ COMMENT ON VIEW pg_stat_gpu_shards IS
   'logical index is resident on, its global TID range, VRAM, and per-shard '
   'search/error counts. Empty for unsharded indexes or while the daemon is down.';
 
--- ----------------------------------------------------------------
--- pg_cuvs_import_hnsw(cagra_oid regclass, hnsw_oid regclass)
--- Phase 3I-2: read .hnsw sidecar (hnswlib binary) written alongside a
--- CAGRA index and bulk-write a pgvector-compatible HNSW index into an
--- existing pgvector HNSW relation.  The target relation is truncated and
--- fully rebuilt from the sidecar; call this only on an offline index.
--- ----------------------------------------------------------------
-CREATE FUNCTION pg_cuvs_import_hnsw(
-    cagra_oid regclass,
-    hnsw_oid  regclass,
-    use_shm   boolean DEFAULT false
-)
-RETURNS void
-AS '$libdir/pg_cuvs', 'pg_cuvs_import_hnsw'
-LANGUAGE C;
-
-COMMENT ON FUNCTION pg_cuvs_import_hnsw(regclass, regclass, boolean) IS
-  'Phase 3I-2: Import the hnswlib binary sidecar written alongside a CAGRA '
-  'index into an existing pgvector HNSW index relation. '
-  'OFFLINE OPERATION: acquires AccessExclusiveLock on the target HNSW index, '
-  'blocking all concurrent queries against it until the transaction commits. '
-  'Requires pgvector 0.5.0+. Validates AM type, dimension, and metric before '
-  'truncating. Crash-safe via WAL full-page images (log_newpage_buffer). '
-  'UNLOGGED target: if the target HNSW index is UNLOGGED, WAL is skipped for '
-  'faster import (~2x); index is lost on crash and must be rebuilt. '
-  'Example: SELECT pg_cuvs_import_hnsw(''my_cagra_idx''::regclass, '
-  '''my_hnsw_idx''::regclass);';
-
--- ----------------------------------------------------------------
--- pg_cuvs_import_cagra(cagra_oid regclass, hnsw_oid regclass)
--- Phase 3J: direct CAGRA → pgvector HNSW without hnswlib intermediate.
--- Retrieves CAGRA adjacency + vectors from daemon via IPC; writes flat
--- pgvector HNSW (all nodes at level 0).  Does NOT require
--- cuvs.cpu_hnsw_fallback=on.  Supports UNLOGGED target for faster import.
--- ----------------------------------------------------------------
-CREATE FUNCTION pg_cuvs_import_cagra(
-    cagra_oid regclass,
-    hnsw_oid  regclass,
-    mode      text DEFAULT 'hnsw'
-)
-RETURNS void
-AS '$libdir/pg_cuvs', 'pg_cuvs_import_cagra'
-LANGUAGE C;
 
 -- ----------------------------------------------------------------
 -- pg_cuvs_build_hnsw(cagra_oid, mode) — GPU-accelerated HNSW creation.
@@ -288,18 +245,3 @@ COMMENT ON FUNCTION pg_cuvs_build_hnsw(regclass, text) IS
   'Returns OID of the new HNSW index (regclass). '
   'Example: SELECT pg_cuvs_build_hnsw(''my_cagra''::regclass);';
 
-COMMENT ON FUNCTION pg_cuvs_import_cagra(regclass, regclass, text) IS
-  'Phase 3J: Direct CAGRA graph import into pgvector HNSW format. '
-  'Fetches CAGRA adjacency + corpus vectors from daemon via IPC (no .hnsw file, '
-  'no from_cagra() conversion). Stores the flat CAGRA graph (NSW) directly — '
-  'all nodes at level 0, no hierarchy. '
-  'Trade-off vs pg_cuvs_import_hnsw(): '
-  '  faster build (~119s vs ~140s at 1M×1024); '
-  '  higher level-0 neighbor count (graph_degree vs 2M); '
-  '  no HNSW hierarchy — may need higher ef_search at very large N (>10M). '
-  'Empirically: recall@10 identical at N=1M (0.9963 vs 0.9962). '
-  'Does NOT require cuvs.cpu_hnsw_fallback=on. '
-  'OFFLINE: acquires AccessExclusiveLock; UNLOGGED target skips WAL (~2x faster). '
-  'Use pg_cuvs_import_hnsw() for standard HNSW hierarchy (via hnswlib). '
-  'Example: SELECT pg_cuvs_import_cagra(''my_cagra_idx''::regclass, '
-  '''my_hnsw_idx''::regclass);';

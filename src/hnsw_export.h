@@ -1,45 +1,29 @@
 #pragma once
 
 /*
- * hnsw_export.h — Phase 3I-2: read .hnsw sidecar (hnswlib binary) and
- * bulk-write a pgvector-compatible HNSW index into an existing pgvector
- * HNSW relation.
+ * hnsw_export.h — GPU HNSW index creation for pg_cuvs.
+ *
+ * Public API: pg_cuvs_build_hnsw(cagra_oid, mode)
+ * Internal helpers: fill_hnsw_from_hnswlib / fill_hnsw_from_cagra_ipc
+ *   (static, defined in hnsw_export.c, not callable from SQL)
  */
 
 #include "postgres.h"
 #include "fmgr.h"
 
 /*
- * pg_cuvs_import_hnsw(cagra_oid regclass, hnsw_oid regclass)
+ * pg_cuvs_build_hnsw(cagra_oid regclass, mode text DEFAULT 'nsw')
  *
- * Reads the .hnsw sidecar written by Phase 3I-1 alongside the CAGRA index
- * identified by cagra_oid, then bulk-writes all element and neighbor pages
- * into the existing pgvector HNSW index identified by hnsw_oid.
+ * GPU-accelerated HNSW creation without pgvector CPU build (285s eliminated).
+ * Creates the HNSW index internally via INDEX_CREATE_SKIP_BUILD.
  *
- * The target HNSW index is truncated to 0 pages first and fully rebuilt from
- * the sidecar data — do not call this on a live production index.
- */
-Datum pg_cuvs_import_hnsw(PG_FUNCTION_ARGS);
-
-/*
- * pg_cuvs_import_cagra(cagra_oid regclass, hnsw_oid regclass)
+ * Recommended modes:
+ *   'nsw'     — flat NSW, 117s, 2.4x vs native. Default.
+ *   'hnswlib' — from_cagra() hierarchy via /dev/shm, 139s, 2.0x.
  *
- * Phase 3J: direct CAGRA→pgvector HNSW conversion without hnswlib intermediate.
- * Retrieves the CAGRA adjacency list from the daemon via IPC and writes a flat
- * pgvector HNSW (all nodes at level 0) directly.  Does NOT require
- * cuvs.cpu_hnsw_fallback=on; no .hnsw sidecar file is needed.
+ * Hidden modes (research only):
+ *   'hnsw', 'hnswlib_file'
  *
- * Trade-off: flat HNSW may require higher ef_search for equivalent recall vs
- * pg_cuvs_import_hnsw() which produces a multi-level graph.
- */
-/*
- * mode: 'nsw' = flat (level 0 only), 'hnsw' = hierarchical (heuristic selection)
- */
-Datum pg_cuvs_import_cagra(PG_FUNCTION_ARGS);
-
-/*
- * pg_cuvs_import(cagra_oid, mode) — unified GPU import.
- * Creates HNSW index on parent table WITHOUT calling pgvector CPU build.
- * Returns OID of new HNSW index.
+ * Returns OID of newly created HNSW index (regclass).
  */
 Datum pg_cuvs_build_hnsw(PG_FUNCTION_ARGS);
