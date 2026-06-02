@@ -1,10 +1,9 @@
 # Playbook: JIT Threshold Sweep
 
-[WARN] 이 playbook은 large-dataset-benchmark.md 실행 결과 `EXPLAIN (ANALYZE)` 출력에
-`JIT:` 섹션이 나타나고 vector-search p95/p99 latency에 스파이크가 관측된 경우에만 실행한다.
-
-측정 없이 `jit = off`를 전역 적용하거나 임의의 `jit_above_cost`를 설정하지 않는다.
-이는 프로젝트 정책이다 (PLAN.md L163-168, ADR-018).
+> [!WARNING]
+> large-dataset-benchmark.md 결과에서 `JIT:` 섹션 + p95 스파이크가 확인된 경우에만 실행.
+> 측정 없이 `jit = off`를 전역 적용하거나 임의의 `jit_above_cost`를 설정하지 않는다.
+> 이는 프로젝트 정책이다 (PLAN.md L163-168, ADR-018).
 
 ---
 
@@ -21,26 +20,72 @@
 
 ---
 
-## 2. 확인 명령 (Diagnostic commands)
+## 2. 진단
 
 ```sql
--- 현재 JIT 관련 설정 확인
 SHOW jit;
 SHOW jit_above_cost;
 SHOW jit_optimize_above_cost;
+```
 
--- EXPLAIN에서 JIT 섹션 확인
+**기대 출력:**
+```
+ jit
+-----
+ on
+(1 row)
+
+ jit_above_cost
+----------------
+ 100000
+(1 row)
+
+ jit_optimize_above_cost
+-------------------------
+ 500000
+(1 row)
+```
+**→ 정상:** 기본값 확인  
+**→ 이상 시:** `jit = off` → 이 playbook 불필요 (JIT이 이미 비활성화됨)
+
+---
+
+```sql
 EXPLAIN (ANALYZE, VERBOSE, BUFFERS)
   SELECT id FROM bench_1m_384
   ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
   LIMIT 10;
--- "JIT:" 섹션 존재 여부 및 "Timing: yes/no" 확인
 ```
 
+**기대 출력 (JIT 활성화됨):**
+```
+...
+JIT:
+  Functions: 3
+  Options: Inlining true, Optimization true, Expressions true, Deforming true
+  Timing: Generation 1.234 ms, Inlining 5.678 ms, Optimization 12.345 ms, Emission 8.901 ms, Total 28.158 ms
+...
+```
+**기대 출력 (JIT 비활성화됨):**
+```
+(JIT: 섹션 없음)
+```
+**→ JIT: 섹션 없음:** 이 playbook 불필요  
+**→ JIT: 있고 p95 안정:** 이 playbook 불필요  
+**→ JIT: 있고 p95 스파이크:** Step 0으로
+
+---
+
 ```bash
-# 현재 postgresql.conf에서 JIT 관련 설정 확인
 ssh $GCP_VM "grep -E '^jit' \$(psql -t -c 'SHOW config_file' | tr -d ' ') 2>/dev/null || echo 'no jit settings'"
 ```
+
+**기대 출력:**
+```
+no jit settings
+```
+또는 현재 적용된 jit 관련 설정 행  
+**→ 참고:** postgresql.conf에 jit 관련 설정이 없으면 기본값이 적용 중임
 
 ---
 
@@ -57,89 +102,200 @@ JIT이 트리거되는 구조적 원인:
 
 ---
 
-## 4. 복구 절차 (Recovery steps)
+## 4. Step-by-step 복구
 
-### 4-1. baseline 측정 (현재 기본값)
+### Step 0 — 전제 확인
+
+```sql
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS)
+  SELECT id FROM bench_1m_384
+  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  LIMIT 10;
+```
+
+**→ JIT: 섹션 없음:** 이 playbook 불필요 — 중단  
+**→ JIT: 있고 p95 안정:** 이 playbook 불필요 — 중단  
+**→ JIT: 있고 p95 스파이크 확인됨:** Step 1으로
+
+---
+
+### Step 1 — baseline 기록
 
 현재 `jit_above_cost` 기본값에서 p50/p95/p99를 기록한다.
 large-dataset-benchmark.md §4-3의 latency 측정 결과를 기준으로 사용한다.
 
-### 4-2. threshold 후보 sweep
-
-후보 값: 기본값(100000), 1e6, 1e7, 1e8.
-각 값에서 p95/p99가 baseline 대비 스파이크 없이 안정적인지 확인한다.
-
 ```sql
--- 세션 레벨에서 후보 값 적용 (postgresql.conf 변경 없이 테스트)
-SET jit_above_cost = 1000000;   -- 1e6
-EXPLAIN (ANALYZE, BUFFERS)
-  SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
-  LIMIT 10;
--- JIT: 섹션 사라졌는지 확인, Planning/Execution time 기록
+SHOW jit_above_cost;
 ```
 
-```sql
-SET jit_above_cost = 10000000;  -- 1e7
-EXPLAIN (ANALYZE, BUFFERS)
-  SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
-  LIMIT 10;
+**기대 출력:**
+```
+ jit_above_cost
+----------------
+ 100000
+(1 row)
 ```
 
+현재 Planning/Execution time을 기록한다:
+
 ```sql
-SET jit_above_cost = 100000000; -- 1e8
 EXPLAIN (ANALYZE, BUFFERS)
   SELECT id FROM bench_1m_384
   ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
   LIMIT 10;
 ```
 
-### 4-3. 결과 해석 및 값 선택
+**기대 출력:**
+```
+Planning Time: X.XXX ms
+Execution Time: X.XXX ms
+```
 
+baseline p50 / p95 / p99 값을 메모한 뒤 Step 2로
+
+---
+
+### Step 2 — jit_above_cost = 1e6 테스트
+
+```sql
+SET jit_above_cost = 1000000;
+EXPLAIN (ANALYZE, BUFFERS)
+  SELECT id FROM bench_1m_384
+  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  LIMIT 10;
+```
+
+**기대 출력 (JIT 제거됨):**
+```
+Planning Time: X.XXX ms
+Execution Time: X.XXX ms
+(JIT: 섹션 없음)
+```
+**기대 출력 (JIT 여전히 있음):**
+```
+JIT:
+  ...
+```
+
+Planning/Execution time과 JIT: 섹션 유무를 기록한다.  
+**→ JIT 사라지고 p95 스파이크 없음:** 이 값이 후보 → Step 5로  
+**→ JIT 여전히 있음 또는 p95 스파이크 지속:** Step 3으로
+
+---
+
+### Step 3 — jit_above_cost = 1e7 테스트
+
+```sql
+SET jit_above_cost = 10000000;
+EXPLAIN (ANALYZE, BUFFERS)
+  SELECT id FROM bench_1m_384
+  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  LIMIT 10;
+```
+
+**기대 출력 (JIT 제거됨):**
+```
+Planning Time: X.XXX ms
+Execution Time: X.XXX ms
+(JIT: 섹션 없음)
+```
+
+Planning/Execution time과 JIT: 섹션 유무를 기록한다.  
+**→ JIT 사라지고 p95 스파이크 없음:** 이 값이 후보 → Step 5로  
+**→ JIT 여전히 있음 또는 p95 스파이크 지속:** Step 4로
+
+---
+
+### Step 4 — jit_above_cost = 1e8 테스트
+
+```sql
+SET jit_above_cost = 100000000;
+EXPLAIN (ANALYZE, BUFFERS)
+  SELECT id FROM bench_1m_384
+  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
+  LIMIT 10;
+```
+
+**기대 출력 (JIT 제거됨):**
+```
+Planning Time: X.XXX ms
+Execution Time: X.XXX ms
+(JIT: 섹션 없음)
+```
+
+Planning/Execution time과 JIT: 섹션 유무를 기록한다.  
+**→ JIT 사라지고 p95 스파이크 없음:** 이 값이 후보 → Step 5로  
+**→ 1e8에서도 JIT 있거나 p95 스파이크 지속:** Escalation 기준 참조
+
+**결과 해석:**
 - vector-search p95/p99가 스파이크 없는 후보 중 가장 낮은 값을 선택한다.
 - mixed analytical workload가 있는 경우: 분석 쿼리에 대해서도 동일 threshold를
   적용했을 때 JIT 이득이 유지되는지 별도 측정한다.
   vector-search 이득과 분석 쿼리 이득이 충돌하면 전역 설정 대신
   `SET LOCAL jit_above_cost` 또는 별도 connection pool 분리를 검토한다.
 
-### 4-4. postgresql.conf 적용 (결정 후에만)
+---
+
+### Step 5 — postgresql.conf 적용
+
+threshold 값이 결정된 경우에만 적용한다. 예: 1e7로 결정된 경우:
 
 ```bash
-# threshold 값이 결정된 경우에만 적용
-# 예: 1e7로 결정된 경우
 ssh $GCP_VM "sudo -u postgres psql -c \
   \"ALTER SYSTEM SET jit_above_cost = 10000000;\""
-ssh $GCP_VM "sudo -u postgres psql -c \"SELECT pg_reload_conf();\""
+```
 
-# 확인
+**기대 출력:**
+```
+ALTER SYSTEM
+```
+
+```bash
+ssh $GCP_VM "sudo -u postgres psql -c \"SELECT pg_reload_conf();\""
+```
+
+**기대 출력:**
+```
+ pg_reload_conf
+----------------
+ t
+(1 row)
+```
+
+적용 확인:
+
+```bash
 ssh $GCP_VM "psql -d postgres -c 'SHOW jit_above_cost;'"
 ```
 
-[WARN] `jit = off` 전역 적용은 허용되지 않는다. analytical workload의 JIT 이득을
-측정 없이 제거하는 것이기 때문이다. sweep 결과가 1e8에서도 스파이크가 사라지지 않는다면
-에스컬레이션한다.
+**기대 출력:**
+```
+ jit_above_cost
+----------------
+ 10000000
+(1 row)
+```
+**→ 성공:** 검증 체크리스트로  
+**→ 실패:** 값이 바뀌지 않음 → `ALTER SYSTEM` 후 `pg_reload_conf()` 재시도
+
+> [!WARNING]
+> `jit = off` 전역 적용은 허용되지 않는다. analytical workload의 JIT 이득을
+> 측정 없이 제거하는 것이기 때문이다. sweep 결과가 1e8에서도 스파이크가 사라지지 않는다면
+> 에스컬레이션한다.
 
 ---
 
-## 5. 검증 명령 (Verification commands)
+## 5. 검증 체크리스트
 
-```sql
--- threshold 적용 후 JIT 섹션 소멸 확인
-EXPLAIN (ANALYZE, BUFFERS)
-  SELECT id FROM bench_1m_384
-  ORDER BY v <-> '[0.1,0.2,...]'::vector(384)
-  LIMIT 10;
--- "JIT:" 섹션이 없거나 "Timing: no"여야 함
-
--- p50/p95/p99 재측정 (baseline 대비 개선 또는 동등 확인)
-```
-
-```bash
-# 설정이 재시작 후에도 유지되는지 확인
-ssh $GCP_VM "sudo systemctl restart postgresql"
-ssh $GCP_VM "psql -d postgres -c 'SHOW jit_above_cost;'"
-```
+- [ ] `EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM bench_1m_384 ORDER BY v <-> '[0.1,0.2,...]'::vector(384) LIMIT 10;` → 기대 출력: `JIT:` 섹션 없거나 `Timing: no`
+- [ ] p50/p95/p99 재측정 → 기대 출력: baseline 대비 p95 스파이크 없고 동등하거나 개선됨
+- [ ] `SHOW jit_above_cost;` → 기대 출력: 결정된 threshold 값 (예: `10000000`)
+- [ ] 재시작 후 설정 유지 확인:
+  ```bash
+  ssh $GCP_VM "sudo systemctl restart postgresql"
+  ssh $GCP_VM "psql -d postgres -c 'SHOW jit_above_cost;'"
+  ```
+  → 기대 출력: 설정한 값 그대로 유지
 
 ---
 

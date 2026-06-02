@@ -15,26 +15,59 @@ reload되고 heap rebuild 없이 검색이 정상 동작하는지 확인한다.
 
 ---
 
-## 2. 확인 명령 (Diagnostic commands)
+## 2. 진단
 
 ```bash
-# 서비스 상태 확인
 sudo systemctl status pg-cuvs-server
+```
 
-# 최근 journal (재시작 전후)
+**기대 출력:**
+```
+● pg-cuvs-server.service - pg_cuvs GPU index server
+   Loaded: loaded (...)
+   Active: active (running) since ...
+```
+**→ 정상:** Active: active (running)  
+**→ 이상 시:** `failed` 또는 `activating` → journalctl로 원인 확인
+
+---
+
+```bash
 sudo journalctl -u pg-cuvs-server -n 50 --no-pager
+```
 
-# persisted artifact 목록
-ls -lh /tmp/cuvs_indexes/
-# 또는 cuvs.index_dir 경로가 다른 경우:
-psql -d postgres -c "SHOW cuvs.index_dir;"
+**기대 출력:**
+```
+pg_cuvs_server: loaded index <db_oid>/<index_oid> (<n> vecs, <N> MB VRAM)
+```
+**→ 정상:** `loaded index` 메시지 존재 → Step 3 (검증)으로  
+**→ 이상 시:** `loaded index` 없음 → 아래 분기 확인
 
-# 소켓 파일 존재 여부
+---
+
+```bash
 ls -la /tmp/.s.pg_cuvs
+```
 
-# VRAM 여유 확인 (로드 실패 원인 중 하나)
+**기대 출력:**
+```
+srwxrwxrwx 1 postgres postgres 0 ... /tmp/.s.pg_cuvs
+```
+**→ 정상:** 소켓 파일 존재하고 서비스가 running  
+**→ 이상 시:** 파일 존재하는데 서비스가 `failed` → stale 소켓 → 원인 C로
+
+---
+
+```bash
 nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits
 ```
+
+**기대 출력:**
+```
+5000, 40960
+```
+**→ 정상:** free가 인덱스 로드에 충분한 여유  
+**→ 이상 시:** free가 매우 낮음 → 원인 B로
 
 ---
 
@@ -54,10 +87,12 @@ journal에 `VRAM budget exceeded loading` 또는 `insufficient VRAM loading` 메
 systemd unit이 `ExecStartPre`로 소켓을 제거하지 않으면 `bind: address already in use`.
 daemon 코드는 `main()` 진입 시 `unlink(g_socket_path)`를 수행하므로 정상 종료 경로에서는
 발생하지 않는다. SIGKILL 후 수동 정리가 필요할 수 있다.
+→ 복구 Step 2A로
 
 ### D. index_dir 경로 불일치
 `postgresql.conf`의 `cuvs.index_dir`와 daemon의 `--index-dir` 인수가 다르면
 PG는 다른 경로를 가리키고 daemon은 다른 경로에서 파일을 찾는다.
+→ 복구 Step 2B로
 
 ### E. 소켓 권한 문제
 systemd unit의 `ExecStartPost`에서 `chmod 666 /tmp/.s.pg_cuvs`가 실행되기 전에
@@ -66,77 +101,136 @@ PG backend가 connect를 시도하면 `EACCES`로 `UNAVAILABLE`이 된다.
 
 ---
 
-## 4. 복구 절차 (Recovery steps)
+## 4. Step-by-step 복구
 
-### 표준 재시작
+### Step 1 — 표준 재시작
 
 ```bash
 sudo systemctl restart pg-cuvs-server
-
-# 재시작 완료 대기 (loaded index 메시지 확인)
-sudo journalctl -u pg-cuvs-server -f --no-pager &
-JPID=$!
-sleep 5
-kill $JPID
 ```
 
-### stale 소켓 수동 정리 후 재시작
+**기대 출력:**
+```
+(에러 없이 즉시 완료)
+```
+**→ 성공:** Step 2로  
+**→ 실패:** `Job for pg-cuvs-server.service failed` → journalctl 확인
+
+---
+
+### Step 2 — journal에서 loaded index 확인
+
+```bash
+sudo journalctl -u pg-cuvs-server -n 50 --no-pager
+```
+
+**기대 출력:**
+```
+pg_cuvs_server: loaded index <db_oid>/<index_oid> (<n> vecs, <N> MB VRAM)
+```
+**→ 성공:** `loaded index` 있음 → Step 3 (검증)으로  
+**→ 실패:** `loaded index` 없고 stale socket 의심 → Step 2A로  
+**→ 실패:** `loaded index` 없고 index_dir 불일치 의심 → Step 2B로  
+**→ 실패:** `loaded index` 없고 journal에 VRAM 관련 메시지 → Step 2C로
+
+---
+
+### Step 2A — stale 소켓 수동 정리 후 시작
+
+```bash
+ls /tmp/.s.pg_cuvs
+```
+
+**기대 출력:**
+```
+/tmp/.s.pg_cuvs
+```
+
+파일이 존재하면:
 
 ```bash
 sudo rm -f /tmp/.s.pg_cuvs
 sudo systemctl start pg-cuvs-server
 ```
 
-### index_dir 경로 동기화 확인
-
-```bash
-# daemon 실행 인수 확인
-sudo systemctl cat pg-cuvs-server | grep ExecStart
-
-# PG GUC 확인
-psql -d postgres -c "SHOW cuvs.index_dir;"
+**기대 출력:**
 ```
-
-두 값이 다르면 systemd unit의 `--index-dir` 인수 또는 `postgresql.conf`의
-`cuvs.index_dir`를 일치시킨다. 수정 후 해당 서비스만 재시작하면 된다.
-
-### VRAM 부족으로 일부 인덱스가 로드 안 된 경우
-
-```bash
-# journal에서 skip된 인덱스 확인
-sudo journalctl -u pg-cuvs-server --no-pager | grep 'skip\|VRAM'
+(에러 없이 완료)
 ```
-
-skip된 인덱스에 대한 검색은 `CUVS_STATUS_NOT_FOUND`를 반환하고 CPU fallback한다.
-VRAM 여유가 생기면 handle_search 내의 lazy load 경로(`load_index` in handle_search)가
-동일 세션 내 다음 검색 시 재시도한다.
+**→ 성공:** Step 2로 돌아가 journal 재확인  
+**→ 실패:** 다른 오류 메시지 → Step 2B 또는 journalctl 전체 확인
 
 ---
 
-## 5. 검증 명령 (Verification commands)
+### Step 2B — index_dir 경로 동기화 확인
 
 ```bash
-# journal에서 reload 확인
-sudo journalctl -u pg-cuvs-server --no-pager | grep 'loaded index'
-# 예상 출력: pg_cuvs_server: loaded index <db_oid>/<index_oid> (<n> vecs, <N> MB VRAM)
-
-# 서비스 active 확인
-sudo systemctl is-active pg-cuvs-server
-# 출력: active
+sudo systemctl cat pg-cuvs-server | grep ExecStart
 ```
+
+**기대 출력:**
+```
+ExecStart=/usr/local/bin/pg_cuvs_server --index-dir /tmp/cuvs_indexes ...
+```
+
+```bash
+psql -d postgres -c "SHOW cuvs.index_dir;"
+```
+
+**기대 출력:**
+```
+ cuvs.index_dir
+----------------
+ /tmp/cuvs_indexes
+(1 row)
+```
+**→ 두 값이 일치:** 경로가 원인이 아님 → 다른 분기 확인  
+**→ 두 값이 불일치:** systemd unit의 `--index-dir` 또는 `postgresql.conf`의 `cuvs.index_dir`를 일치시킨 뒤 해당 서비스 재시작 → Step 2로 돌아가 journal 재확인
+
+---
+
+### Step 2C — VRAM 부족 확인
+
+```bash
+sudo journalctl -u pg-cuvs-server --no-pager | grep -i 'VRAM\|skip'
+```
+
+**기대 출력:**
+```
+pg_cuvs_server: VRAM budget exceeded loading index ..., skip
+```
+**→ VRAM 관련 메시지 있음:** vram-oom-fallback.md 참조  
+**→ 없음:** 다른 원인 → journalctl 전체 확인 후 Escalation 기준 참조
+
+---
+
+### Step 3 — 검증
 
 ```sql
--- 재시작 후 heap rebuild 없이 검색이 정상 동작하는지 확인
--- (인덱스 생성 없이 기존 cagra index 사용)
-SELECT id FROM items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
--- 이전과 동일한 결과여야 함
-
--- GPU path가 사용되었는지 확인 (fallback 없이)
 SET cuvs.debug = on;
 SELECT id FROM items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
--- NOTICE: pg_cuvs: cagra scan ... 메시지가 나와야 함
 SET cuvs.debug = off;
 ```
+
+**기대 출력:**
+```
+NOTICE:  pg_cuvs: cagra scan index_oid=XXXXX gpu
+ id
+----
+  1
+(1 row)
+```
+**→ 성공:** NOTICE에 `cagra scan ... gpu` 포함 → 복구 완료  
+**→ 실패:** NOTICE 없거나 fallback 메시지 → Step 2 재확인
+
+---
+
+## 5. 검증 체크리스트
+
+- [ ] `sudo systemctl is-active pg-cuvs-server` → 기대 출력: `active`
+- [ ] `sudo journalctl -u pg-cuvs-server --no-pager | grep 'loaded index'` → 기대 출력: `pg_cuvs_server: loaded index <db_oid>/<index_oid> (<n> vecs, <N> MB VRAM)` 1줄 이상
+- [ ] `SET cuvs.debug = on; SELECT id FROM items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;` → 기대 출력: `NOTICE: pg_cuvs: cagra scan index_oid=XXXXX gpu`
+- [ ] 이전과 동일한 결과 반환 (heap rebuild 없이 기존 cagra index 사용)
 
 ---
 

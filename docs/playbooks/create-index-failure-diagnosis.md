@@ -25,32 +25,143 @@ HINT:   pg_cuvs_server is not reachable. Start it and retry CREATE INDEX, ...
 
 ---
 
-## 2. 확인 명령 (Diagnostic commands)
+## 2. 진단
+
+오류 메시지의 `status=N` 값을 읽고 아래 순서로 확인한다.
+
+### 2-1. status 코드 확인
+
+```
+ERROR:  pg_cuvs: BUILD failed (status N); ...
+```
+
+| status N | 원인 | 이동 |
+|---|---|---|
+| 4 | daemon 미구동 | Step 2A로 |
+| 2 | VRAM 부족 | Step 2B로 |
+| 5 | GPU CAGRA 빌드 실패 | Step 2C로 |
+| 6 | 디스크 직렬화 실패 | Step 2D로 |
+| 1 | 기타 daemon 오류 | journal 확인 후 Step 2A로 |
+
+---
+
+### Step 2A — daemon 상태 확인 (status=4)
+
+psql 안에서 나가지 않고 확인하려면 `\!` 메타 커맨드를 사용한다:
+
+```sql
+-- psql 안에서 바로 실행
+\! sudo systemctl is-active pg-cuvs-server
+```
+
+또는 bash에서:
 
 ```bash
-# daemon 상태 확인
-sudo systemctl status pg-cuvs-server
 sudo systemctl is-active pg-cuvs-server
+```
 
-# daemon journal (최근 100줄)
-sudo journalctl -u pg-cuvs-server -n 100 --no-pager
+**기대 출력:**
+```
+active
+```
+**-> 정상 (active):** Step 2A-2로  
+**-> 이상 (inactive / failed):** daemon 미구동 -> 복구 Step 1로
 
-# 소켓 존재 여부
+```bash
+# Step 2A-2: 소켓 존재 여부
 ls -la /tmp/.s.pg_cuvs
+```
 
-# index_dir 디스크 여유 공간
-df -h /tmp/cuvs_indexes/
+**기대 출력:**
+```
+srwxrwxrwx 1 postgres postgres 0 ... /tmp/.s.pg_cuvs
+```
+**-> 정상:** 소켓 있음 -> GUC 확인 (SHOW cuvs.socket_path;) 후 재시도  
+**-> 이상 (No such file):** 소켓 없음 -> 복구 Step 1로
 
-# VRAM 여유
+---
+
+### Step 2B — VRAM 여유 확인 (status=2)
+
+```bash
 nvidia-smi --query-gpu=memory.free,memory.total --format=csv,noheader,nounits
 ```
 
-```sql
--- PostgreSQL에서 GUC 확인
-SHOW cuvs.socket_path;
-SHOW cuvs.index_dir;
-SHOW enable_cuvs;
+**기대 출력 (단위: MiB):**
 ```
+8192, 24576
+```
+**-> 정상 (free > 1000):** VRAM 충분 -> journal에서 eviction 실패 여부 확인  
+**-> 이상 (free < 500):** VRAM 부족 -> 복구 Step 2로
+
+```bash
+# eviction 관련 로그 확인
+sudo journalctl -u pg-cuvs-server --no-pager | grep -E 'VRAM|evict|MB'
+```
+
+**기대 출력:**
+```
+pg_cuvs: evicted index 16384/16392 (freed 512 MB)
+```
+**-> eviction 없이 OOM:** 복구 Step 2로  
+**-> eviction 반복 실패:** daemon 재시작 검토
+
+---
+
+### Step 2C — GPU 빌드 오류 확인 (status=5)
+
+```bash
+sudo journalctl -u pg-cuvs-server --no-pager | grep -E 'cuvs_cagra_build|FAILED|CUDA|error'
+```
+
+**기대 출력 (오류 예시):**
+```
+pg_cuvs: cuvs_cagra_build returned NULL (CUDA out of memory)
+```
+**-> CUDA out of memory:** OOM_FALLBACK과 동일 -> 복구 Step 2로  
+**-> cuVS API 오류 (`cuvs_cagra_build returned NULL` 외 메시지):** libcuvs 버전 불일치 -> 복구 Step 3로  
+**-> 오류 없음:** daemon journal 전체 확인 후 에스컬레이션
+
+---
+
+### Step 2D — 디스크/registry 확인 (status=6)
+
+```bash
+# 디스크 공간
+df -h $(psql -t -c "SHOW cuvs.index_dir;" | tr -d ' ')
+```
+
+**기대 출력:**
+```
+Filesystem  Size  Used Avail Use%
+tmpfs        16G  2.1G   14G  14% /tmp
+```
+**-> 정상 (Avail > 1G):** Step 2D-2로  
+**-> 이상 (Use% > 95%):** 디스크 꽉 참 -> 복구 Step 4로
+
+```bash
+# Step 2D-2: tmp 파일 잔재 (원자적 rename 실패 흔적)
+ls /tmp/cuvs_indexes/*.tmp 2>/dev/null
+```
+
+**기대 출력:**
+```
+(출력 없음)
+```
+**-> .tmp 파일 있음:** 이전 빌드가 rename 전에 중단됨 -> `rm -f /tmp/cuvs_indexes/*.tmp` 후 재시도  
+**-> 출력 없음:** Step 2D-3으로
+
+```bash
+# Step 2D-3: registry full 여부
+sudo journalctl -u pg-cuvs-server --no-pager | grep 'registry full'
+```
+
+**기대 출력 (registry full 시):**
+```
+pg_cuvs: registry full (64/64 slots occupied), cannot add new index
+```
+**-> registry full:** 복구 Step 5로  
+**-> 출력 없음:** 디스크 권한 확인 (`ls -la /tmp/cuvs_indexes/`) 후 에스컬레이션
 
 ---
 
@@ -66,119 +177,217 @@ IPC status code별 원인과 힌트 메시지:
 | `CUVS_STATUS_PERSIST_FAILED` | 6 | 빌드 성공, 디스크 직렬화 실패 또는 registry full | 디스크 공간/권한 확인, registry 정원(64) 초과 확인 |
 | `CUVS_STATUS_ERROR` | 1 | 기타 daemon 오류 (shm 실패 등) | journal 확인 |
 
-### A. UNAVAILABLE (status=4): daemon 미구동
-```bash
-sudo systemctl start pg-cuvs-server
-sleep 2
-sudo systemctl is-active pg-cuvs-server
-ls -la /tmp/.s.pg_cuvs
-```
-
-### B. OOM_FALLBACK (status=2): VRAM 부족
-```bash
-# 현재 VRAM 점유 확인
-nvidia-smi
-sudo journalctl -u pg-cuvs-server --no-pager | grep 'VRAM\|evict\|MB'
-```
-VRAM 확보 방법:
-- 사용하지 않는 cagra 인덱스를 DROP INDEX한 뒤 `REINDEX` (LRU eviction 트리거).
-- daemon 재시작 (`--max-vram-mb` 값 검토).
-- 인덱스 수를 줄이거나 `cuvs.max_vram_mb` GUC를 낮춰 eviction을 더 일찍 트리거.
-
-### C. BUILD_FAILED (status=5): GPU 빌드 오류
-```bash
-sudo journalctl -u pg-cuvs-server --no-pager | grep -E 'cuvs_cagra_build|FAILED|CUDA|error'
-```
-- CUDA out-of-memory during build: OOM_FALLBACK과 동일 복구 절차.
-- cuVS API 오류: libcuvs 버전과 빌드 시 헤더 버전 일치 여부 확인.
-
-### D. PERSIST_FAILED (status=6): 디스크 직렬화 실패
-```bash
-# 디스크 공간
-df -h $(psql -t -c "SHOW cuvs.index_dir;" | tr -d ' ')
-
-# 권한 (daemon user가 쓸 수 있어야 함)
-ls -la /tmp/cuvs_indexes/
-
-# tmp 파일 잔재 확인 (원자적 rename 실패 흔적)
-ls /tmp/cuvs_indexes/*.tmp 2>/dev/null
-
-# registry full 여부: journal에서 확인
-sudo journalctl -u pg-cuvs-server --no-pager | grep 'registry full'
-```
-
-원인 중 하나: registry full (MAX_INDEXES=64 slot이 모두 resident이고 LRU eviction이
-slot을 하나도 비우지 못함 — 예: eviction 대상의 save_index가 실패).
-
-registry full(최대 64개):
-```sql
--- 사용하지 않는 cagra 인덱스 조회
-SELECT indexname, tablename FROM pg_indexes
-WHERE indexdef LIKE '%USING cagra%'
-ORDER BY tablename;
--- 불필요한 인덱스 DROP INDEX 후 재시도
-```
+각 원인의 복구 이동:
+- UNAVAILABLE (status=4) -> 복구 Step 1로
+- OOM_FALLBACK (status=2) -> 복구 Step 2로
+- BUILD_FAILED (status=5) libcuvs 불일치 -> 복구 Step 3로
+- PERSIST_FAILED 디스크 공간 -> 복구 Step 4로
+- PERSIST_FAILED registry full -> 복구 Step 5로
 
 ---
 
-## 4. 복구 절차 (Recovery steps)
+## 4. Step-by-step 복구
 
-DDL이 실패하면 catalog는 이미 rollback된 상태다. 추가 cleanup이 필요 없다.
-원인을 해결한 뒤 `CREATE INDEX USING cagra`를 재시도한다.
+### Step 1 — daemon 시작 (UNAVAILABLE 복구)
 
-### UNAVAILABLE 복구
+psql 안에서 나가지 않고 바로 실행:
+
+```sql
+\! sudo systemctl start pg-cuvs-server
+\! sudo journalctl -u pg-cuvs-server -n 20 --no-pager
+```
+
+또는 bash에서:
 
 ```bash
 sudo systemctl start pg-cuvs-server
 sudo journalctl -u pg-cuvs-server -n 20 --no-pager
-# "listening on /tmp/.s.pg_cuvs" 확인
+```
+
+**기대 출력:**
+```
+pg_cuvs: listening on /tmp/.s.pg_cuvs
+pg_cuvs: startup_load_indexes: loaded N indexes
+```
+**-> 성공 ("listening on" 확인):** Step 5 (검증)로  
+**-> 실패 (start failed, dependency error):** `journalctl -xe` 확인 후 에스컬레이션
+
+---
+
+### Step 2 — VRAM 확보 (OOM_FALLBACK 복구)
+
+```sql
+-- 사용하지 않는 cagra 인덱스 확인
+SELECT indexname, tablename FROM pg_indexes
+WHERE indexdef LIKE '%USING cagra%'
+ORDER BY tablename;
+```
+
+**기대 출력:**
+```
+  indexname  | tablename
+-------------+-----------
+ cagra_idx   | items
+ cagra_idx2  | logs
 ```
 
 ```sql
--- 재시도
-CREATE INDEX cagra_idx ON items USING cagra (embedding vector_l2_ops);
+-- 불필요한 인덱스 DROP (LRU eviction 트리거)
+DROP INDEX cagra_idx2;
 ```
 
-### PERSIST_FAILED: 디스크 공간 부족
-
-```bash
-# 오래된 tmp 파일 정리 (daemon이 정리 못한 경우)
-rm -f /tmp/cuvs_indexes/*.tmp
-
-# 공간 확보 후 재시도
+**기대 출력:**
 ```
-
-### enable_cuvs=off로 CPU 경로 우회 (긴급)
-
-GPU 가속이 당장 필요하지 않은 경우:
+DROP INDEX
+```
+**-> 성공:** nvidia-smi로 VRAM 여유 재확인 후 CREATE INDEX 재시도  
+**-> DROP 후에도 VRAM 부족:** daemon 재시작 (`sudo systemctl restart pg-cuvs-server`) 후 재시도
 
 ```sql
+-- 긴급 우회: CPU(HNSW) 경로 사용
 SET enable_cuvs = off;
 CREATE INDEX hnsw_idx ON items USING hnsw (embedding vector_l2_ops);
--- GPU 준비 후 DROP INDEX hnsw_idx; CREATE INDEX USING cagra; 로 전환
+-- GPU 준비 후: DROP INDEX hnsw_idx; CREATE INDEX USING cagra;
 ```
 
 ---
 
-## 5. 검증 명령 (Verification commands)
+### Step 3 — 바이너리 재빌드 (BUILD_FAILED/버전 불일치 복구)
 
 ```bash
-# CREATE INDEX 성공 후 artifact가 디스크에 있는지 확인
-ls -lh /tmp/cuvs_indexes/
-# <db_oid>_<index_oid>.cagra + <db_oid>_<index_oid>.tids 쌍이 있어야 함
+# 로컬에서 VM으로 소스 동기화 (Makefile:L179)
+rsync -avz --delete \
+    --exclude '.git' --exclude 'src/*.o' --exclude 'src/*.bc' \
+    --exclude '*.so' --exclude '.env.gpu' \
+    ./ $(GCP_VM):~/pg_cuvs/
+```
 
-# daemon journal에 빌드 성공 메시지 확인
-sudo journalctl -u pg-cuvs-server --no-pager | tail -10
-# "built index <db_oid>/<index_oid> (<n> vecs, <N> MB VRAM)" 확인
+**기대 출력:**
+```
+sending incremental file list
+...
+sent N bytes  received M bytes
+```
+
+```bash
+# VM에서 재빌드 (Makefile:L188)
+ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && make 2>&1 | tee /tmp/pg_cuvs_build.log"
+```
+
+**기대 출력 (마지막 줄):**
+```
+build complete
+```
+**-> 빌드 성공:** Step 3-2로  
+**-> 빌드 실패 (CUDA 컴파일 오류):** `/tmp/pg_cuvs_build.log` 확인 후 에스컬레이션
+
+```bash
+# Step 3-2: VM에서 설치 (Makefile:L193)
+ssh -tt $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate $(CONDA_ENV) && sudo -E make install"
+```
+
+**기대 출력:**
+```
+/bin/install -c pg_cuvs.so $(pkglibdir)/pg_cuvs.so
+```
+**-> 성공:** CREATE INDEX 재시도 후 Step 5 (검증)로  
+**-> 실패 (permission denied):** `sudo -E` 환경 확인
+
+---
+
+### Step 4 — 디스크 공간 확보 (PERSIST_FAILED 복구)
+
+```bash
+# .tmp 잔재 제거 (daemon이 정리 못한 경우)
+rm -f /tmp/cuvs_indexes/*.tmp
+```
+
+**기대 출력:**
+```
+(출력 없음)
+```
+
+```bash
+# 디스크 공간 재확인
+df -h /tmp/cuvs_indexes/
+```
+
+**기대 출력:**
+```
+Avail 이 1G 이상이어야 함
+```
+**-> 공간 확보:** CREATE INDEX 재시도 후 Step 5 (검증)로  
+**-> 공간 부족 지속:** `/tmp` 전체 정리 또는 `cuvs.index_dir`을 다른 볼륨으로 변경
+
+---
+
+### Step 5 — registry 슬롯 확보 (PERSIST_FAILED / registry full 복구)
+
+```sql
+-- 인덱스 수 확인 (64개 초과 시 registry full)
+SELECT count(*) FROM pg_indexes WHERE indexdef LIKE '%USING cagra%';
+```
+
+**기대 출력:**
+```
+ count
+-------
+    64
 ```
 
 ```sql
--- 검색 동작 확인
+-- 불필요한 인덱스 DROP
+DROP INDEX <index_name>;
+```
+
+**기대 출력:**
+```
+DROP INDEX
+```
+**-> 성공:** CREATE INDEX 재시도 후 Step 5 (검증)로  
+**-> DROP 후에도 registry full:** daemon 재시작 후 재시도 (`sudo systemctl restart pg-cuvs-server`)
+
+---
+
+## 5. 검증 체크리스트
+
+CREATE INDEX 성공 후 아래를 순서대로 확인한다.
+
+```bash
+# artifact 쌍 확인
+ls -lh /tmp/cuvs_indexes/
+```
+
+**기대 출력:**
+```
+-rw-r--r-- 1 postgres postgres  45M ... 16384_16392.cagra
+-rw-r--r-- 1 postgres postgres  12K ... 16384_16392.tids
+```
+- [ ] `.cagra` + `.tids` 쌍이 존재한다
+
+```bash
+# daemon journal에서 빌드 성공 메시지 확인
+sudo journalctl -u pg-cuvs-server --no-pager | tail -10
+```
+
+**기대 출력:**
+```
+pg_cuvs: built index 16384/16392 (N vecs, M MB VRAM)
+```
+- [ ] `built index <db_oid>/<index_oid>` 메시지가 있다
+
+```sql
+-- 검색 동작 확인 (GPU path 사용 여부)
 SET cuvs.debug = on;
 SELECT id FROM items ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
--- NOTICE: pg_cuvs: cagra scan ... 확인
 SET cuvs.debug = off;
 ```
+
+**기대 출력:**
+```
+NOTICE:  pg_cuvs: cagra scan ...
+```
+- [ ] `NOTICE: pg_cuvs: cagra scan` 메시지가 있다 (GPU path 사용 중)
 
 ---
 

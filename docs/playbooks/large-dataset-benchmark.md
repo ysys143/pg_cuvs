@@ -17,21 +17,116 @@ PLAN.md §5 참조.
 
 ---
 
-## 2. 확인 명령 (Diagnostic commands)
+## 빠른 실행 (make 래퍼)
+
+### 빠른 sanity (10K×384, 기본값)
+
+```bash
+# make gpu-bench 가 실제로 하는 것 (Makefile:L264):
+# ssh VM에서 benchmark.sh 실행 후 tee design/bench_<ts>.log
+make gpu-bench
+```
+
+**기대:** `design/bench_YYYYMMDD_HHMM.log` 생성 + 마지막에 `[bench] SUMMARY` 블록
+
+**기대 출력 (SUMMARY 예시):**
+```
+[bench] SUMMARY
+build_time_s: 12.3
+cagra_bytes: 41943040
+vram_used_mb_after_build: 48
+cold_planning_ms: 2.1
+warm_planning_ms: 0.3
+exec_p50_ms: 0.8
+exec_p95_ms: 1.2
+exec_p99_ms: 1.5
+fallbacks: 0
+jit_section: no
+```
+**→ `jit_section: no`:** 완료. threshold 변경 불필요  
+**→ `jit_section: yes`:** p95/p99 확인 → p95가 p50의 3배 이상이면 `jit-threshold-sweep.md` 실행 여부 결정
+
+---
+
+### PLAN 완료 게이트 (1M×1536)
+
+```bash
+# Makefile:L273: $(MAKE) gpu-bench N=1000000 DIM=1536
+make gpu-bench-1m
+```
+
+**기대:** 빌드 수 분 + SUMMARY 블록
+
+**기대 출력 (SUMMARY 예시):**
+```
+[bench] SUMMARY
+build_time_s: 180.5
+vram_used_mb_after_build: 3072
+exec_p50_ms: 2.4
+exec_p95_ms: 3.8
+fallbacks: 0
+jit_section: no
+```
+**→ `jit_section: no`:** Phase 1.5 완료 기준 통과  
+**→ `jit_section: yes`:** p95/p99 확인 → `jit-threshold-sweep.md` 실행 여부 결정  
+**→ backend OOM 중 `cuvs_ambuild()`:** PLAN.md Phase 2 §5 streaming handoff로 에스컬레이션
+
+---
+
+### 임의 크기 실행
+
+```bash
+# N/DIM/K/M 를 넘겨 특정 셀만 실행
+make gpu-bench N=1000000 DIM=384 K=100
+```
+
+출력은 `make gpu-bench`가 `design/bench_<timestamp>.log`로 tee 한다.
+모든 metric은 `metric: value` 형태이며 끝에 `[bench] SUMMARY` 블록으로 모인다:
+`build_time_s`, `cagra_bytes`, `tids_bytes`, `vram_used_mb_after_build`,
+`cold_planning_ms`, `warm_planning_ms`, `exec_p50_ms`/`p95`/`p99`,
+`fallbacks`, `reload_time_s`, `compute_apps`, 그리고 핵심 게이트 datum인
+`jit_section: yes/no`.
+
+---
+
+## 2. 진단
 
 ```bash
 # GPU 메모리 현황
 ssh $GCP_VM "nvidia-smi --query-gpu=memory.total,memory.used,memory.free \
   --format=csv,noheader,nounits"
+```
 
+**기대 출력:**
+```
+24576, 512, 24064
+```
+**→ `memory.free` 충분:** 인덱스 빌드 진행  
+**→ `memory.free` 부족:** VRAM 예산(`--max-vram-mb`) 조정 필요
+
+```bash
 # daemon 보유 인덱스 및 VRAM 사용량 (journal 기준)
 ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager \
   | grep -E 'loaded index|built index'"
+```
 
+**기대 출력:**
+```
+[INFO] pg_cuvs_server: built index 16384/16392 (1000000 vecs, 512 MB VRAM)
+```
+
+```bash
 # 백엔드별 CUDA context 소유 여부 확인 (pg_cuvs_server 외 프로세스가 GPU를 잡으면 ADR-002 위반)
 ssh $GCP_VM "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
   --format=csv,noheader"
 ```
+
+**기대 출력:**
+```
+12345, pg_cuvs_server, 512
+```
+**→ `pg_cuvs_server`만 있음:** 정상  
+**→ PG 백엔드 프로세스가 CUDA context 소유:** ADR-002 위반 → 즉시 에스컬레이션
 
 ---
 
@@ -49,7 +144,10 @@ ssh $GCP_VM "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
 
 ---
 
-## 4. 복구 절차 (Recovery steps)
+## 4. 상세 측정이 필요할 때
+
+> 아래 수동 SQL 절차는 `make gpu-bench` 래퍼가 커버하지 않는 세부 분석이나 특정 셀
+> 재측정이 필요할 때 사용한다.
 
 ### 4-1. 데이터 생성
 
@@ -157,22 +255,39 @@ ssh $GCP_VM "sudo journalctl -u pg-cuvs-server --no-pager \
 
 ---
 
-## 5. 검증 명령 (Verification commands)
+## 5. 검증 체크리스트
 
 ```bash
 # daemon이 단독으로 GPU를 점유하는지 확인 (PG 백엔드 0 MB여야 함)
 ssh $GCP_VM "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
   --format=csv,noheader"
-# pg_cuvs_server 프로세스만 나와야 함
 ```
+
+**기대 출력:**
+```
+12345, pg_cuvs_server, 512
+```
+**→ pg_cuvs_server 프로세스만 나와야 함**
 
 ```sql
 -- 검색 결과 정확도 (id=1이 자기 자신의 최근접 이웃이어야 함)
 SELECT id FROM bench_10k_384
 ORDER BY v <-> (SELECT v FROM bench_10k_384 WHERE id = 1)
 LIMIT 1;
--- 출력: 1
 ```
+
+**기대 출력:**
+```
+ id
+----
+  1
+```
+
+- [ ] SUMMARY 블록에 `jit_section: no` (또는 yes 시 p95/p99 허용 범위 내)
+- [ ] `fallbacks: 0` (OOM fallback 없음)
+- [ ] `nvidia-smi compute-apps`에 `pg_cuvs_server`만 있음 (ADR-002 준수)
+- [ ] `id=1` 자기 자신 최근접 이웃 확인 (정확도 기본 검증)
+- [ ] `design/bench_YYYYMMDD_HHMM.log` 파일 생성됨
 
 ---
 
@@ -184,32 +299,3 @@ LIMIT 1;
   (malloc 사용). PLAN.md Phase 2 §5 streaming handoff로 에스컬레이션.
 - `EXPLAIN (ANALYZE)`에 `JIT:` 섹션이 있고 p95 latency가 p50의 3배 이상이면:
   jit-threshold-sweep.md를 실행한다. 측정 없이 `jit = off`를 적용하지 않는다 (ADR-018).
-
----
-
-## 7. How to run (harness)
-
-위 §4의 수동 절차는 `infra/scripts/benchmark.sh`로 자동화되어 있다.
-로컬 노트북에는 toolchain/daemon이 없으므로 **VM에서 leader가 실행**한다.
-
-```bash
-# Default sanity 실행 (10000 x 384, k=10, M=100 queries). 빠르게 동작 확인.
-make gpu-bench
-
-# PLAN 완료 게이트 실행 (1M x 1536d, VRAM-stress). 명시적 타깃.
-make gpu-bench-1m
-
-# 임의 크기: N/DIM/K/M 를 넘겨 특정 셀만 실행.
-make gpu-bench N=1000000 DIM=384 K=100
-```
-
-출력은 `make gpu-bench`가 `design/bench_<timestamp>.log`로 tee 한다.
-모든 metric은 `metric: value` 형태이며 끝에 `[bench] SUMMARY` 블록으로 모인다:
-`build_time_s`, `cagra_bytes`, `tids_bytes`, `vram_used_mb_after_build`,
-`cold_planning_ms`, `warm_planning_ms`, `exec_p50_ms`/`p95`/`p99`,
-`fallbacks`, `reload_time_s`, `compute_apps`, 그리고 핵심 게이트 datum인
-`jit_section: yes/no`.
-
-**핵심:** `jit_section: yes`이면 §3 분기에 따라 p95/p99를 보고
-jit-threshold-sweep.md sweep 필요 여부를 결정한다. `jit_section: no`이면
-threshold 변경 불필요.
