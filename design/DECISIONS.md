@@ -770,6 +770,117 @@ Crossover N  ~ 1005 / 0.189 ~ 5300 rows
 
 ---
 
+## ADR-031b — import_hnsw AccessExclusiveLock 수정 (correctness)
+
+**날짜**: 2026-06-01  
+**상태**: 결정됨 (버그 수정)
+
+### 문제
+
+`pg_cuvs_import_hnsw`가 target HNSW를 `ExclusiveLock`으로 열었다. `ExclusiveLock`은 `AccessShareLock`(인덱스 스캔이 잡는 락)과 충돌하지 않으므로, truncate + 페이지 재작성 도중 concurrent SELECT가 반쯤 지워진 페이지를 읽을 수 있었다.
+
+### 결정
+
+`index_open(hnsw_oid, AccessExclusiveLock)`으로 변경. REINDEX와 동일한 수준으로 import 완료까지 모든 concurrent access를 블록.
+
+### 영향
+
+- import는 offline DDL (이미 문서화)
+- 기존 테스트의 `WARNING: you don't own a lock of type ExclusiveLock` 제거됨
+- 변경 파일: `src/hnsw_export.c`
+
+---
+
+## ADR-032 — HNSW 사이드카 직렬화 조건부화
+
+**날짜**: 2026-06-01  
+**상태**: 결정됨
+
+### 배경
+
+`from_cagra()` CPU 직렬화(~30s @ 1M×1024)가 모든 CAGRA 빌드에 무조건 실행됐다.
+CAGRA-search만 사용하는 사용자도 30s 패널티를 받는다.
+
+### 결정
+
+BUILD IPC 프레임에 `use_cpu_hnsw` 플래그를 추가하고, 데몬은 이 값이 1일 때만 `.hnsw` 사이드카를 직렬화한다. 백엔드는 `cuvs_cpu_hnsw_fallback` GUC 값을 전달한다.
+
+### 영향
+
+- CAGRA-only 빌드: 사이드카 생략 → ~30s 절감
+- 3I import 경로: `SET cuvs.cpu_hnsw_fallback = on` 후 CREATE INDEX 필요
+- **버그 수정 포함**: `cuvs_ipc_build()`에 `use_cpu_hnsw` 파라미터 미전달 버그 수정 (BUILD 명령이 항상 0 전달 → 사이드카 미생성)
+- 변경 파일: `src/cuvs_ipc.c`, `src/cuvs_ipc.h`, `src/pg_cuvs.c`, `src/pg_cuvs_server.c`
+
+---
+
+## ADR-033 — UNLOGGED 인덱스 타겟 지원
+
+**날짜**: 2026-06-01  
+**상태**: 결정됨
+
+### 배경
+
+`pg_cuvs_import_hnsw`는 페이지마다 `log_newpage_buffer(buf, true)`를 호출해 full-page WAL을 기록한다. 1M×1024 인덱스(~8GB) 기준 WAL 기록이 ~28s를 차지한다.
+
+### 결정
+
+타겟 HNSW 인덱스의 `relpersistence`를 syscache에서 확인하고, UNLOGGED(`RELPERSISTENCE_UNLOGGED`)이면 `log_newpage_buffer` 호출을 생략한다. UNLOGGED 시 NOTICE 메시지 출력.
+
+### 트레이드오프
+
+- LOGGED (기본): crash-safe, WAL 기록, ~57s
+- UNLOGGED: crash 시 인덱스 손실, WAL 없음, ~28s
+- 기본 경로 동작 완전 보존 (opt-in)
+- 변경 파일: `src/hnsw_export.c`, `sql/pg_cuvs--0.1.0.sql`
+
+---
+
+## ADR-036 — Phase 3J: pg_cuvs_import_cagra (직접 변환)
+
+**날짜**: 2026-06-01  
+**상태**: 결정됨 + 실측 완료
+
+### 배경
+
+`pg_cuvs_import_hnsw`는 hnswlib 중간 포맷(`.hnsw` 파일)을 경유한다:
+```
+CAGRA → from_cagra() (~30s) → .hnsw 파일 → 파싱 → pgvector pages (~57s)
+```
+`from_cagra()`를 제거하고 CAGRA adjacency list를 IPC로 직접 pgvector 페이지로 변환한다.
+
+### 결정
+
+새 SQL 함수 `pg_cuvs_import_cagra(cagra_oid, hnsw_oid)`:
+- 새 IPC 명령 `CUVS_OP_EXPORT_ADJACENCY`: 데몬이 GPU adjacency + 벡터 → shared memory
+- flat pgvector HNSW (all nodes level 0) 직접 작성
+- `cpu_hnsw_fallback=on` 불필요, `.hnsw` 파일 불필요
+
+### 실측 결과 (Cohere 1024d, N=1M, A100-40GB, 2026-06-01)
+
+| 경로 | CAGRA build | import | 합계 | recall@10 |
+|------|-------------|--------|------|-----------|
+| import_cagra (direct) | 55.7s | 63.3s | **119.0s** | 0.9963 |
+| import_hnsw (hnswlib) | 83.4s | 57.3s | **140.7s** | 0.9962 |
+
+**전체 1.18× 빠름**. recall/QPS 동일 — flat HNSW가 multi-level과 동등한 품질.
+
+### 트레이드오프
+
+- flat HNSW: 계층 없음 → 동일 recall을 위해 ef_search를 높여야 할 수 있음
+- import 단계 자체는 IPC 4GB 전송 오버헤드로 6s 느림
+- 전체 speedup은 from_cagra() 제거분(28s)에서 옴
+
+### 선택 가이드
+
+| 요구사항 | 권장 |
+|----------|------|
+| 가장 빠른 경로 (crash unsafe) | import_cagra + UNLOGGED (~96s) |
+| crash-safe + 빠름 | import_cagra + LOGGED (~119s) |
+| multi-level HNSW 계층 보장 | import_hnsw (~140s) |
+
+---
+
 ## ADR-034 — CAGRA 빌드 PostgreSQL 오버헤드 감소 로드맵
 
 **날짜**: 2026-06-02  
