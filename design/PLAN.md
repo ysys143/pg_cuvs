@@ -867,8 +867,38 @@ Phase 3I status: **COMPLETE** (2026-06-02).
 
 ---
 
+#### Phase 3K — CREATE INDEX ... USING pg_cuvs_hnsw DDL 문법 전환
+
+목표: `pg_cuvs_build_hnsw()` SQL 함수 호출 방식을 표준 `CREATE INDEX` DDL 문법으로 전환해 PostgreSQL 인덱스 관리 표준 경로와 통합한다.
+
+배경:
+- 현재 CAGRA→HNSW 변환은 `SELECT pg_cuvs_build_hnsw('my_cagra'::regclass, 'nsw')` 함수 호출이다.
+- 이 방식은 `pg_indexes` 카탈로그에 노출되지 않고, `pg_dump`/`pg_restore`에서 자동 지원되지 않으며, `DROP INDEX`/`REINDEX`가 자연스럽지 않다.
+
+결정 (ADR-038):
+- `pg_cuvs_hnsw` 커스텀 Access Method를 등록한다.
+- `CREATE INDEX my_idx ON items USING pg_cuvs_hnsw (embedding vector_l2_ops) WITH (source = 'my_cagra', mode = 'nsw')` 형태의 표준 DDL을 사용한다.
+- `ambuild()` 안에서 현재 `pg_cuvs_build_hnsw()`의 로직(source CAGRA 찾기 -> `INDEX_CREATE_SKIP_BUILD`로 pgvector HNSW 껍데기 생성 -> CAGRA 그래프를 pgvector 페이지로 변환)을 수행한다.
+
+구현 항목:
+- `pg_cuvs_hnsw` AM handler 등록 (`CREATE ACCESS METHOD pg_cuvs_hnsw TYPE INDEX HANDLER pg_cuvs_hnsw_handler`).
+- `ambuild()`에서 `WITH` 절 파라미터(`source`, `mode`, `ef_construction` 등)를 파싱하고 기존 빌드 로직을 실행.
+- `amvalidate()`에서 source CAGRA 인덱스 존재 여부와 dimension/metric 호환성을 검증.
+- pgvector 호환성: 버전 고정(pgvector >= 0.7.0) + CI 호환 매트릭스 테스트.
+- 기존 `pg_cuvs_build_hnsw()` SQL 함수를 deprecate 또는 제거.
+
+Phase 3K 완료 기준:
+- `CREATE INDEX ... USING pg_cuvs_hnsw` DDL이 CAGRA source에서 pgvector HNSW 인덱스를 생성한다.
+- 생성된 인덱스가 `pg_indexes` 카탈로그에 정상 노출된다.
+- `DROP INDEX`와 `REINDEX`가 자연스럽게 동작한다.
+- `pg_dump`/`pg_restore`로 인덱스 정의가 자동 보존된다.
+- recall/성능이 기존 함수 호출 방식과 동등하다.
+- CI에서 pgvector 호환 매트릭스가 검증된다.
+
+---
+
 Phase 3 전체 완료 기준:
-- Phase 3A-3I의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3K의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---

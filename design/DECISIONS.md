@@ -1020,3 +1020,47 @@ Phase 3I 구현 중 근본적인 문제 발견: `pg_cuvs_import_hnsw(cagra_oid, 
 
 - 기존 두 함수 유지. 거부 — 285s CPU 빌드 페널티가 GPU 가속 가치를 반감시킨다.
 - `CREATE INDEX USING cagra WITH (export_hnsw=on)` 옵션으로 자동화. 보류 — 사용자가 명시적으로 변환 시점을 제어하는 것이 운영상 더 직관적. CAGRA 인덱스와 HNSW 인덱스를 독립적으로 관리 가능.
+
+---
+
+## ADR-038 — Phase 3K: pg_cuvs_build_hnsw() 함수 호출을 CREATE INDEX ... USING pg_cuvs_hnsw DDL 문법으로 전환
+
+**날짜**: 2026-06-03
+**상태**: 결정됨
+
+### 배경
+
+현재 CAGRA 기반 HNSW 빌드는 `SELECT pg_cuvs_build_hnsw('my_cagra'::regclass, 'nsw')` 형태의 SQL 함수 호출이다. 이 방식은 동작하지만, PostgreSQL의 인덱스 관리 표준 경로(DDL, 카탈로그, 덤프/복원)와 분리되어 있다.
+
+### 결정
+
+`pg_cuvs_hnsw`라는 커스텀 Access Method를 등록하고, 표준 DDL 문법으로 전환한다.
+
+```sql
+-- 기존
+SELECT pg_cuvs_build_hnsw('my_cagra'::regclass, 'nsw');
+
+-- 변경
+CREATE INDEX my_idx ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
+  WITH (source = 'my_cagra', mode = 'nsw');
+```
+
+`pg_cuvs_hnsw` AM의 `ambuild()` 내부에서 현재 `pg_cuvs_build_hnsw()`의 로직을 수행한다: source CAGRA 인덱스 찾기 -> `INDEX_CREATE_SKIP_BUILD`로 pgvector HNSW 껍데기 생성 -> CAGRA 그래프를 pgvector 페이지 포맷으로 변환.
+
+### 장점
+
+- `WITH` 절로 파라미터 전달 (mode, ef_construction 등)
+- `DROP INDEX` / `REINDEX`가 자연스럽게 동작
+- `pg_indexes` 카탈로그 뷰에 정상 노출
+- `pg_dump` / `pg_restore` 자동 지원
+
+### pgvector 호환성
+
+- pgvector 내부 페이지 포맷 의존은 버전 고정 + 가이드 명시로 관리
+- 지원 범위를 README/가이드에 명확히 표기 (예: pgvector >= 0.7.0)
+- CI에서 호환 매트릭스 테스트
+
+### 대안
+
+- 함수 호출 방식 유지. 거부 — pg_dump/restore에서 인덱스가 누락되고, DROP INDEX/REINDEX가 동작하지 않으며, pg_indexes 카탈로그에 노출되지 않아 운영 표면이 PostgreSQL 표준과 괴리된다.
+- `CREATE INDEX USING cagra WITH (export_hnsw=on)` 빌드 타임 옵션. 보류 — CAGRA 인덱스와 HNSW 인덱스의 lifecycle이 결합되며, ADR-037에서 이미 독립 관리가 운영상 더 직관적이라고 결정했다.
