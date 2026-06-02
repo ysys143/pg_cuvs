@@ -853,6 +853,60 @@ Phase 3 전체 완료 기준:
 
 ---
 
+## Phase 4 — 인제스트 성능 가속
+
+Phase 3J(direct CAGRA→pgvector) 완료 후 측정된 두 가지 병목에 대한 개선 로드맵.
+실측 기준: N=1M, dim=1024, Cohere Wikipedia, A100-40GB.
+
+### 4A — CAGRA 빌드 PostgreSQL 오버헤드 감소
+
+현재: pg_cuvs CAGRA build ~55s / cuVS lib 직접 ~10s (45s 차이)
+
+```
+heap scan → varlena decode → malloc 버퍼 누적 → memcpy → shm → daemon → GPU → CAGRA
+```
+
+| 개선 방향 | 절감 | 난이도 | 상태 |
+|-----------|------|--------|------|
+| double memcpy 제거 | ~2-5s | 낮음 | 미구현 |
+| parallel maintenance workers | ~10-20s | 중간 | 미구현 |
+| Streaming/pipeline | ~10-15s | 높음 | cuVS API 미제공, 장기 |
+| heap scan 최적화 | ~15-25s | 높음 | PG internals, 장기 |
+| 이진 벡터 저장 | ~5-10s | 높음 | 스키마 변경, 장기 |
+
+단기 목표: double memcpy 제거 → ~50s, parallel workers → ~30-35s
+
+### 4B — import_hnsw 페이지 write 병목 감소
+
+현재: ~57s (LOGGED) / ~28s (UNLOGGED) — ReadBuffer+PageInit+PageAddItem×2+WAL 순차 1M회
+
+| 개선 방향 | 절감 | 난이도 | 상태 |
+|-----------|------|--------|------|
+| UNLOGGED 타겟 | ~28s | 낮음 | **완료** (ADR-033) |
+| UNLOGGED + REINDEX 패턴 | 운영 패턴 | 낮음 | **완료** (ADR-035 문서화) |
+| 병렬 페이지 write | ~15-25s | 높음 | 미구현 |
+| Bulk WAL | ~10-15s | 높음 | PG WAL internals, 장기 |
+
+**UNLOGGED + REINDEX 권장 패턴** (현재 가능):
+```sql
+-- 1. 빠른 import (WAL 없음, crash unsafe)
+CREATE UNLOGGED INDEX t_hnsw ON t USING hnsw (...);
+SELECT pg_cuvs_import_cagra('t_cagra'::regclass, 't_hnsw'::regclass);
+
+-- 2. maintenance window 후 WAL-safe 전환
+REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
+```
+
+### 4 — 완료 기준
+
+| 목표 | 수치 |
+|------|------|
+| 4A 단기 완료 | CAGRA build ≤ 35s (현재 55s) |
+| 4B 단기 완료 | UNLOGGED import ≤ 25s (현재 28s) |
+| 종합 (4A+4B, UNLOGGED) | 전체 ≤ 65s (현재 96s, native 285s 대비 4.4×) |
+
+---
+
 ## 기술 위험 및 대응
 
 | 위험 | 대응 |

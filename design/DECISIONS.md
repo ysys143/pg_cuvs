@@ -767,3 +767,77 @@ Crossover N  ~ 1005 / 0.189 ~ 5300 rows
 - `parallel_fanout=0`: 소규모 인덱스(N<1M)에서 sequential이 효율적
 
 **주의**: `parallel_fanout=1`이 유리한 구간은 shard당 N이 충분히 커서 스레딩 오버헤드를 상쇄할 때 (N>5M 예상). 소규모에서는 default off를 고려.
+
+---
+
+## ADR-034 — CAGRA 빌드 PostgreSQL 오버헤드 감소 로드맵
+
+**날짜**: 2026-06-02  
+**상태**: 계획
+
+### 배경
+
+pg_cuvs CAGRA 빌드는 동일 데이터를 cuVS lib 직접 사용할 때보다 ~45s 느리다.
+(cuVS lib: ~10s / pg_cuvs: ~55s, N=1M×1024)
+
+원인 분석:
+- PostgreSQL heap scan + varlena decode: ~15-20s
+- malloc 버퍼 누적 (realloc 패턴): ~5s
+- heap 버퍼 → shm memcpy: ~5-10s (4GB 이중 복사)
+- daemon mmap + GPU upload: ~3-5s
+- CAGRA GPU build: ~10s
+
+### 개선 방향 (우선순위 순)
+
+| 방향 | 절감 예상 | 난이도 | 변경 범위 |
+|------|-----------|--------|-----------|
+| **double memcpy 제거** | ~2-5s | 낮음 | `pg_cuvs.c` accumulation buffer를 shm에 직접 할당 |
+| **parallel maintenance workers** | ~10-20s | 중간 | `ambuild()` parallel scan API 활용; IPC는 단일 집계 유지 |
+| **Streaming/pipeline** | ~10-15s | 높음 | 청크 단위 IPC + GPU transfer 겹치기; cuVS incremental API 필요 |
+| **heap scan 자체** | ~15-25s | 높음 | `table_index_build_scan()` 커스터마이징 |
+| **이진 벡터 저장** | ~5-10s | 높음 | varlena 외부 저장, 스키마 변경 필요 |
+
+### 결정
+
+단기(double memcpy + parallel workers)만 구현. Streaming/pipeline은 cuVS public API 변화를 모니터링 후 재평가.
+
+---
+
+## ADR-035 — import_hnsw 페이지 write 병목 감소 로드맵
+
+**날짜**: 2026-06-02  
+**상태**: 계획
+
+### 배경
+
+`pg_cuvs_import_hnsw` / `pg_cuvs_import_cagra`의 pgvector 페이지 write 단계가 ~52-63s.
+원인: `ReadBuffer(P_NEW)` + `PageInit` + `PageAddItem×2` + `MarkBufferDirty` + `log_newpage_buffer`를 1M번 순차 실행.
+
+### 현재 적용된 개선
+
+- **UNLOGGED 타겟** (ADR-033): WAL 생략 → ~28s (LOGGED ~57s 대비 50% 절감)
+- **Phase 3J direct path** (ADR 미정): `from_cagra()` 제거 → 전체 ~22s 절감
+
+### 추가 개선 방향
+
+| 방향 | 절감 예상 | 난이도 | 변경 범위 |
+|------|-----------|--------|-----------|
+| **병렬 페이지 write** | ~15-25s | 높음 | PG parallel worker로 페이지 범위 분할; buffer manager 조율 복잡 |
+| **Bulk WAL** | ~10-15s | 높음 | 범위 단위 WAL 레코드; PG WAL internals 수정 필요 |
+| **UNLOGGED + 주기적 REINDEX** | 0 (이미 가능) | 낮음 | import → UNLOGGED; crash 허용 window 후 REINDEX로 LOGGED 전환 |
+
+### UNLOGGED + REINDEX 패턴 (지금 사용 가능)
+
+```sql
+-- 빠른 import (WAL 없음)
+CREATE UNLOGGED INDEX t_hnsw ON t USING hnsw (embedding vector_l2_ops);
+SELECT pg_cuvs_import_cagra('t_cagra'::regclass, 't_hnsw'::regclass);
+
+-- maintenance window 후 WAL-safe LOGGED로 전환
+REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
+```
+
+### 결정
+
+병렬 페이지 write와 Bulk WAL은 PG internals 의존도가 높아 단기 구현 대상 제외.
+UNLOGGED + REINDEX 패턴을 OPS_GPU_PLAYBOOK에 추가하여 운영 패턴으로 권장.
