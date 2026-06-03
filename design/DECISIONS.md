@@ -1006,6 +1006,12 @@ pgvector의 `vector` 타입은 varlena다. dim=1024면 벡터 하나가 `4 bytes
 
 실현 가능성: 불가. PG 코어 API가 없다.
 
+(f) `PrefetchBuffer()` heap page prefetch: PG 내장 API `PrefetchBuffer()`로 다음에 읽을 heap 페이지를 OS에 미리 요청해 I/O wait를 감소시킨다. `table_index_build_scan()` 루프 안에서 현재 tuple 처리 중 다음 N개 페이지를 prefetch하는 방식이다.
+
+난점: `table_index_build_scan()`은 콜백 방식(`IndexBuildCallback`)이라, 콜백 안에서 "다음에 읽을 페이지 번호"를 알 수 없다. scan의 page iteration은 `table_index_build_scan` 내부(`heapam_index_build_range_scan`)가 제어하며, 콜백은 이미 fetch된 tuple만 받는다. prefetch를 삽입하려면 커스텀 scan 루프로 교체해야 하는데, 이는 (d)의 raw page scan 커스터마이징과 동일한 MVCC 정합성 리스크를 수반한다. 또한 `table_index_build_scan`은 sequential scan이므로 OS readahead(`/sys/block/*/queue/read_ahead_kb`, 일반적으로 128-256KB)가 이미 동작한다. heap 페이지가 shared_buffers에 이미 있거나 OS page cache에 있는 경우가 대부분이라 `PrefetchBuffer()`의 추가 I/O 이득이 제한적이다. 6/1 세션에서 검토 후 "PG 코어 인터페이스 복잡도 대비 이득 제한적"으로 기각했다.
+
+실현 가능성: 낮음. 콜백 인터페이스 교체가 필요하고, sequential scan의 OS readahead와 중복된다.
+
 **결론**
 
 단기에 heap scan + varlena decode 자체를 의미 있게 가속할 실현 가능한 방안은 없다. parallel workers(4A-2)로 wall-clock을 분산하는 것이 현실적 대안이다.
