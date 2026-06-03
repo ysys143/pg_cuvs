@@ -921,8 +921,8 @@ heap scan → varlena decode → malloc 버퍼 누적 → memcpy → shm → dae
 | double memcpy 제거 | ~2-5s | 낮음 | 미구현 |
 | parallel maintenance workers | ~10-20s | 중간 | 미구현 |
 | Streaming/pipeline | ~10-15s | 높음 | cuVS API 미제공, 장기 |
-| heap scan 최적화 | ~15-25s | 높음 | PG internals, 장기 |
-| 이진 벡터 저장 | ~5-10s | 높음 | 스키마 변경, 장기 |
+| heap scan 최적화 | ~15-25s | 높음 | PG internals, 장기 (ADR-034 후속 분석: 실현 불가) |
+| 이진 벡터 저장 | ~5-10s | 높음 | 스키마 변경, 장기 (ADR-034 후속 분석: pg_cuvs 단독 불가) |
 
 단기 목표: double memcpy 제거 → ~50s, parallel workers → ~30-35s
 
@@ -954,6 +954,15 @@ heap scan → varlena decode → malloc 버퍼 누적 → memcpy → shm → dae
 - `max_parallel_maintenance_workers = 0`이면 기존 단일 프로세스 경로와 동작 동일(byte-identical artifact).
 - worker별 merge 후 CAGRA build 결과(recall, TID mapping)가 단일 프로세스 build와 동일.
 - 기존 test suite 전수 PASS. parallel build용 integration scenario 1건 추가(worker 수 >= 2에서 build + search 정합 확인).
+
+장기 항목 분석 결과 (ADR-034 §heap scan 후속 분석, 2026-06-03):
+
+heap scan + varlena decode ~15-20s는 PG 오버헤드 45s 중 가장 큰 단일 구간이다. 주 원인은 pgvector `vector` 타입이 varlena여서 dim >= 512인 벡터가 거의 모두 TOAST되고, `cuvs_build_callback()`이 매 tuple마다 `PG_DETOAST_DATUM`(palloc + decompress)을 호출하는 것이다. 검토한 5가지 가속 방안(PLAIN storage 강제, 별도 binary column, pgvector fixed-length 기여, raw page scan 커스터마이징, prefetch/streaming detoast) 중 pg_cuvs 단독으로 단기에 실현 가능한 것은 없다.
+
+현실적 대응:
+- parallel workers(4A-2)가 wall-clock 분산으로 유일한 단기 가속 수단이다.
+- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 ~25-35% 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다.
+- 장기 모니터링 대상: pgvector fixed-length storage 지원 여부, PG 코어 TOAST prefetch/streaming API.
 
 ### 4B — import_hnsw 페이지 write 병목 감소
 

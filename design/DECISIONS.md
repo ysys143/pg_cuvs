@@ -955,6 +955,65 @@ AM handler: `amcanparallel`을 등록하지 않는다. `amcanparallel`은 parall
 - `cuvs.build_parallel_workers` 자체 GUC 추가. 보류 — `max_parallel_maintenance_workers`가 PostgreSQL 표준이고 다른 AM과 일관. pg_cuvs 고유 요구가 생기면 그때 추가.
 - streaming/pipeline으로 한 번에 해결. 거부 — cuVS에 incremental build API가 없어 전체 corpus를 한 번에 넘겨야 한다. scan과 GPU transfer를 겹치려면 cuVS API 변경이 필요.
 
+### heap scan + varlena decode 병목 후속 분석
+
+2026-06-03 추가. ADR-034 테이블의 "heap scan 자체"(~15-25s)와 "이진 벡터 저장"(~5-10s)에 대한 상세 분석이다. 이 두 항목은 PG 오버헤드 45s 중 가장 큰 단일 구간(~15-20s, 33-44%)을 차지하지만 "높음/장기"로만 분류되어 왜 어려운지, 어떤 접근이 가능한지 기록되지 않았다.
+
+**병목의 정확한 원인**
+
+pgvector의 `vector` 타입은 varlena다. dim=1024면 벡터 하나가 `4 bytes(vl_len_) + 2 bytes(dim) + 2 bytes(unused) + 1024 * 4 bytes(float) = 4104 bytes`로, PostgreSQL TOAST threshold(기본 ~2KB, `TOAST_TUPLE_THRESHOLD`)를 초과한다. pgvector는 `vector` 컬럼에 `EXTENDED` storage strategy를 기본 적용하므로, 거의 모든 row의 벡터가 TOAST 테이블에 별도 저장된다.
+
+`cuvs_build_callback()`(pg_cuvs.c:919)이 매 tuple마다 수행하는 작업:
+1. `DatumGetPgVector(values[0])` → `PG_DETOAST_DATUM(d)` 호출(pg_cuvs.c:71). TOAST된 벡터를 `palloc` + LZ compression 해제(또는 외부 TOAST chunk fetch + reassemble)로 메인 메모리에 복원한다.
+2. `vec->dim` 읽기 + dimension mismatch 검사(pg_cuvs.c:934-935).
+3. `memcpy(dst, vec->x, dim * sizeof(float))`(pg_cuvs.c:943)로 flat buffer에 복사. dim=1024면 per-vector 4KB.
+4. 콜백 반환 후 detoast된 palloc 메모리는 per-tuple memory context reset으로 해제.
+
+오버헤드 구성(추정):
+- TOAST decompression + palloc/pfree: 전체의 ~50-60%. 1M회 palloc(4KB) + pglz decompress가 주 비용.
+- heap page read + visibility check(`table_index_build_scan` 내부 `heapam_index_build_range_scan`): 전체의 ~25-30%. sequential scan이라 I/O 자체는 OS page cache 히트가 대부분이지만, per-tuple `HeapTupleSatisfiesVacuum` 호출 + tuple header 파싱이 누적.
+- per-vector memcpy(4KB x 1M = 4GB): 전체의 ~10-15%. L2 cache miss가 누적.
+
+**검토한 가속 방안**
+
+(a) PLAIN storage strategy 강제: `ALTER TABLE t ALTER COLUMN embedding SET STORAGE PLAIN`으로 벡터를 TOAST하지 않게 한다. detoast 비용(palloc + decompress)이 완전히 제거되므로 scan 구간에서 ~50-60% 절감(~8-12s)을 기대할 수 있다.
+
+난점: tuple이 커지면(4KB+) 페이지당 row 수가 1-2개로 급감한다. heap 자체가 ~4x 커지고, sequential scan의 page 수도 비례해 증가한다. pgvector가 `EXTENDED`를 기본으로 쓰는 이유는 대부분의 쿼리(WHERE 조건, JOIN, projection)에서 벡터 전체를 읽지 않아도 되기 때문이다. PLAIN으로 바꾸면 벡터를 참조하지 않는 쿼리도 큰 tuple을 fetch하게 되어 일반 workload 성능이 저하된다. 또한 기존 pgvector 사용자의 스키마 변경이 필요하다.
+
+실현 가능성: pg_cuvs가 강제할 수 없고 사용자 선택이다. 빌드 성능 최적화 팁으로 가이드 문서에 안내하는 것은 가능하다. "벡터 빌드 전용 테이블에서만 PLAIN을 쓰고, 서빙 테이블은 EXTENDED를 유지하라"는 패턴이 될 수 있다.
+
+(b) 별도 binary column / side table: 벡터를 `bytea` PLAIN으로 별도 컬럼 또는 side table에 저장하고, `cuvs_ambuild`가 이 컬럼을 참조한다.
+
+난점: 사용자 스키마 변경을 강제한다. pgvector `vector` 타입과의 이중 관리가 필요하다. pg_cuvs가 pgvector operator class를 재사용하는 현재 설계(ADR-006)와 충돌한다 — AM이 index의 opclass에 등록된 컬럼이 아닌 다른 컬럼을 읽으려면 `ambuild` 내부에서 별도 heap scan을 해야 하고, 이는 표준 `table_index_build_scan` 경로를 벗어난다. DX 저하가 크다.
+
+실현 가능성: 낮음. 아키텍처 변경이 필요하고, 편익 대비 사용자 부담이 크다.
+
+(c) pgvector 측 fixed-length storage 기여: 벡터 차원이 테이블 생성 시 고정이면(예: `vector(1024)`), varlena가 아닌 fixed-length 타입으로 저장할 수 있다. TOAST를 회피하면서도 PG가 타입 크기를 미리 알 수 있어 storage 최적화가 가능하다.
+
+난점: pgvector 업스트림 변경에 의존한다. pgvector의 설계 철학은 가변 차원 지원이고, `vector` 타입이 varlena인 것은 의도적 선택이다(동일 테이블에 다른 차원의 벡터를 저장하지는 않지만, 타입 시스템 수준에서 고정 길이를 강제하지 않는다). pgvector에 이런 변경을 기여하려면 업스트림 수용 가능성을 먼저 확인해야 하며, pg_cuvs 자체 로드맵으로 제어할 수 없다.
+
+실현 가능성: pg_cuvs 단독으로 불가. pgvector 커뮤니티와의 협의가 전제.
+
+(d) `table_index_build_scan` 커스터마이징: 표준 `table_index_build_scan` 대신 raw page scan + 직접 tuple 파싱으로 visibility check 오버헤드를 줄인다.
+
+난점: `HeapTupleSatisfiesVacuum`과 동등한 MVCC visibility 판정을 직접 구현해야 한다. 이를 잘못 구현하면 committed/aborted/in-progress tuple을 잘못 포함/제외해 인덱스 정합성이 깨진다. PG 버전마다 visibility 로직이 달라질 수 있어 유지보수 비용이 높다. `table_index_build_scan`은 HOT chain 처리, snapshot 관리, progress reporting 등도 포함하고 있어 대체하기 어렵다.
+
+실현 가능성: 매우 낮음. MVCC 정합성 리스크가 성능 이득을 정당화하지 못한다.
+
+(e) prefetch / streaming detoast: scan 루프에서 현재 tuple을 처리하는 동안 다음 N개 tuple의 TOAST chunk를 비동기로 prefetch한다.
+
+난점: PostgreSQL에 tuple-level asynchronous detoast API가 없다. `PG_DETOAST_DATUM`은 동기 호출이다. PG의 buffer prefetch 힌트(`PrefetchBuffer`)는 heap page 수준이지 TOAST chunk 수준이 아니다. palloc은 thread-safe가 아니라 per-backend이므로, 별도 스레드에서 detoast를 수행할 수 없다. PG 코어 변경 없이는 불가능하다.
+
+실현 가능성: 불가. PG 코어 API가 없다.
+
+**결론**
+
+단기에 heap scan + varlena decode 자체를 의미 있게 가속할 실현 가능한 방안은 없다. parallel workers(4A-2)로 wall-clock을 분산하는 것이 현실적 대안이다.
+
+PLAIN storage는 사용자가 선택적으로 적용할 수 있으므로, `docs/playbooks/` 또는 OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다. 내용: "dim >= 512이고 빌드 빈도가 높은 경우, 벡터 컬럼에 `SET STORAGE PLAIN`을 적용하면 TOAST decompression 비용을 제거해 빌드 시간을 ~25-35% 줄일 수 있다. 단, 벡터를 참조하지 않는 일반 쿼리 성능이 저하될 수 있으므로 빌드 전용 테이블 또는 빌드 빈도가 높은 환경에서만 권장한다."
+
+장기적으로는 pgvector의 fixed-length storage 지원 여부를 모니터링하고, PG 코어의 TOAST prefetch/streaming API 발전을 추적한다. 어느 쪽이든 pg_cuvs 단독으로 제어할 수 없는 외부 의존이다.
+
 ---
 
 ## ADR-035 — import_hnsw 페이지 write 병목 감소 로드맵
