@@ -1,0 +1,117 @@
+-- pg_cuvs_batch.sql — Phase 3M (ADR-040): batch search API.
+--
+-- Coverage:
+--   1. pg_cuvs_batch_search returns (query_idx, ctid, distance) for Q queries in
+--      one IPC round-trip; per-query_idx top-K id set matches the seqscan ground
+--      truth under brute_force mode (exact), for L2 (criterion 2 + 4b).
+--   2. CAGRA-mode batch returns Q*K rows (one batched dispatch); shape check.
+--   3. Sharded (cuvs.shard_count=2) brute_force batch also matches the GT.
+--   4. Error cases: empty queries array, dim mismatch, no cagra index.
+--
+-- recall is compared via the per-query top-K id SET (JOIN on ctid), not the
+-- distance values: the SRF returns the daemon's raw metric distance (cuVS L2 is
+-- the SQUARED distance, unlike pgvector's sqrt <->), but the ranking is
+-- identical, so an exact search returns exactly the ground-truth id set.
+--
+-- REQUIRES: pg_cuvs_server running with a GPU; cuvs.index_dir writable.
+
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- Same deterministic 200-vector, 8-dim corpus as brute_force.sql.
+CREATE TABLE pcb_test (id int, embedding vector(8));
+INSERT INTO pcb_test
+SELECT g,
+       format('[%s,%s,%s,%s,%s,%s,%s,%s]',
+              (g * 0.013)::numeric(12,6),
+              (g * g * 0.0007)::numeric(12,6),
+              sin(g * 0.10)::numeric(12,6),
+              cos(g * 0.17)::numeric(12,6),
+              ((g % 13) * 0.05)::numeric(12,6),
+              ((g % 7) * 0.08)::numeric(12,6),
+              sin(g * 0.30)::numeric(12,6),
+              cos(g * 0.23)::numeric(12,6))::vector
+FROM generate_series(1, 200) g;
+
+SET client_min_messages = 'warning';
+CREATE INDEX pcb_l2 ON pcb_test USING cagra (embedding vector_l2_ops);
+SET client_min_messages = 'notice';
+
+-- Per-query seqscan ground-truth id sets for the two batch queries.
+SET enable_cuvs = off; SET enable_seqscan = on;
+CREATE TEMP TABLE gt_q0 AS
+    SELECT id FROM pcb_test
+    ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+CREATE TEMP TABLE gt_q1 AS
+    SELECT id FROM pcb_test
+    ORDER BY embedding <-> '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]' LIMIT 10;
+RESET enable_cuvs; RESET enable_seqscan;
+
+-- ── brute_force batch: per-query_idx top-10 id set equals the GT (criterion 2) ──
+SET cuvs.search_mode = 'brute_force';
+CREATE TEMP TABLE batch_bf AS
+    SELECT b.query_idx, t.id
+    FROM pg_cuvs_batch_search('pcb_test',
+             ARRAY['[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]',
+                   '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]']::vector[], 10) b
+    JOIN pcb_test t ON t.ctid = b.ctid;
+RESET cuvs.search_mode;
+
+-- recall@10 = 1.0 for each query when all 10 GT ids are present.
+SELECT
+    (SELECT count(*) FROM batch_bf WHERE query_idx = 0 AND id IN (SELECT id FROM gt_q0)) AS bf_q0_recall,
+    (SELECT count(*) FROM batch_bf WHERE query_idx = 1 AND id IN (SELECT id FROM gt_q1)) AS bf_q1_recall;
+
+-- Each query returns exactly 10 rows (one batched dispatch, Q*K layout).
+SELECT query_idx, count(*) AS n FROM batch_bf GROUP BY query_idx ORDER BY query_idx;
+
+-- ── CAGRA-mode batch: shape check (Q*K rows; cagra is ANN, recall not asserted) ──
+SELECT count(DISTINCT query_idx) AS n_queries, count(*) AS n_rows
+FROM pg_cuvs_batch_search('pcb_test',
+         ARRAY['[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]',
+               '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]']::vector[], 10);
+
+-- ── sharded brute_force batch (criterion 4: works for sharded) ──
+SET client_min_messages = 'warning';
+SET cuvs.shard_count = 2;
+CREATE INDEX pcb_sh ON pcb_test USING cagra (embedding vector_l2_ops);
+RESET cuvs.shard_count;
+SET client_min_messages = 'notice';
+
+SET cuvs.search_mode = 'brute_force';
+CREATE TEMP TABLE batch_sh AS
+    SELECT b.query_idx, t.id
+    FROM pg_cuvs_batch_search('pcb_test',
+             ARRAY['[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]',
+                   '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]']::vector[], 10) b
+    JOIN pcb_test t ON t.ctid = b.ctid;
+RESET cuvs.search_mode;
+
+SELECT
+    (SELECT count(*) FROM batch_sh WHERE query_idx = 0 AND id IN (SELECT id FROM gt_q0)) AS sh_q0_recall,
+    (SELECT count(*) FROM batch_sh WHERE query_idx = 1 AND id IN (SELECT id FROM gt_q1)) AS sh_q1_recall;
+
+-- ── Error cases (do not abort the script) ──
+\set ON_ERROR_STOP off
+
+-- Empty queries array.
+SELECT * FROM pg_cuvs_batch_search('pcb_test', ARRAY[]::vector[], 10);
+
+-- Dimension mismatch (4-dim query against an 8-dim index).
+SELECT * FROM pg_cuvs_batch_search('pcb_test', ARRAY['[1,2,3,4]']::vector[], 10);
+
+-- No cagra index on the relation.
+CREATE TABLE pcb_noidx (id int, embedding vector(8));
+SELECT * FROM pg_cuvs_batch_search('pcb_noidx',
+             ARRAY['[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]']::vector[], 10);
+DROP TABLE pcb_noidx;
+
+\set ON_ERROR_STOP on
+
+-- Cleanup.
+DROP TABLE pcb_test CASCADE;
+DROP EXTENSION pg_cuvs CASCADE;
