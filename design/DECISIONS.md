@@ -1343,3 +1343,36 @@ CREATE INDEX my_idx ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
 
 - 함수 호출 방식 유지. 거부 — pg_dump/restore에서 인덱스가 누락되고, DROP INDEX/REINDEX가 동작하지 않으며, pg_indexes 카탈로그에 노출되지 않아 운영 표면이 PostgreSQL 표준과 괴리된다.
 - `CREATE INDEX USING cagra WITH (export_hnsw=on)` 빌드 타임 옵션. 보류 — CAGRA 인덱스와 HNSW 인덱스의 lifecycle이 결합되며, ADR-037에서 이미 독립 관리가 운영상 더 직관적이라고 결정했다.
+
+---
+
+## ADR-041 — Phase 3K: pg_cuvs_hnsw의 source를 선택적으로 (heap에서 ephemeral CAGRA 빌드)
+
+**날짜**: 2026-06-04
+**상태**: 결정됨 (구현/VM 검증 완료, installcheck 8/8)
+
+### 배경
+
+ADR-038/3K로 `CREATE INDEX ... USING pg_cuvs_hnsw WITH (source = 'my_cagra')`가 동작하지만, source CAGRA 인덱스를 먼저 만들어야 하고(2단계), 변환 후 보통 `DROP INDEX my_cagra`로 정리한다. 더 중요하게 `REINDEX`가 저장된 `source` relopt를 다시 찾으므로, source CAGRA가 살아 있어야만 재빌드된다(source를 DROP했으면 REINDEX 불가).
+
+### 결정
+
+`source`를 선택적으로 만든다. 생략하면 `ambuild`가 heap을 직접 스캔해 **ephemeral CAGRA를 GPU에서 빌드 → pgvector HNSW 페이지로 변환 → 임시 CAGRA를 drop**한다. 한 DDL로 완결되고, `REINDEX`는 heap에서 self-contained하게 재빌드된다.
+
+- **source 명시**: 기존 CAGRA를 재사용(빌드 절약 + 그 CAGRA를 GPU 검색용으로도 보존). 한 번의 GPU 빌드로 CAGRA + HNSW 두 인덱스를 얻는다.
+- **source 생략**: ephemeral CAGRA. CAGRA는 HNSW를 만드는 중간 빌드 산물(`.o`와 유사)이므로 변환 후 정리한다. CAGRA를 보존하려면 source 모드를 쓴다.
+
+구현:
+- `cuvs_build_cagra_from_heap` 헬퍼를 `cuvs_ambuild`(USING cagra)와 source-less 경로가 공유(corpus 스캔 + `cuvs_ipc_build`). (Tidy First 구조 추출, 동작 불변.)
+- source-less: `self(my_hnsw) oid`를 키로 ephemeral CAGRA 빌드(`shard_count=1` — sharded는 adjacency export 불가), `PG_TRY/PG_FINALLY`로 변환 후 **성공/실패 무관하게 `cuvs_ipc_drop`**.
+- `cuvs_index_metric`을 opfamily-OID `static` 캐시 비교에서 **opclass-family 이름 기반**(`cuvs_metric_from_opclass_name`)으로 변경 — cagra/pg_cuvs_hnsw 두 AM이 한 세션에 쓰여도 metric이 정확하다. (이전 캐시는 첫 호출 AM의 opfamily에 고정돼, 두 번째 AM의 cosine/ip를 "unrecognized → L2"로 오인했다.)
+
+### 안전성
+
+- **abort zombie 방지**: ephemeral CAGRA를 `ambuild` 내부 `PG_FINALLY`로 항상 drop하므로, ambuild 종료 시 데몬에 임시 CAGRA가 없다. 이후 CREATE INDEX가 abort돼도(인덱스 relfilenode 롤백) zombie가 남지 않는다. `object_access_hook`은 CREATE 실패를 통지하지 못하고 명시적 cagra DROP만 감지하므로(ADR-023), 이 ambuild-내부 drop이 필수다.
+- VM 검증: source-less 빌드/조회/`REINDEX`(source 없이)/cosine metric 정확/`leftover_ephemeral_cagra = 0`(데몬 registry zombie 없음) 확인, installcheck 8/8.
+
+### 대안
+
+- source 필수 유지. 거부 — 2단계 + 정리가 번거롭고, REINDEX가 source 생존에 의존한다.
+- `WITH (keep_cagra=true)` 보존 옵션. 거부 — "데몬에만 CAGRA 남기기"는 가리키는 `USING cagra` 카탈로그 인덱스가 없어 검색에 못 쓰고 DROP 시 정리도 안 되는 유령이 되며, "CAGRA 카탈로그 인덱스 동시 생성"은 source 모드와 결과가 같아 중복이다. CAGRA 보존이 필요하면 `USING cagra` + source 모드를 쓴다(ADR-038이 보류한 `export_hnsw=on`과 같은 이유).

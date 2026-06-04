@@ -894,6 +894,11 @@ Phase 3K 완료 기준:
 - recall/성능이 기존 함수 호출 방식과 동등하다.
 - CI에서 pgvector 호환 매트릭스가 검증된다.
 
+Phase 3K status: **COMPLETE** (2026-06-04, installcheck 8/8).
+- `pg_cuvs_hnsw` AM: pgvector hnsw `IndexAmRoutine`을 복사해 read 경로를 위임하고 `ambuild`/`amoptions`만 override (ADR-038). opclass는 pgvector 0.8.0 hnsw support proc 미러링.
+- `source` 선택적 (ADR-041): 생략 시 heap에서 ephemeral CAGRA를 빌드 → 변환 → drop. 한 DDL로 완결되고 REINDEX가 self-contained. source 명시 시 기존 CAGRA를 재사용(GPU 검색용으로 보존).
+- `pg_cuvs_build_hnsw()`는 deprecated (런타임 NOTICE). 0.1.0이 미릴리스라 0.2.0 bump 없이 base `sql/pg_cuvs--0.1.0.sql`에 포함.
+
 ---
 
 #### Phase 3M — 배치 검색 API

@@ -196,22 +196,21 @@ CREATE EXTENSION pg_cuvs;
 ### GPU Build Accelerator (Phase 3I / 3K) Quick Start
 
 ```sql
--- 1. Build a CAGRA graph on the GPU (requires the daemon + GPU).
-CREATE INDEX my_cagra ON items USING cagra (embedding vector_l2_ops);
+-- Simplest: one self-contained DDL. ambuild builds an ephemeral CAGRA on the
+-- GPU, converts it into this index's own pages (pgvector-HNSW format, no CPU
+-- build), then drops the temporary CAGRA. The result is a first-class catalog
+-- index (pg_indexes / DROP INDEX / REINDEX / pg_dump all work), and REINDEX
+-- rebuilds from the heap with no extra dependency.
+CREATE INDEX my_hnsw ON items USING pg_cuvs_hnsw (embedding vector_l2_ops);
 
--- 2. Convert it to a pgvector-format HNSW index via standard DDL (Phase 3K).
---    No pgvector CPU build (skip-build): the CAGRA graph is written directly
---    into this index's own pages (~66s for 1M×384). The read path is served by
---    pgvector's hnsw AM, so the result is a first-class catalog index
---    (pg_indexes / DROP INDEX / REINDEX / pg_dump all work).
-CREATE INDEX my_hnsw ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
-    WITH (source = 'my_cagra', mode = 'nsw');
-
--- 3. (optional) Drop the CAGRA index to reclaim GPU VRAM — my_hnsw is independent.
-DROP INDEX my_cagra;
-
--- 4. Serve queries via standard pgvector HNSW on CPU (GPU not required).
+-- Serve queries via standard pgvector HNSW on CPU (GPU not required).
 SELECT * FROM items ORDER BY embedding <-> $1 LIMIT 10;
+
+-- To ALSO keep a CAGRA index for GPU search, build it first and reuse it as the
+-- source — one GPU build then powers both indexes (no second build):
+CREATE INDEX my_cagra  ON items USING cagra (embedding vector_l2_ops);
+CREATE INDEX my_hnsw2  ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
+    WITH (source = 'my_cagra', mode = 'nsw');
 ```
 
 > The older `SELECT pg_cuvs_import_hnsw(cagra, hnsw)` two-step form (create an
