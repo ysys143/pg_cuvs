@@ -1560,7 +1560,8 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
              * (daemon crash after planning) — counts so the breaker opens and
              * subsequent queries replan to CPU via the socket-existence gate. */
             if (rc != CUVS_STATUS_DIM_MISMATCH
-                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE)
+                && rc != CUVS_STATUS_METRIC_MISMATCH && rc != CUVS_STATUS_STALE
+                && rc != CUVS_STATUS_NO_VECTORS)
                 cuvs_circuit_record_error((uint32_t)index_oid,
                                           cuvs_circuit_breaker_threshold);
 
@@ -1625,6 +1626,17 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
                              errmsg("pg_cuvs: cagra index not loaded on GPU daemon; "
                                     "retry will use CPU while breaker is open"),
                              errhint("REINDEX the index to reload it on the daemon.")));
+                    break;
+                case CUVS_STATUS_NO_VECTORS:
+                    /* Phase 3L: brute_force requested but the .vectors sidecar is
+                     * missing or stale. User/config error — fail loudly with
+                     * guidance rather than silently returning ANN/no rows. */
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                             errmsg("pg_cuvs: brute_force search requires a .vectors "
+                                    "sidecar that is missing or stale for this index"),
+                             errhint("REINDEX the index to (re)build the brute_force "
+                                     "vector sidecar, or SET cuvs.search_mode='cagra'.")));
                     break;
                 default:
                     ereport(ERROR,
@@ -2276,10 +2288,11 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         /* Phase 3F: shard count (0/1 = unsharded). */
         values[32] = Int32GetDatum((int32) s->shard_count);
 
-        /* Phase 3I-1: last search mode for this index. */
+        /* Phase 3I-1 / 3L: last search mode for this index. */
         values[33] = CStringGetTextDatum(
             s->search_mode == 1 ? "cpu_hnsw" :
-            s->search_mode == 2 ? "cpu_fallback" : "gpu_cagra");
+            s->search_mode == 2 ? "cpu_fallback" :
+            s->search_mode == 3 ? "brute_force" : "gpu_cagra");
 
         tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     }

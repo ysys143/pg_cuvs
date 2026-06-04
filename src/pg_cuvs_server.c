@@ -144,7 +144,7 @@ typedef struct IndexEntry {
 
     /* Phase 3I-1: CPU HNSW fallback. Loaded lazily when use_cpu_hnsw=1. */
     CuvsHnswIndex   hnsw_idx;        /* NULL until first cpu_hnsw search request */
-    uint32_t        last_search_mode; /* 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback */
+    uint32_t        last_search_mode; /* 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback, 3=gpu_bf (Phase 3L) */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -880,6 +880,98 @@ fail_cleanup:
     if (e->delta_vecs_host) { free(e->delta_vecs_host); e->delta_vecs_host = NULL; }
     e->delta_n_cached   = 0;
     e->delta_generation = 0;
+}
+
+/* Phase 3L: make e's resident main brute-force index match the current
+ * `.vectors` sidecar and the requested precision. Lazily (re)built on the first
+ * brute_force search and whenever the sidecar's mtime or the precision changes.
+ * Leaves main_bf_idx == NULL (so the caller fails closed with NO_VECTORS) when
+ * the sidecar is missing, stale (generation mismatch with the current .tids),
+ * corrupt, shape-mismatched, or cannot fit. Best-effort, NON-evicting:
+ * brute_force must never evict a base CAGRA index. Caller holds g_index_mutex.
+ * Unsharded only — sharded BF uses per-shard caches (refresh_shard_bf_caches). */
+static void
+refresh_main_bf_cache(IndexEntry *e, uint32_t want_precision)
+{
+    char              path[512], tids_path[512];
+    struct stat       st;
+    FILE             *f;
+    CuvsVectorsHeader vh;
+    CuvsTidsHeader    th;
+    float            *vecs = NULL;
+    size_t            got, needed;
+    uint32_t          dg = delta_gpu_of(e);   /* unsharded: the index's GPU */
+
+    vectors_file_path(path, sizeof(path), g_index_dir, e->db_oid, e->index_oid);
+    if (stat(path, &st) != 0)
+    {
+        free_main_bf_cache(e);          /* no sidecar -> brute_force unavailable */
+        return;
+    }
+    if (e->main_bf_idx
+        && (int64_t) st.st_mtime == e->main_bf_mtime
+        && e->bf_precision == want_precision)
+        return;                         /* unchanged + same precision -> reuse */
+
+    /* Sidecar changed or precision toggled: drop the old index and rebuild.
+     * Record the new mtime/precision up front so a persistent failure below
+     * does not retry the (re)build on every search. */
+    free_main_bf_cache(e);
+    e->main_bf_mtime = (int64_t) st.st_mtime;
+    e->bf_precision  = want_precision;
+
+    f = fopen(path, "rb");
+    if (!f)
+        return;
+    if (cuvs_vectors_read(f, &vh, &vecs) != 0)
+    {
+        fclose(f);
+        return;                         /* corrupt / short read -> unavailable */
+    }
+    fclose(f);
+    if (vh.dim != e->dim || vh.metric != e->metric || vh.n_vecs != e->n_vecs)
+    {
+        free(vecs);
+        return;                         /* shape mismatch -> unavailable */
+    }
+
+    /* Generation: the sidecar must belong to the current base build's .tids. */
+    tids_file_path(tids_path, sizeof(tids_path), g_index_dir, e->db_oid, e->index_oid);
+    {
+        FILE *tf = fopen(tids_path, "rb");
+        if (!tf) { free(vecs); return; }
+        got = fread(&th, 1, sizeof(th), tf);
+        fclose(tf);
+    }
+    if (got != sizeof(th) || th.magic != CUVS_TIDS_MAGIC
+        || th.body_crc32 != vh.base_tids_crc32)
+    {
+        free(vecs);
+        return;                         /* stale sidecar (torn build) -> unavailable */
+    }
+
+    /* VRAM: best-effort, NON-evicting (never evict a base index for BF). */
+    needed = (size_t) vh.n_vecs * (size_t) vh.dim * (want_precision == 1 ? 2 : 4);
+    if ((g_max_vram_per_gpu[dg] > 0
+         && total_vram_used(dg) + needed > g_max_vram_per_gpu[dg])
+        || needed > gpu_free_vram_bytes(dg))
+    {
+        free(vecs);
+        return;                         /* no spare VRAM -> brute_force unavailable */
+    }
+
+    e->main_bf_idx = cuvs_bf_build(vecs, vh.n_vecs, (int) vh.dim, vh.metric,
+                                   want_precision, dg);
+    free(vecs);
+    if (e->main_bf_idx)
+    {
+        e->main_bf_n          = vh.n_vecs;
+        e->main_bf_generation = vh.base_tids_crc32;
+        e->main_bf_vram_bytes = needed;
+        LOG_INFO("pg_cuvs_server: main BF cache %u/%u built (%lld vecs, %s, %zu MB VRAM)\n",
+                 e->db_oid, e->index_oid, (long long) vh.n_vecs,
+                 want_precision == 1 ? "float16" : "float32", needed / (1024 * 1024));
+    }
 }
 
 /* Forward decls used by save_index. */
@@ -1721,6 +1813,96 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     }
 
     int k = (int)cmd->k;
+
+    /* Phase 3L: GPU brute-force (exact) search, unsharded. The resident BF index
+     * over the `.vectors` sidecar is (re)built lazily at the requested precision.
+     * If it is unavailable (sidecar missing / stale generation / won't fit) we
+     * fail closed with NO_VECTORS so the backend raises a clear "REINDEX to
+     * enable brute_force" error rather than silently returning ANN results.
+     * Delta is NOT merged here — `.vectors` already covers the full base corpus
+     * exactly. Sharded BF runs in the fanout block below. */
+    if (cmd->search_mode == 1 && e->shard_count < 2)
+    {
+        refresh_main_bf_cache(e, cmd->bf_precision);
+        if (!e->main_bf_idx)
+        {
+            munmap(query, vec_bytes);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_NO_VECTORS;
+            strncpy(hdr.error,
+                    "brute_force requested but the .vectors sidecar is missing or "
+                    "stale; REINDEX to enable it",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, CUVS_STATUS_NO_VECTORS, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+
+        int bk = (int) ((int64_t) k < e->main_bf_n ? (int64_t) k : e->main_bf_n);
+        CuvsSearchResult *raw     = malloc((size_t)(bk > 0 ? bk : 1) * sizeof(CuvsSearchResult));
+        CuvsResult       *results = malloc((size_t)(bk > 0 ? bk : 1) * sizeof(CuvsResult));
+        if (!raw || !results)
+        {
+            free(raw); free(results);
+            munmap(query, vec_bytes);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_error(client_fd, "malloc failed");
+            return;
+        }
+
+        int ret = (bk > 0)
+            ? cuvs_bf_search(e->main_bf_idx, query, (int) cmd->dim, bk, raw, delta_gpu_of(e))
+            : 0;
+        munmap(query, vec_bytes);
+        if (ret != 0)
+        {
+            free(raw); free(results);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = (ret == 2) ? CUVS_STATUS_DIM_MISMATCH : CUVS_STATUS_OOM_FALLBACK;
+            strncpy(hdr.error,
+                    (ret == 2) ? "query dim != index dim" : "brute_force search failed",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, hdr.status, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+
+        int n_valid = 0;
+        for (int i = 0; i < bk; i++)
+        {
+            int64_t id = raw[i].item_id;
+            if (id < 0 || id >= e->n_vecs) continue;
+            results[n_valid].tid      = e->tids[id];
+            results[n_valid].distance = raw[i].distance;
+            n_valid++;
+        }
+        free(raw);
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        uint32_t latency_us = (uint32_t)(
+            (t1.tv_sec - t0.tv_sec) * 1000000 +
+            (t1.tv_nsec - t0.tv_nsec) / 1000);
+
+        record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
+        e->last_requested_k = cmd->k;
+        e->last_returned_k  = (uint32_t) n_valid;
+        e->last_search_mode = 3; /* gpu_bf */
+
+        pthread_mutex_unlock(&g_index_mutex);
+
+        CuvsReplyHeader hdr = {0};
+        hdr.status       = CUVS_STATUS_OK;
+        hdr.n_results    = (uint32_t) n_valid;
+        hdr.latency_us   = latency_us;
+        hdr.delta_merged = 0;
+        send_all(client_fd, &hdr, sizeof(hdr));
+        if (n_valid > 0)
+            send_all(client_fd, results, (size_t) n_valid * sizeof(CuvsResult));
+        free(results);
+        return;
+    }
 
     /* Phase 3F/3G: sharded fanout. Search every shard for its top-(k+overfetch),
      * map each shard-local id to a global TID via the shard's tid_offset, merge
