@@ -25,7 +25,11 @@ jobs:
 
       - name: Install PostgreSQL ${{ matrix.pg }}
         run: |
+          # ubuntu-22.04 runners don't ship PG16 in the default apt repos;
+          # add the official PGDG repo via postgresql-common's helper first.
           sudo apt-get update -qq
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-${{ matrix.pg }} \
               postgresql-server-dev-${{ matrix.pg }} \
               gcc make
