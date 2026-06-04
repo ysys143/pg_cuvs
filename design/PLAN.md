@@ -809,7 +809,7 @@ pgvector 의존 없이 pg_cuvs 자체 AM으로 처리한다.
 3I-1 완료 현황 (2026-06-02):
 - `cuvs.cpu_hnsw_fallback=on` 시 CAGRA build 후 `.hnsw` sidecar 조건부 생성 (ADR-032).
 - daemon이 `.hnsw` sidecar를 로드해 cuVS CPU HNSW search 수행.
-- **잔여**: `search_mode` 컬럼 미추가.
+- `search_mode` 컬럼 구현 완료 (`gpu_cagra | cpu_hnsw | cpu_fallback`, `pg_stat_gpu_search` + daemon `last_search_mode`).
 
 ---
 
@@ -861,9 +861,8 @@ Phase 3I 전체 완료 기준:
 - 각 sub-phase는 독립적으로 릴리스 가능하다.
 
 Phase 3I status: **COMPLETE** (2026-06-02).
-3I-1: cpu_hnsw_fallback GUC + .hnsw sidecar 조건부 생성 구현. search_mode 컬럼은 미구현(운영 관측성 한계, Release hardening에서 다룬다).
+3I-1: cpu_hnsw_fallback GUC + .hnsw sidecar 조건부 생성 구현. search_mode 컬럼 구현 완료.
 3I-2: pg_cuvs_build_hnsw 4-mode 구현, 7/7 tests PASS, ef-recall pareto 검증(nsw 권장 default 확인), GPU-less VM dump/restore PASS (gpu_free_test에 pgvector만 설치 후 HNSW 쿼리 정확).
-잔여 개선 항목: search_mode 컬럼 — Phase 3I 완료 기준 밖, Release hardening에서 포함 여부 결정.
 
 ---
 
@@ -897,8 +896,40 @@ Phase 3K 완료 기준:
 
 ---
 
+#### Phase 3L — GPU Brute Force 검색 모드 사용자 노출
+
+목표: 내부 delta cache 전용으로만 쓰이던 `cuvs_brute_force_search` / `CuvsBfIndex`를 사용자가 직접 사용할 수 있는 GPU exact search 경로로 노출한다. (ADR-039)
+
+배경:
+- `USING cagra` ANN 검색은 recall < 1.0일 수 있다. 소규모 데이터 또는 정확도가 중요한 workload에서 exact GPU search가 필요하다.
+- 벤치마크 ground truth 생성 시 seqscan 대비 GPU BF가 훨씬 빠르다 (N=1M 기준 seqscan 수십 초 vs GPU BF 수백 ms).
+- `cuvs_brute_force_search` 인프라가 이미 구현되어 있어 구현 비용이 낮다.
+
+구현 항목:
+- `cuvs.search_mode` GUC 추가 (`'cagra'` default / `'brute_force'`).
+- `CREATE INDEX USING cagra` 빌드 시 raw vector matrix를 `.vectors` sidecar로 직렬화 (versioned header, fsync+rename durable).
+- daemon `IndexEntry`에 `main_bf_idx` (`CuvsBfIndex`) 추가; startup 시 `.vectors` sidecar 존재하면 로드.
+- IPC search request에 `search_mode` 필드 추가; daemon이 분기해 `cuvs_brute_force_search` 또는 기존 CAGRA 경로 호출.
+- sharded index: shard별 벡터 범위를 각 shard의 `CuvsBfIndex`에 올려 기존 fanout 경로에서 BF 검색.
+- `pg_stat_gpu_cache`에 `bf_vram_bytes` 노출.
+- `pg_stat_gpu_search.search_mode`가 `'brute_force'`를 반환.
+
+VRAM 영향:
+- 1M×384 float32 기준 약 1.5 GB 추가 (CAGRA 그래프와 별도).
+- `.vectors` sidecar가 없으면 BF 검색 요청 시 ERROR.
+
+Phase 3L 완료 기준:
+- `SET cuvs.search_mode = 'brute_force'`로 `USING cagra` 인덱스에 GPU exact search가 동작한다.
+- recall@10 = 1.0 (pgvector seqscan ground truth와 일치).
+- `pg_stat_gpu_search.search_mode = 'brute_force'` 확인.
+- `cuvs.search_mode = 'cagra'` default 경로는 기존과 byte-identical.
+- sharded index에서도 BF 검색이 정확한 top-k를 반환한다.
+- `.vectors` sidecar 없을 때 BF 요청 시 명확한 ERROR.
+
+---
+
 Phase 3 전체 완료 기준:
-- Phase 3A-3K의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3L의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---
@@ -921,10 +952,48 @@ heap scan → varlena decode → malloc 버퍼 누적 → memcpy → shm → dae
 | double memcpy 제거 | ~2-5s | 낮음 | 미구현 |
 | parallel maintenance workers | ~10-20s | 중간 | 미구현 |
 | Streaming/pipeline | ~10-15s | 높음 | cuVS API 미제공, 장기 |
-| heap scan 최적화 | ~15-25s | 높음 | PG internals, 장기 |
-| 이진 벡터 저장 | ~5-10s | 높음 | 스키마 변경, 장기 |
+| heap scan 최적화 | ~15-25s | 높음 | PG internals, 장기 (ADR-034 후속 분석: 실현 불가) |
+| 이진 벡터 저장 | ~5-10s | 높음 | 스키마 변경, 장기 (ADR-034 후속 분석: pg_cuvs 단독 불가) |
 
 단기 목표: double memcpy 제거 → ~50s, parallel workers → ~30-35s
+
+실행 순서: **4A-1 → 4A-2**. 4A-1이 shm 직접 할당을 도입하므로, 4A-2의 worker별 buffer가 shm 위에 올라갈 수 있어 이중 복사 경로가 완전히 제거된다. 4A-2를 먼저 하면 worker별 heap buffer → shm memcpy가 여전히 남는다.
+
+구현 항목:
+
+**4A-1 — double memcpy 제거** (ADR-034 §4A-1):
+- `cuvs_ambuild()`에서 scan 시작 전 `shm_open` + 초기 `ftruncate`(preflight 추정치 기반) + `mmap` 수행.
+- `grow_build_buffers()`의 `realloc`을 `ftruncate` + `mremap`(또는 `munmap` + 재`mmap`)으로 교체.
+- `shm_write_build_payload()`의 `shm_open` + `mmap` + `memcpy` x 2를 제거. IPC frame에 shm 이름만 전달.
+- `shm_open` 실패 시 기존 heap 경로로 degraded fallback + WARNING.
+
+**4A-2 — parallel maintenance workers** (ADR-034 §4A-2):
+- `table_index_build_scan()`에 `ParallelTableScanDesc`를 전달하거나 `table_parallel_index_build_scan()`을 사용(구현 시 PG API 조사 후 결정).
+- worker별 독립 `CuvsBuildState`로 partial buffer 누적. scan 완료 후 leader가 memcpy 연접으로 merge.
+- `max_parallel_maintenance_workers` GUC를 읽어 worker 수 결정. 0이면 기존 단일 프로세스 경로.
+- `amcanparallel` 등 scan 병렬화 콜백은 등록하지 않음(build 병렬화는 `ambuild()` 내부에서 처리).
+
+4A-1 완료 기준:
+- 데이터셋: N=1M, dim=1024, Cohere Wikipedia. 하드웨어: A100-40GB.
+- `CREATE INDEX USING cagra` build time이 기존 ~55s에서 ~50s 이하로 감소.
+- `shm_open` 실패 시 heap 경로 fallback이 동작하고, 결과가 기존과 동일(recall, 정합성 차이 없음).
+- 기존 test suite(`make gpu-test-all`) 전수 PASS. fallback 경로용 integration scenario 1건 추가.
+
+4A-2 완료 기준:
+- 동일 데이터셋/하드웨어.
+- `max_parallel_maintenance_workers = 4` 설정 시 build time이 ~50s에서 ~30-35s로 감소.
+- `max_parallel_maintenance_workers = 0`이면 기존 단일 프로세스 경로와 동작 동일(byte-identical artifact).
+- worker별 merge 후 CAGRA build 결과(recall, TID mapping)가 단일 프로세스 build와 동일.
+- 기존 test suite 전수 PASS. parallel build용 integration scenario 1건 추가(worker 수 >= 2에서 build + search 정합 확인).
+
+장기 항목 분석 결과 (ADR-034 §heap scan 후속 분석, 2026-06-03):
+
+heap scan + varlena decode ~15-20s는 PG 오버헤드 45s 중 가장 큰 단일 구간이다. 주 원인은 pgvector `vector` 타입이 varlena여서 dim >= 512인 벡터가 거의 모두 TOAST되고, `cuvs_build_callback()`이 매 tuple마다 `PG_DETOAST_DATUM`(palloc + decompress)을 호출하는 것이다. 검토한 5가지 가속 방안(PLAIN storage 강제, 별도 binary column, pgvector fixed-length 기여, raw page scan 커스터마이징, prefetch/streaming detoast) 중 pg_cuvs 단독으로 단기에 실현 가능한 것은 없다.
+
+현실적 대응:
+- parallel workers(4A-2)가 wall-clock 분산으로 유일한 단기 가속 수단이다.
+- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 ~25-35% 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다.
+- 장기 모니터링 대상: pgvector fixed-length storage 지원 여부, PG 코어 TOAST prefetch/streaming API.
 
 ### 4B — import_hnsw 페이지 write 병목 감소
 
@@ -934,8 +1003,8 @@ heap scan → varlena decode → malloc 버퍼 누적 → memcpy → shm → dae
 |-----------|------|--------|------|
 | UNLOGGED 타겟 | ~28s | 낮음 | **완료** (ADR-033) |
 | UNLOGGED + REINDEX 패턴 | 운영 패턴 | 낮음 | **완료** (ADR-035 문서화) |
-| 병렬 페이지 write | ~15-25s | 높음 | 미구현 |
-| Bulk WAL | ~10-15s | 높음 | PG WAL internals, 장기 |
+| 병렬 페이지 write | ~15-25s | 높음 | **단기 제외** (ADR-035: PG buffer manager concurrent extension 제약) |
+| Bulk WAL | ~10-15s | 높음 | **단기 제외** (ADR-035: log_newpage_range는 buffer-manager-through 경로와 비호환) |
 
 **UNLOGGED + REINDEX 권장 패턴** (현재 가능):
 ```sql
@@ -947,13 +1016,23 @@ SELECT pg_cuvs_import_cagra('t_cagra'::regclass, 't_hnsw'::regclass);
 REINDEX INDEX t_hnsw;  -- pgvector 재빌드, LOGGED
 ```
 
+4B 현황: 단기 개선 가능 항목(UNLOGGED, Phase 3J direct path)은 모두 적용 완료. 잔여 개선(병렬 page write, Bulk WAL)은 ADR-035에서 PG internals 의존도를 이유로 단기 제외로 결정했다. 따라서 4B의 현실적 목표는 현상 유지(UNLOGGED ~28s, LOGGED ~57s)이며, PG 코어에 인덱스 build용 bulk page write API가 추가되거나 `ReadBuffer` concurrent extension 제약이 완화되는 시점에 재검토한다.
+
+재검토 조건:
+- PG 코어에 `ReadBufferExtended`의 multi-block allocation 변형이 추가되는 경우.
+- PG 코어에 buffer manager를 통한 `log_newpage_range` 연동 패턴이 정립되는 경우.
+- `wal_compression`의 float 벡터 데이터 압축 효과가 실측으로 유의미하다고 확인되는 경우(별도 실측 필요).
+
 ### 4 — 완료 기준
 
-| 목표 | 수치 |
-|------|------|
-| 4A 단기 완료 | CAGRA build ≤ 35s (현재 55s) |
-| 4B 단기 완료 | UNLOGGED import ≤ 25s (현재 28s) |
-| 종합 (4A+4B, UNLOGGED) | 전체 ≤ 65s (현재 96s, native 285s 대비 4.4×) |
+검증 환경: N=1M, dim=1024, Cohere Wikipedia, A100-40GB. `bench/run_cohere.sh` 또는 동등한 harness로 실행하고 `bench/results/`에 결과를 기록한다.
+
+| 목표 | 수치 | 검증 방법 |
+|------|------|-----------|
+| 4A-1 완료 | CAGRA build ≤ 50s (현재 55s) | `EXPLAIN (ANALYZE)` build time + shm fallback integration test |
+| 4A-2 완료 | CAGRA build ≤ 35s (현재 55s, workers=4 기준) | 동일 + workers=0 동작 동일 확인 + parallel build integration test |
+| 4B 현상 유지 | UNLOGGED import ~28s (변동 없음) | `EXPLAIN (ANALYZE)` import time, 기존 test suite regression 없음 |
+| 종합 (4A-2 + 4B, UNLOGGED) | 전체 ≤ 65s (현재 96s, native 285s 대비 4.4×) | end-to-end: CAGRA build + pg_cuvs_build_hnsw(nsw) + UNLOGGED import |
 
 ---
 
