@@ -63,8 +63,12 @@ jobs:
   gpu-regress:
     name: GPU regression (installcheck)
     runs-on: [self-hosted, gpu, a100]
-    # Only run on push (not every PR preview to save GPU time).
-    if: github.event_name == 'push'
+    # Only run on push, AND only when a self-hosted A100 runner is enabled via
+    # the repo variable GPU_CI_ENABLED=true. Without a registered runner this
+    # job would queue forever, so it is gated off by default. After registering
+    # a [self-hosted, gpu, a100] runner, set repo variable GPU_CI_ENABLED=true
+    # (Settings → Secrets and variables → Actions → Variables).
+    if: github.event_name == 'push' && vars.GPU_CI_ENABLED == 'true'
 
     steps:
       - uses: actions/checkout@v4
