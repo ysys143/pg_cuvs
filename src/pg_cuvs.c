@@ -43,6 +43,7 @@
 #include "catalog/objectaccess.h"   /* object_access_hook, OAT_DROP (Phase 3G.1) */
 #include "catalog/pg_class.h"       /* RelationRelationId, RELKIND_INDEX, Form_pg_class */
 #include "utils/syscache.h"         /* SearchSysCache1(RELOID) */
+#include "catalog/pg_opfamily.h"    /* OPFAMILYOID, Form_pg_opfamily */
 
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock */
@@ -794,30 +795,27 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 static uint32_t
 cuvs_index_metric(Relation indexRel)
 {
-    static bool resolved = false;
-    static Oid  opf_l2 = InvalidOid, opf_cos = InvalidOid, opf_ip = InvalidOid;
-    Oid relam = indexRel->rd_rel->relam;
-    Oid idxopf;
-
-    if (!resolved)
+    /* Resolve by opclass-family NAME (vector_l2_ops / vector_cosine_ops /
+     * vector_ip_ops). pgvector names the family after the opclass, and both
+     * the cagra and pg_cuvs_hnsw AMs reuse those same names, so this is AM-
+     * agnostic and build/scan always agree. (The previous opfamily-OID cache
+     * was AM-specific and mis-mapped when both AMs were used in one session.) */
+    Oid       idxopf = indexRel->rd_opfamily[0];
+    int       m = -1;
+    HeapTuple oftup = SearchSysCache1(OPFAMILYOID, ObjectIdGetDatum(idxopf));
+    if (HeapTupleIsValid(oftup))
     {
-        Oid c;
-        c = get_opclass_oid(relam, list_make1(makeString("vector_l2_ops")), true);
-        opf_l2  = OidIsValid(c) ? get_opclass_family(c) : InvalidOid;
-        c = get_opclass_oid(relam, list_make1(makeString("vector_cosine_ops")), true);
-        opf_cos = OidIsValid(c) ? get_opclass_family(c) : InvalidOid;
-        c = get_opclass_oid(relam, list_make1(makeString("vector_ip_ops")), true);
-        opf_ip  = OidIsValid(c) ? get_opclass_family(c) : InvalidOid;
-        resolved = true;
+        const char *opfname =
+            NameStr(((Form_pg_opfamily) GETSTRUCT(oftup))->opfname);
+        m = cuvs_metric_from_opclass_name(opfname);
+        ReleaseSysCache(oftup);
     }
 
-    idxopf = indexRel->rd_opfamily[0];
-    if (OidIsValid(opf_cos) && idxopf == opf_cos) return CUVS_METRIC_COSINE;
-    if (OidIsValid(opf_ip)  && idxopf == opf_ip)  return CUVS_METRIC_IP;
-    if (OidIsValid(opf_l2)  && idxopf == opf_l2)  return CUVS_METRIC_L2;
+    if (m >= 0)
+        return (uint32_t) m;
 
     ereport(WARNING,
-            (errmsg("pg_cuvs: unrecognized opclass family for cagra index %u; assuming L2",
+            (errmsg("pg_cuvs: unrecognized opclass family for index %u; assuming L2",
                     RelationGetRelid(indexRel))));
     return CUVS_METRIC_L2;
 }
@@ -954,13 +952,20 @@ cuvs_build_callback(Relation index,
 }
 
 /* ----------------------------------------------------------------
- * Index AM: ambuild — handles CREATE INDEX USING cagra
+ * Phase 3K: shared heap-scan + CAGRA build.
+ *
+ * Used by both cuvs_ambuild (USING cagra) and the source-less pg_cuvs_hnsw
+ * path (ephemeral CAGRA — see src/hnsw_export.c). Scans the heap into a corpus
+ * and asks the daemon to build a CAGRA index under (MyDatabaseId,
+ * build_index_oid). On an empty heap, sets *out_n_vecs = 0 and builds nothing.
+ * The corpus is freed internally; a build failure raises ERROR (DDL durability
+ * contract).
  * ---------------------------------------------------------------- */
-static IndexBuildResult *
-cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
+void
+cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
+                           uint32_t build_index_oid, uint32_t shard_count,
+                           bool use_cpu_hnsw, int64_t *out_n_vecs, double *out_reltuples)
 {
-    IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
-
     CuvsBuildState bs;
     memset(&bs, 0, sizeof(bs));
     bs.metric = cuvs_index_metric(indexRel);  /* baked into the CAGRA graph */
@@ -1003,24 +1008,24 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         true, true,
         cuvs_build_callback, &bs, NULL);
 
-    result->heap_tuples  = bs.reltuples;
-    result->index_tuples = (double)bs.n_vecs;
+    if (out_reltuples) *out_reltuples = bs.reltuples;
+    *out_n_vecs = bs.n_vecs;
 
     if (bs.n_vecs == 0)
     {
         /* Empty table — nothing to build */
         if (bs.vectors) free(bs.vectors);
         if (bs.tids)    free(bs.tids);
-        return result;
+        return;
     }
 
     /* Send corpus to daemon for CAGRA build */
-    uint32_t heap_table_oid  = (uint32_t)RelationGetRelid(heapRel);
+    uint32_t heap_table_oid   = (uint32_t)RelationGetRelid(heapRel);
     uint32_t heap_relfilenode = (uint32_t)heapRel->rd_rel->relfilenode;
     int rc = cuvs_ipc_build(
         cuvs_socket_path,
         (uint32_t)MyDatabaseId,
-        (uint32_t)RelationGetRelid(indexRel),
+        build_index_oid,
         bs.vectors,
         (const uint64_t *)bs.tids,
         bs.n_vecs,
@@ -1029,8 +1034,8 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         get_index_dir(),
         heap_table_oid,
         heap_relfilenode,
-        (uint32_t)cuvs_shard_count,
-        cuvs_cpu_hnsw_fallback ? 1 : 0);  /* Phase 3I-1: serialize .hnsw sidecar */
+        shard_count,
+        use_cpu_hnsw ? 1 : 0);  /* Phase 3I-1: serialize .hnsw sidecar */
 
     free(bs.vectors);
     free(bs.tids);
@@ -1066,15 +1071,42 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                         "aborted to preserve catalog durability", rc),
                  errhint("%s", hint)));
     }
+}
+
+/* ----------------------------------------------------------------
+ * Index AM: ambuild — handles CREATE INDEX USING cagra
+ * ---------------------------------------------------------------- */
+static IndexBuildResult *
+cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
+{
+    IndexBuildResult *result = palloc0(sizeof(IndexBuildResult));
+    int64_t n_vecs    = 0;
+    double  reltuples = 0.0;
+
+    /* Scan the heap and build the CAGRA index on the daemon under this index's
+     * own OID (shard_count / cpu_hnsw from GUCs). */
+    cuvs_build_cagra_from_heap(heapRel, indexRel, indexInfo,
+                               (uint32_t) RelationGetRelid(indexRel),
+                               (uint32_t) cuvs_shard_count,
+                               cuvs_cpu_hnsw_fallback,
+                               &n_vecs, &reltuples);
+
+    result->heap_tuples  = reltuples;
+    result->index_tuples = (double) n_vecs;
+
+    if (n_vecs == 0)
+        return result;  /* empty table — nothing built */
 
     /* Phase 3C: write .relfilenode sidecar so the daemon can verify heap
      * compatibility before loading a GCS artifact on a new node. */
     {
+        uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
+        uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
         char sidecar[MAXPGPATH];
         snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
                  get_index_dir(),
-                 (uint32_t)MyDatabaseId,
-                 (uint32_t)RelationGetRelid(indexRel));
+                 (uint32_t) MyDatabaseId,
+                 (uint32_t) RelationGetRelid(indexRel));
         FILE *f = fopen(sidecar, "w");
         if (f)
         {
