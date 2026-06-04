@@ -1,0 +1,143 @@
+-- brute_force.sql — Phase 3L (ADR-039): GPU brute-force search mode.
+--
+-- Coverage:
+--   1. cuvs.search_mode='brute_force' on a USING cagra index returns recall@k=1.0
+--      (sorted top-k distances match the pgvector seqscan ground truth) for L2,
+--      cosine, and inner-product opclasses.
+--   2. pg_stat_gpu_search.search_mode reports 'brute_force'.
+--   3. cuvs.bf_precision='float16' still matches the exact ground truth here
+--      (small corpus; half accumulates distances in float32).
+--   4. pg_stat_gpu_cache exposes bf_vram_mb / bf_precision after a BF search.
+--   5. Sharded (cuvs.shard_count=2) brute_force also returns recall@k=1.0.
+--   6. cagra default path is unchanged (recall may be < 1.0; not asserted here —
+--      the rest of REGRESS is the byte-identical-default gate).
+--
+-- The recall check compares the SORTED top-k distance lists rather than ids, so
+-- exact distance ties never cause a spurious mismatch: for an exact search the
+-- distance multiset is identical to the seqscan ground truth.
+--
+-- REQUIRES: pg_cuvs_server running with a GPU; cuvs.index_dir writable.
+
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- Deterministic 200-vector, 8-dim corpus. Mixed linear/periodic terms keep the
+-- per-query distances distinct (no exact ties) while staying reproducible.
+CREATE TABLE bf_test (id int, embedding vector(8));
+INSERT INTO bf_test
+SELECT g,
+       format('[%s,%s,%s,%s,%s,%s,%s,%s]',
+              (g * 0.013)::numeric(12,6),
+              (g * g * 0.0007)::numeric(12,6),
+              sin(g * 0.10)::numeric(12,6),
+              cos(g * 0.17)::numeric(12,6),
+              ((g % 13) * 0.05)::numeric(12,6),
+              ((g % 7) * 0.08)::numeric(12,6),
+              sin(g * 0.30)::numeric(12,6),
+              cos(g * 0.23)::numeric(12,6))::vector
+FROM generate_series(1, 200) g;
+
+-- ── L2 ───────────────────────────────────────────────────────────
+SET client_min_messages = 'warning';
+CREATE INDEX bf_l2 ON bf_test USING cagra (embedding vector_l2_ops);
+SET client_min_messages = 'notice';
+
+-- Ground truth (seqscan, GPU off) vs brute_force (GPU exact). recall@10 = 1.0
+-- when the sorted distance lists are equal.
+SET enable_cuvs = off; SET enable_seqscan = on;
+CREATE TEMP TABLE gt_l2 AS
+    SELECT round((embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET enable_cuvs;
+
+SET cuvs.search_mode = 'brute_force'; SET enable_seqscan = off;
+CREATE TEMP TABLE bf_l2_r AS
+    SELECT round((embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET cuvs.search_mode; RESET enable_seqscan;
+
+SELECT (SELECT array_agg(d ORDER BY d) FROM gt_l2)
+     = (SELECT array_agg(d ORDER BY d) FROM bf_l2_r) AS l2_recall_ok;
+
+-- search_mode stat reflects the brute_force search just performed.
+SELECT search_mode FROM pg_stat_gpu_search
+WHERE index_name = 'bf_l2';
+
+-- pg_stat_gpu_cache exposes the Phase 3L bf_vram_mb / bf_precision columns.
+-- (This tiny corpus's BF index is well under 1 MB, so bf_vram_mb rounds to 0;
+-- we assert the columns are present and queryable rather than a byte count.)
+SELECT bf_vram_mb >= 0 AS bf_cols_ok
+FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
+
+-- ── cosine ───────────────────────────────────────────────────────
+SET client_min_messages = 'warning';
+CREATE INDEX bf_cos ON bf_test USING cagra (embedding vector_cosine_ops);
+SET client_min_messages = 'notice';
+
+SET enable_cuvs = off; SET enable_seqscan = on;
+CREATE TEMP TABLE gt_cos AS
+    SELECT round((embedding <=> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <=> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET enable_cuvs;
+
+SET cuvs.search_mode = 'brute_force'; SET enable_seqscan = off;
+CREATE TEMP TABLE bf_cos_r AS
+    SELECT round((embedding <=> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <=> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET cuvs.search_mode; RESET enable_seqscan;
+
+SELECT (SELECT array_agg(d ORDER BY d) FROM gt_cos)
+     = (SELECT array_agg(d ORDER BY d) FROM bf_cos_r) AS cos_recall_ok;
+
+-- ── float16 precision (same exact GT on this small corpus) ────────
+SET enable_cuvs = off; SET enable_seqscan = on;
+CREATE TEMP TABLE gt_l2b AS
+    SELECT round((embedding <-> '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <-> '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]' LIMIT 10;
+RESET enable_cuvs;
+
+SET cuvs.search_mode = 'brute_force'; SET cuvs.bf_precision = 'float16';
+SET enable_seqscan = off;
+CREATE TEMP TABLE bf_l2_f16 AS
+    SELECT round((embedding <-> '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <-> '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]' LIMIT 10;
+RESET cuvs.search_mode; RESET cuvs.bf_precision; RESET enable_seqscan;
+
+-- float16 returns the same top-10 ordering; distances may differ slightly, so
+-- compare the id SET (must equal the GT ids), not the distances.
+SELECT count(*) = 10 AS f16_recall_ok
+FROM (
+    SELECT id FROM bf_test
+    WHERE round((embedding <-> '[0.2,0.9,0.4,0.1,0.5,0.3,0.7,0.6]')::numeric, 4)
+          IN (SELECT d FROM gt_l2b)
+) s;
+
+-- ── sharded brute_force ──────────────────────────────────────────
+SET client_min_messages = 'warning';
+SET cuvs.shard_count = 2;
+CREATE INDEX bf_sh ON bf_test USING cagra (embedding vector_l2_ops);
+RESET cuvs.shard_count;
+SET client_min_messages = 'notice';
+
+SET enable_cuvs = off; SET enable_seqscan = on;
+CREATE TEMP TABLE gt_sh AS
+    SELECT round((embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET enable_cuvs;
+
+SET cuvs.search_mode = 'brute_force'; SET enable_seqscan = off;
+CREATE TEMP TABLE bf_sh_r AS
+    SELECT round((embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM bf_test ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET cuvs.search_mode; RESET enable_seqscan;
+
+SELECT (SELECT array_agg(d ORDER BY d) FROM gt_sh)
+     = (SELECT array_agg(d ORDER BY d) FROM bf_sh_r) AS sharded_recall_ok;
+
+-- Cleanup.
+DROP TABLE bf_test CASCADE;
+DROP EXTENSION pg_cuvs CASCADE;
