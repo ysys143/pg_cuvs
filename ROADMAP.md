@@ -23,9 +23,9 @@
 | 3H-full | 운영 runbook 완성 (replica bootstrap, capacity-planning, upgrade) | 1 |
 | 3L | GPU brute force 검색 모드 (`cuvs.search_mode='brute_force'`) | 2 |
 | 3M | 배치 검색 API (`pg_cuvs_batch_search`) | 2 |
-| 4A-1 | CAGRA 빌드 double memcpy 제거 | 3 |
-| 4A-2 | parallel maintenance workers | 3 |
-| 3A | Pending delta / delta exact search | 4 |
+| 3A | Pending delta / delta exact search | 3 |
+| 4A-1 | CAGRA 빌드 double memcpy 제거 | 4 |
+| 4A-2 | parallel maintenance workers | 4 |
 | 3C | GCS artifact snapshot (본체) | 5 |
 | 3D | Replica async warmup | 5 |
 
@@ -66,30 +66,10 @@
 
 ---
 
-### Wave 2 — 핵심 기능 (순차)
-
-#### 3A-1 — Pending Delta CPU-exact MVP
-**왜 먼저**: RAG/검색 시스템은 문서가 계속 추가/수정된다. INSERT 하나만 해도 GPU path가 완전히 포기되는 현재 구조로는 streaming write가 있는 모든 워크로드에서 pg_cuvs를 쓸 수 없다. 3A-1은 `.delta` sidecar + backend CPU exact merge만으로 "INSERT 후 GPU path 유지"를 달성하는 가장 보수적인 경로이며, GPU delta cache(3A-2)나 tombstone(3A-4) 없이도 correctness가 보장된다.
-
-구현 항목:
-- `aminsert`에서 `.delta` sidecar에 (TID, vector, generation) append — 성공 시 `MARK_STALE` 전송 안 함
-- `.delta` append 실패 시 기존 stale path로 fail-closed
-- query 시 base CAGRA search(k+slop) + CPU exact search over delta rows + top-k merge
-- generation mismatch 시 CPU reroute
-- `cuvs.max_delta_rows` 초과 시 GPU+delta 중단 + REINDEX 권고
-- REINDEX 후 `.delta` compaction
-
-완료 기준:
-- INSERT 후 REINDEX 전에도 새 row가 GPU+delta merged top-k에 포함됨
-- L2/cosine/IP 각각에서 GPU+delta 결과가 pgvector ground truth와 일치
-- delta threshold 초과 시 CPU reroute 발생
-
-스펙: [design/PLAN.md — Phase 3A](design/PLAN.md) (3A-1)
-
----
+### Wave 2 — 신규 기능, 리스크 낮음 (순차)
 
 #### 3L — GPU Brute Force 검색 모드
-**왜**: `cuvs_brute_force_search` / `CuvsBfIndex` 인프라가 이미 구현됨. 구현 비용 낮음. 3M의 BF 배치 경로 전제.
+**왜**: `cuvs_brute_force_search` / `CuvsBfIndex` 인프라가 이미 구현됨. 구현 비용 낮음. 3M의 BF 배치 경로 전제. **3A-2(GPU delta cache)가 동일한 `CuvsBfIndex` 인프라를 재사용하므로 3A 전에 먼저 완성하는 것이 효율적.**
 
 구현 항목:
 - `CREATE INDEX USING cagra` 시 `.vectors` sidecar 직렬화 (versioned header, fsync+rename)
@@ -128,10 +108,45 @@
 
 ---
 
-### Wave 3 — 빌드 성능 (순차, Wave 2와 병렬 시작 가능)
+### Wave 3 — Pending Delta (순차)
+
+RAG/검색 시스템은 문서가 계속 추가/수정된다. INSERT 하나만 해도 GPU path가 완전히 포기되는 현재 구조로는 streaming write가 있는 모든 워크로드에서 pg_cuvs를 실운용할 수 없다. **3L에서 완성한 `CuvsBfIndex` 인프라를 3A-2 GPU delta cache가 직접 재사용한다.**
+
+#### 3A-1 — CPU-exact MVP
+- `aminsert`에서 `.delta` sidecar에 (TID, vector, generation) append — 성공 시 `MARK_STALE` 전송 안 함
+- `.delta` append 실패 시 기존 stale path로 fail-closed
+- query 시 base CAGRA(k+slop) + CPU exact search over delta rows + top-k merge
+- generation mismatch 시 CPU reroute
+- `cuvs.max_delta_rows` 초과 시 GPU+delta 중단 + REINDEX 권고
+- REINDEX 후 `.delta` compaction
+
+#### 3A-2 — GPU BF delta cache
+- daemon이 `.delta`를 generation/mtime 기준 lazy reload → `CuvsBfIndex`로 로드 (3L 인프라 재사용)
+- base CAGRA search + GPU BF delta search → daemon 내 merge → `delta_merged` flag
+- `delta_merged=1`이면 backend CPU merge 생략
+
+#### 3A-3 — delta controls/stats
+- `cuvs.delta_search=auto|cpu|gpu` GUC
+- `pg_stat_gpu_search` delta 컬럼 (`delta_rows`, `delta_generation`, `delta_vram_bytes`, `delta_search_mode`)
+
+#### 3A-4 — tombstone/cleanup
+- `.tombstone` sidecar + snapshot-aware dead TID filtering
+- `ambulkdelete`가 dead TID를 tombstone으로 기록
+- tombstone cap 초과/unusable 시에만 `.stale` CPU reroute
+
+완료 기준:
+- INSERT/UPDATE 후 REINDEX 없이 GPU+delta merged top-k가 pgvector ground truth와 일치
+- DELETE/VACUUM은 tombstone correction 기본 경로 사용
+- daemon restart 후 delta 유실 시 incomplete GPU 결과 서빙 안 함
+
+스펙: [design/PLAN.md — Phase 3A](design/PLAN.md)
+
+---
+
+### Wave 4 — 빌드 성능 (순차)
 
 #### 4A-1 — CAGRA 빌드 double memcpy 제거
-**왜 먼저**: 4A-1의 shm 직접 할당이 4A-2 worker buffer와 결합해야 double memcpy 완전 제거.
+**왜**: 4A-1의 shm 직접 할당이 4A-2 worker buffer와 결합해야 double memcpy 완전 제거.
 
 구현 항목:
 - `cuvs_ambuild()`에서 scan 전 `shm_open` + `ftruncate` + `mmap`
@@ -156,21 +171,6 @@
 완료 기준: workers=4 기준 build ≤ 35s (현재 55s)
 
 스펙: [design/PLAN.md — Phase 4A](design/PLAN.md) | ADR-034 §4A-2
-
----
-
-### Wave 4 — 정합성 (write 수요 확인 후)
-
-#### 3A — Pending Delta / Delta Exact Search
-**왜 나중에**: 가장 복잡하고 정합성 리스크가 높음. write-heavy workload 실제 수요 확인 후 진입. 현재는 REINDEX 권고로 커버 가능.
-
-subphase:
-- **3A-1**: `.delta` sidecar + backend CPU exact merge MVP
-- **3A-2**: daemon GPU brute-force delta cache + `delta_merged` IPC flag
-- **3A-3**: `cuvs.delta_search` GUC + stats 컬럼
-- **3A-4**: `.tombstone` sidecar + snapshot-aware dead TID filtering
-
-스펙: [design/PLAN.md — Phase 3A](design/PLAN.md)
 
 ---
 
