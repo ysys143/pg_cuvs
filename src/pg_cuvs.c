@@ -826,6 +826,19 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
         *indexStartupCost = 1e15;
         *indexTotalCost   = 1e15;
     }
+    else if (cuvs_search_mode == 1)
+    {
+        /* Phase 3L (ADR-039): brute_force is exact GPU k-NN — latency is
+         * bandwidth-bound in the corpus size N, not in cuvs.k. Model it as a
+         * small N-scaled cost with no per-k term; still far below a disabled
+         * seqscan so the GPU path is chosen whenever the user opts into
+         * brute_force. A missing .vectors sidecar is NOT gated here: it surfaces
+         * as a clear ERROR at execution, not a silent CPU fallback. */
+        double n = path->indexinfo->rel->tuples;
+        if (n < 1) n = 1;
+        *indexStartupCost = CUVS_STARTUP_COST;
+        *indexTotalCost   = CUVS_STARTUP_COST + CUVS_ROWS_COST * n;
+    }
     else
     {
         *indexStartupCost = CUVS_STARTUP_COST;
@@ -2305,7 +2318,7 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
  * backing the pg_stat_gpu_cache view. One row normally; zero rows when the
  * daemon is unreachable (same convention as pg_stat_gpu_search).
  * ---------------------------------------------------------------- */
-#define GPU_CACHE_NCOLS 9
+#define GPU_CACHE_NCOLS 11
 
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_cache_stats);
 Datum
@@ -2362,6 +2375,9 @@ pg_cuvs_gpu_cache_stats(PG_FUNCTION_ARGS)
                 values[6] = Int32GetDatum((int32) cs->resident_count);
                 values[7] = Int64GetDatum((int64) (cs->vram_used_bytes / (1024 * 1024)));
                 values[8] = Int64GetDatum((int64) (cs->vram_budget_bytes / (1024 * 1024)));
+                /* Phase 3L: resident brute-force index VRAM + precision. */
+                values[9] = Int64GetDatum((int64) (cs->bf_vram_bytes / (1024 * 1024)));
+                values[10] = CStringGetTextDatum(cs->bf_precision == 1 ? "float16" : "float32");
                 tuplestore_putvalues(tupstore, tupdesc, values, nulls);
             }
         }

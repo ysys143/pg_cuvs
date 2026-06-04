@@ -292,6 +292,8 @@ typedef struct CuvsCacheStats {
     uint64_t persist_failures;  /* eviction aborted because save_index failed */
     uint64_t vram_used_bytes;   /* sum of resident vram_bytes */
     uint64_t vram_budget_bytes; /* g_max_vram_bytes; 0 = unlimited */
+    uint64_t bf_vram_bytes;     /* Phase 3L: VRAM held by resident brute-force indexes */
+    uint32_t bf_precision;      /* Phase 3L: precision of resident BF indexes (0=f32, 1=f16) */
 } CuvsCacheStats;
 
 int cuvs_ipc_cache_stats(const char *socket_path, CuvsCacheStats *out,

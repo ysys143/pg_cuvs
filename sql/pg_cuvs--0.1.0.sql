@@ -205,7 +205,9 @@ CREATE FUNCTION pg_cuvs_gpu_cache_stats(
     OUT persist_failures bigint,
     OUT resident_count   integer,
     OUT vram_used_mb     bigint,
-    OUT vram_budget_mb   bigint
+    OUT vram_budget_mb   bigint,
+    OUT bf_vram_mb       bigint,
+    OUT bf_precision     text
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_cache_stats'

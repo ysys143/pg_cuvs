@@ -3831,11 +3831,25 @@ handle_cache_stats(int client_fd)
                 for (int s = 0; s < ej->shard_count; s++)
                     if (ej->shards[s].valid &&
                         ej->shards[s].gpu_device_id == (uint32_t)dev)
+                    {
                         cs->resident_count++;
+                        /* Phase 3L: per-shard resident brute-force index VRAM. */
+                        if (ej->shards[s].bf_idx)
+                        {
+                            cs->bf_vram_bytes += ej->shards[s].bf_vram_bytes;
+                            cs->bf_precision = ej->bf_precision;
+                        }
+                    }
             }
             else if (ej->gpu_device_id == (uint32_t)dev)
             {
                 cs->resident_count++;
+                /* Phase 3L: unsharded resident brute-force index VRAM. */
+                if (ej->main_bf_idx)
+                {
+                    cs->bf_vram_bytes += ej->main_bf_vram_bytes;
+                    cs->bf_precision = ej->bf_precision;
+                }
             }
         }
         cs->vram_used_bytes  = total_vram_used(dev);
