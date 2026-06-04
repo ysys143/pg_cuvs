@@ -34,12 +34,28 @@
   데몬 VRAM/artifact 정리(+재시작 zombie 검증), delta/tombstone/stale, sharded GPU
   delta cache(`delta_search_mode`).
 
+## 용량 계획 / 업그레이드 *(Phase 3H-full)*
+- [capacity-planning.md](capacity-planning.md) — VRAM 추정 공식(`estimate_vram_bytes`,
+  `cuvs_auto_shard_count`), N×dim별 단일/멀티 GPU 표, `--max-vram-mb` 권장값(물리
+  70–80%), artifact 디스크 크기, 50M×384 단일 노드 한계.
+- [release-upgrade.md](release-upgrade.md) — 0.1.0 설치/재설치(`make install` +
+  `make install-server`), 데몬·PostgreSQL 재시작 순서, artifact magic 호환성,
+  향후 `ALTER EXTENSION pg_cuvs UPDATE` 절차(TBD: 첫 릴리스 후 검증).
+
+## 노드 부트스트랩 *(Phase 3H-full)*
+- [replica-bootstrap.md](replica-bootstrap.md) — GCS snapshot으로 새 노드 부트스트랩
+  (`snapshot_uri`/`cluster_id`/`gcs_key_file`), warmup_state 흐름,
+  `.relfilenode` heap 호환 확인, manifest SHA 검증.
+  (TBD: 스트리밍 물리 복제 환경 검증 필요.)
+
 ## 벤치마크
 - [large-dataset-benchmark.md](large-dataset-benchmark.md) — 대규모 데이터셋 벤치 절차.
+- [benchmark-runbook.md](benchmark-runbook.md) — *(Phase 3H-full)* 벤치 하네스 3종
+  (`make gpu-bench` / `make gpu-cohere` / `make gpu-anbench`) 사용법, 결과 위치
+  (`bench/results/`, `design/anbench/`), GT 버그 이력, capacity-planning.md 연계.
 
 ---
 
-> Phase 3H-light 기준(이 색인): 위 12개 중 4개(*Phase 3* 표시)가 멀티 GPU/GCS/샤딩/
-> DROP 운영 표면을 커버한다. replica bootstrap·DiskANN·capacity-planning 수치·release
-> upgrade runbook은 DiskANN/벤치마크 이후 **3H-full**에서 추가한다.
+> Phase 3H-full 기준(이 색인): 위 16개 중 8개(*Phase 3* 및 *Phase 3H-full* 표시)가
+> 멀티 GPU/GCS/샤딩/DROP/용량계획/업그레이드/bootstrap/벤치마크 운영 표면을 커버한다.
 > 설계 근거: `design/DECISIONS.md` ADR-013, ADR-021..024.
