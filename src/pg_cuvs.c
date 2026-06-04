@@ -26,6 +26,9 @@
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/tableam.h"
+#include "access/table.h"          /* table_open/table_close (Phase 3M) */
+#include "access/relation.h"       /* index_open/index_close (Phase 3M) */
+#include "utils/array.h"           /* deconstruct_array, ARR_ELEMTYPE (Phase 3M) */
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
@@ -2172,6 +2175,223 @@ cuvs_metric_name(uint32_t metric)
         case CUVS_METRIC_IP:     return "ip";
         default:                 return "unknown";
     }
+}
+
+/* ----------------------------------------------------------------
+ * Phase 3M: pg_cuvs_batch_search(rel regclass, queries vector[], k int)
+ *   RETURNS TABLE(query_idx int, ctid tid, distance float4)
+ *
+ * Sends Q queries to the daemon in one IPC round-trip (one batched GPU
+ * dispatch) and returns up to K = min(k, n_vecs) neighbors per query. Mirrors
+ * the single-query semantics: raw ctids + daemon distance, no internal heap
+ * visibility filtering (the caller JOINs on ctid for MVCC, exactly like the AM
+ * scan sets xs_recheck). Honors cuvs.search_mode / cuvs.bf_precision, so it
+ * works in brute_force mode too once a .vectors sidecar exists.
+ * ---------------------------------------------------------------- */
+PG_FUNCTION_INFO_V1(pg_cuvs_batch_search);
+Datum
+pg_cuvs_batch_search(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc       tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext   per_query_ctx, oldcontext;
+
+    Oid        table_oid = PG_GETARG_OID(0);
+    ArrayType *qarr      = PG_GETARG_ARRAYTYPE_P(1);
+    int        k         = PG_GETARG_INT32(2);
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    if (k < 1 || k > 2000)
+        ereport(ERROR,
+                (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                 errmsg("pg_cuvs_batch_search: k must be between 1 and 2000")));
+
+    /* --- Resolve the USING cagra index on the table. --- */
+    Relation  heapRel = table_open(table_oid, AccessShareLock);
+    List     *indexes = RelationGetIndexList(heapRel);
+    Oid       cagra_am = get_am_oid("cagra", true);
+    Oid       index_oid = InvalidOid;
+    ListCell *lc;
+
+    foreach(lc, indexes)
+    {
+        Oid       io = lfirst_oid(lc);
+        Relation  ir = index_open(io, AccessShareLock);
+        bool      is_cagra = (OidIsValid(cagra_am) && ir->rd_rel->relam == cagra_am);
+        index_close(ir, AccessShareLock);
+        if (is_cagra) { index_oid = io; break; }
+    }
+    list_free(indexes);
+    if (!OidIsValid(index_oid))
+    {
+        table_close(heapRel, AccessShareLock);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs_batch_search: no \"USING cagra\" index on relation \"%s\"",
+                        get_rel_name(table_oid))));
+    }
+
+    {
+        Relation indexRel = index_open(index_oid, AccessShareLock);
+        uint32_t metric   = cuvs_index_metric(indexRel);
+        index_close(indexRel, AccessShareLock);
+        table_close(heapRel, AccessShareLock);
+
+        /* --- Deconstruct queries vector[] into a row-major float buffer. --- */
+        Oid    elemtype = ARR_ELEMTYPE(qarr);
+        int16  elmlen;
+        bool   elmbyval;
+        char   elmalign;
+        Datum *elems;
+        bool  *elnulls;
+        int    Q;
+        int    dim = 0;
+        float *qbuf = NULL;
+
+        get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+        deconstruct_array(qarr, elemtype, elmlen, elmbyval, elmalign,
+                          &elems, &elnulls, &Q);
+
+        if (Q < 1)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_EXCEPTION),
+                     errmsg("pg_cuvs_batch_search: queries array is empty")));
+        if (Q > cuvs_max_batch_queries)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pg_cuvs_batch_search: %d queries exceeds cuvs.max_batch_queries (%d)",
+                            Q, cuvs_max_batch_queries)));
+
+        for (int q = 0; q < Q; q++)
+        {
+            PgVector *v;
+            if (elnulls[q])
+                ereport(ERROR,
+                        (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                         errmsg("pg_cuvs_batch_search: NULL query vector at index %d", q)));
+            v = DatumGetPgVector(elems[q]);
+            if (q == 0)
+            {
+                dim  = (int) v->dim;
+                qbuf = palloc((size_t) Q * (size_t) dim * sizeof(float));
+            }
+            else if ((int) v->dim != dim)
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_EXCEPTION),
+                         errmsg("pg_cuvs_batch_search: query %d has dim %d, expected %d",
+                                q, (int) v->dim, dim)));
+            memcpy(qbuf + (size_t) q * dim, v->x, (size_t) dim * sizeof(float));
+        }
+
+        /* --- One IPC round-trip; honors search_mode / bf_precision. --- */
+        {
+            uint64_t *tids = palloc((size_t) Q * (size_t) k * sizeof(uint64_t));
+            float    *dists = palloc((size_t) Q * (size_t) k * sizeof(float));
+            uint32_t  Kout = 0, latency_us = 0;
+            int rc = cuvs_ipc_search_batch(
+                cuvs_socket_path, (uint32_t) MyDatabaseId, (uint32_t) index_oid,
+                qbuf, (uint32_t) Q, dim, k, metric,
+                (uint32_t) cuvs_shard_overfetch, cuvs_parallel_fanout ? 1 : 0,
+                (uint32_t) cuvs_search_mode, (uint32_t) cuvs_bf_precision,
+                tids, dists, &Kout, &latency_us);
+
+            if (rc != CUVS_STATUS_OK)
+            {
+                switch (rc)
+                {
+                    case CUVS_STATUS_NO_VECTORS:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: brute_force requires a .vectors "
+                                        "sidecar that is missing or stale for this index"),
+                                 errhint("REINDEX the index, or SET cuvs.search_mode='cagra'.")));
+                        break;
+                    case CUVS_STATUS_DIM_MISMATCH:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_DATA_EXCEPTION),
+                                 errmsg("pg_cuvs_batch_search: query dim %d does not match the "
+                                        "cagra index dimension", dim)));
+                        break;
+                    case CUVS_STATUS_METRIC_MISMATCH:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: index built with a different metric "
+                                        "than this query's operator class"),
+                                 errhint("REINDEX the index.")));
+                        break;
+                    case CUVS_STATUS_STALE:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: cagra index is stale (writes since build)"),
+                                 errhint("REINDEX the index.")));
+                        break;
+                    case CUVS_STATUS_UNAVAILABLE:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_CONNECTION_FAILURE),
+                                 errmsg("pg_cuvs_batch_search: GPU daemon unavailable")));
+                        break;
+                    case CUVS_STATUS_NOT_FOUND:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                                 errmsg("pg_cuvs_batch_search: cagra index not loaded on the GPU daemon"),
+                                 errhint("REINDEX the index to reload it on the daemon.")));
+                        break;
+                    default:
+                        ereport(ERROR,
+                                (errcode(ERRCODE_INTERNAL_ERROR),
+                                 errmsg("pg_cuvs_batch_search: batch search failed (status %d)", rc)));
+                        break;
+                }
+            }
+
+            /* --- Materialize (query_idx, ctid, distance) rows. --- */
+            per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+            oldcontext = MemoryContextSwitchTo(per_query_ctx);
+            tupstore = tuplestore_begin_heap(true, false, work_mem);
+            rsinfo->returnMode = SFRM_Materialize;
+            rsinfo->setResult  = tupstore;
+            rsinfo->setDesc    = tupdesc;
+            MemoryContextSwitchTo(oldcontext);
+
+            for (int q = 0; q < Q; q++)
+            {
+                for (uint32_t j = 0; j < Kout; j++)
+                {
+                    uint64_t        tid = tids[(size_t) q * Kout + j];
+                    uint32_t        blk;
+                    uint16_t        off;
+                    ItemPointerData iptr;
+                    Datum           values[3];
+                    bool            isnull[3] = {false, false, false};
+
+                    if (tid == 0)
+                        continue;   /* sentinel: this query had fewer than K neighbors */
+
+                    cuvs_tid_decode(tid, &blk, &off);
+                    ItemPointerSet(&iptr, blk, off);
+                    values[0] = Int32GetDatum(q);
+                    values[1] = PointerGetDatum(&iptr);
+                    values[2] = Float4GetDatum(dists[(size_t) q * Kout + j]);
+                    tuplestore_putvalues(tupstore, tupdesc, values, isnull);
+                }
+            }
+        }
+    }
+
+    return (Datum) 0;
 }
 
 PG_FUNCTION_INFO_V1(pg_cuvs_gpu_search_stats);

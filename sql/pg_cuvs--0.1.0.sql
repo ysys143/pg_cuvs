@@ -295,3 +295,34 @@ COMMENT ON FUNCTION pg_cuvs_build_hnsw(regclass, text) IS
   'Returns OID of the new HNSW index (regclass). '
   'Example: SELECT pg_cuvs_build_hnsw(''my_cagra''::regclass);';
 
+
+-- ----------------------------------------------------------------
+-- Phase 3M (ADR-040): pg_cuvs_batch_search — Q queries in one IPC round-trip.
+--
+-- Sends Q query vectors to the daemon in a single request and returns up to
+-- K = min(k, n_vecs) neighbors per query from one batched GPU dispatch. Honors
+-- cuvs.search_mode (cagra / brute_force) and cuvs.bf_precision. Returns raw
+-- ctids + the daemon distance with no internal MVCC filtering (same semantics
+-- as the index scan, which sets xs_recheck) — JOIN on ctid for visible rows:
+--
+--   SELECT t.*, b.query_idx, b.distance
+--   FROM pg_cuvs_batch_search('items', ARRAY[q1,q2]::vector[], 10) b
+--   JOIN items t ON t.ctid = b.ctid
+--   ORDER BY b.query_idx, b.distance;
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_batch_search(
+    rel       regclass,
+    queries   vector[],
+    k         integer,
+    OUT query_idx integer,
+    OUT ctid      tid,
+    OUT distance  real
+)
+RETURNS SETOF record
+AS '$libdir/pg_cuvs', 'pg_cuvs_batch_search'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_batch_search(regclass, vector[], integer) IS
+  'Phase 3M: batch GPU k-NN. Q queries in one IPC round-trip / GPU dispatch. '
+  'Returns (query_idx, ctid, distance); JOIN on ctid for MVCC-visible rows. '
+  'Honors cuvs.search_mode and cuvs.bf_precision (brute_force needs .vectors).';

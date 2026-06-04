@@ -2501,6 +2501,324 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Handle SEARCH_BATCH command (CUVS_OP_SEARCH_BATCH, Phase 3M)
+ *
+ * Q queries arrive in one request shm ([Q][dim][Q*dim f32]); the daemon runs
+ * one batched GPU dispatch (cuvs_*_search_batch) for unsharded indexes, or a
+ * per-query shard fanout+merge for sharded indexes, and returns Q*K results
+ * (K = min(k, n_vecs)) in a daemon-allocated reply shm
+ * ([Q][K][tids Q*K][dists Q*K]) whose key travels back in reply.error[]. The
+ * single-query handle_search path is unchanged. Held under g_index_mutex for
+ * the whole call (no lock-free window): correctness over latency for batches.
+ * ---------------------------------------------------------------- */
+static void
+handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    /* --- Resolve the index (find or reload), mirroring handle_search. --- */
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    if (e)
+    {
+        cache_counter_bump(g_cache_hits, e);
+    }
+    else
+    {
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid);
+        if (load_rc == 0)
+            e = find_index(cmd->db_oid, cmd->index_oid);
+        if (!e)
+        {
+            int st = (load_rc == -2) ? CUVS_STATUS_OOM_FALLBACK : CUVS_STATUS_NOT_FOUND;
+            pthread_mutex_unlock(&g_index_mutex);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = (uint32_t) st;
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+        cache_counter_bump(g_cache_reloads, e);
+        cache_counter_bump(g_cache_misses, e);
+    }
+    e->last_search = time(NULL);
+
+    /* --- Stale / metric / dim gates (same statuses as handle_search). --- */
+    if (e->stale)
+    {
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_STALE;
+        strncpy(hdr.error, "index stale (writes since build)", sizeof(hdr.error) - 1);
+        record_search_stat(e, CUVS_STATUS_STALE, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    if (cmd->metric != e->metric)
+    {
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_METRIC_MISMATCH;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "index built with metric %u but queried with metric %u; REINDEX required",
+                 e->metric, cmd->metric);
+        record_search_stat(e, CUVS_STATUS_METRIC_MISMATCH, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    if (cmd->dim != e->dim)
+    {
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_DIM_MISMATCH;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "query dim %u does not match index dim %u", cmd->dim, e->dim);
+        record_search_stat(e, CUVS_STATUS_DIM_MISMATCH, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    uint32_t Q      = (uint32_t) cmd->n_vecs;   /* SEARCH_BATCH: Q in n_vecs */
+    int      dim    = (int) cmd->dim;
+    int      k      = (int) cmd->k;
+    int      use_bf = (cmd->search_mode == 1);
+    int      K      = (int) ((int64_t) k < e->n_vecs ? (int64_t) k : e->n_vecs);
+
+    if (Q == 0 || K <= 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "empty batch or empty index");
+        return;
+    }
+
+    /* --- Map the request shm: [Q][dim][Q*dim f32]. --- */
+    size_t qhdr_bytes = 2 * sizeof(uint32_t);
+    size_t qtotal     = qhdr_bytes + (size_t) Q * (size_t) dim * sizeof(float);
+    int    qfd        = shm_open(cmd->shm_key, O_RDONLY, 0666);
+    if (qfd < 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm_open failed for batch queries");
+        return;
+    }
+    void *qmem = mmap(NULL, qtotal, PROT_READ, MAP_SHARED, qfd, 0);
+    close(qfd);
+    if (qmem == MAP_FAILED)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "mmap failed for batch queries");
+        return;
+    }
+    const float *queries = (const float *) ((const char *) qmem + qhdr_bytes);
+
+    /* --- brute_force: ensure the resident BF cache(s); fail closed if absent. --- */
+    if (use_bf)
+    {
+        int ready;
+        if (e->shard_count >= 2)
+            ready = refresh_shard_bf_caches(e, cmd->bf_precision);
+        else
+        {
+            refresh_main_bf_cache(e, cmd->bf_precision);
+            ready = (e->main_bf_idx != NULL);
+        }
+        if (!ready)
+        {
+            munmap(qmem, qtotal);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_NO_VECTORS;
+            strncpy(hdr.error,
+                    "brute_force requested but the .vectors sidecar is missing or "
+                    "stale; REINDEX to enable it",
+                    sizeof(hdr.error) - 1);
+            record_search_stat(e, CUVS_STATUS_NO_VECTORS, 0, hdr.error);
+            pthread_mutex_unlock(&g_index_mutex);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+    }
+
+    /* --- Run the batched search into out[Q*K] (global TIDs). --- */
+    CuvsResult *out = malloc((size_t) Q * (size_t) K * sizeof(CuvsResult));
+    if (!out)
+    {
+        munmap(qmem, qtotal);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "malloc failed");
+        return;
+    }
+    int ok = 1;
+
+    if (e->shard_count < 2)
+    {
+        /* Unsharded: one GPU dispatch for the whole batch. */
+        CuvsSearchResult *raw = malloc((size_t) Q * (size_t) K * sizeof(CuvsSearchResult));
+        if (!raw)
+        {
+            ok = 0;
+        }
+        else
+        {
+            int ret = use_bf
+                ? cuvs_bf_search_batch(e->main_bf_idx, queries, (int) Q, dim, K, raw, delta_gpu_of(e))
+                : cuvs_cagra_search_batch(e->handle, queries, (int) Q, dim, K, raw, e->gpu_device_id);
+            if (ret != 0)
+                ok = 0;
+            else
+                for (size_t i = 0; i < (size_t) Q * (size_t) K; i++)
+                {
+                    int64_t id = raw[i].item_id;
+                    out[i].tid      = (id < 0 || id >= e->n_vecs) ? 0 : e->tids[id];
+                    out[i].distance = raw[i].distance;
+                }
+            free(raw);
+        }
+    }
+    else
+    {
+        /* Sharded: per-query fanout + global merge, sequential under the lock. */
+        int sc        = e->shard_count;
+        int overfetch = (int) cmd->shard_overfetch;
+        int eff_k     = k + overfetch;
+        if (eff_k < k) eff_k = k;
+        CuvsSearchResult *sraw = malloc((size_t) eff_k * sizeof(CuvsSearchResult));
+        CuvsResult       *cand = malloc((size_t) sc * (size_t) eff_k * sizeof(CuvsResult));
+        if (!sraw || !cand)
+        {
+            ok = 0;
+        }
+        else
+        {
+            for (uint32_t q = 0; q < Q && ok; q++)
+            {
+                const float *query = queries + (size_t) q * dim;
+                int n_total = 0;
+                for (int s = 0; s < sc; s++)
+                {
+                    ShardEntry *sh = &e->shards[s];
+                    int sk = (int) (sh->n_vecs < (int64_t) eff_k ? sh->n_vecs : eff_k);
+                    if (sk <= 0) continue;
+                    int ret = use_bf
+                        ? cuvs_bf_search(sh->bf_idx, query, dim, sk, sraw, sh->gpu_device_id)
+                        : cuvs_cagra_search(sh->handle, query, dim, sk, sraw, sh->gpu_device_id);
+                    if (ret != 0) { ok = 0; break; }
+                    for (int j = 0; j < sk; j++)
+                    {
+                        int64_t id = sraw[j].item_id;
+                        if (id < 0 || id >= sh->n_vecs) continue;
+                        int64_t gid = sh->tid_offset + id;
+                        if (gid < 0 || gid >= e->n_vecs) continue;
+                        cand[n_total].tid      = e->tids[gid];
+                        cand[n_total].distance = sraw[j].distance;
+                        n_total++;
+                    }
+                }
+                if (!ok) break;
+                g_merge_metric = e->metric;
+                qsort(cand, (size_t) n_total, sizeof(CuvsResult), delta_cand_cmp);
+                int nv = (n_total < K) ? n_total : K;
+                for (int j = 0; j < K; j++)
+                {
+                    if (j < nv)
+                        out[(size_t) q * K + j] = cand[j];
+                    else
+                    {
+                        out[(size_t) q * K + j].tid      = 0;
+                        out[(size_t) q * K + j].distance = 3.402823466e+38f;
+                    }
+                }
+            }
+        }
+        free(sraw);
+        free(cand);
+    }
+
+    munmap(qmem, qtotal);
+
+    if (!ok)
+    {
+        free(out);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_OOM_FALLBACK;
+        strncpy(hdr.error, "batch search failed on the GPU; retry on CPU",
+                sizeof(hdr.error) - 1);
+        record_search_stat(e, CUVS_STATUS_OOM_FALLBACK, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t latency_us = (uint32_t) (
+        (t1.tv_sec - t0.tv_sec) * 1000000 +
+        (t1.tv_nsec - t0.tv_nsec) / 1000);
+    record_search_stat(e, CUVS_STATUS_OK, latency_us, NULL);
+    e->last_requested_k = cmd->k;
+    e->last_returned_k  = (uint32_t) K;
+    e->last_search_mode = use_bf ? 3 : 0;
+
+    /* --- Allocate the reply shm: [Q][K][tids Q*K][dists Q*K]. --- */
+    static int bsr_seq = 0;
+    char rkey[64];
+    snprintf(rkey, sizeof(rkey), "/pg_cuvs_bsr_%d_%d",
+             (int) getpid(), __atomic_fetch_add(&bsr_seq, 1, __ATOMIC_RELAXED));
+    size_t rhdr   = 2 * sizeof(uint32_t);
+    size_t rtids  = (size_t) Q * (size_t) K * sizeof(uint64_t);
+    size_t rdists = (size_t) Q * (size_t) K * sizeof(float);
+    size_t rtotal = rhdr + rtids + rdists;
+
+    int rfd = shm_open(rkey, O_CREAT | O_RDWR, 0666);
+    if (rfd < 0)
+    {
+        free(out);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm_open failed for batch reply");
+        return;
+    }
+    fchmod(rfd, 0666);
+    if (ftruncate(rfd, (off_t) rtotal) != 0)
+    {
+        close(rfd); shm_unlink(rkey); free(out);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "ftruncate failed for batch reply");
+        return;
+    }
+    void *rmem = mmap(NULL, rtotal, PROT_WRITE, MAP_SHARED, rfd, 0);
+    close(rfd);
+    if (rmem == MAP_FAILED)
+    {
+        shm_unlink(rkey); free(out);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "mmap failed for batch reply");
+        return;
+    }
+    ((uint32_t *) rmem)[0] = Q;
+    ((uint32_t *) rmem)[1] = (uint32_t) K;
+    {
+        uint64_t *tp = (uint64_t *) ((char *) rmem + rhdr);
+        float    *dp = (float *)    ((char *) rmem + rhdr + rtids);
+        for (size_t i = 0; i < (size_t) Q * (size_t) K; i++)
+        {
+            tp[i] = out[i].tid;
+            dp[i] = out[i].distance;
+        }
+    }
+    munmap(rmem, rtotal);
+    free(out);
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status       = CUVS_STATUS_OK;
+    hdr.n_results    = Q;
+    hdr.latency_us   = latency_us;
+    hdr.delta_merged = (uint32_t) K;   /* per-query result stride */
+    strncpy(hdr.error, rkey, sizeof(hdr.error) - 1);
+    send_all(client_fd, &hdr, sizeof(hdr));
+}
+
+/* ----------------------------------------------------------------
  * Atomic tids file write helper.
  * Writes to <tids_tmp> path, fsyncs, returns 0 on success, -1 on failure.
  * On failure the tmp file is unlinked.
@@ -4114,6 +4432,9 @@ connection_thread(void *arg)
     {
         case CUVS_OP_SEARCH:
             handle_search(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_BATCH:
+            handle_search_batch(client_fd, &cmd);
             break;
         case CUVS_OP_BUILD:
             handle_build(client_fd, &cmd);
