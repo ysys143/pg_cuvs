@@ -896,6 +896,30 @@ Phase 3K 완료 기준:
 
 ---
 
+#### Phase 3M — 배치 검색 API
+
+목표: Q개 쿼리를 단일 IPC 요청으로 묶어 데몬에 전송하고, 한 번의 GPU dispatch로 Q×K 결과를 반환하는 `pg_cuvs_batch_search` SQL 함수를 추가한다. (ADR-040)
+
+배경:
+- 현재 IPC는 Q=1 단일 쿼리 구조라 벤치마크 GT 생성, RAG 멀티청크 검색 등 배치성 workload에서 IPC 왕복 Q회 + GPU kernel launch Q회가 누적된다.
+- cuVS CAGRA/BF search API는 이미 Q×dim 행렬 입력을 지원하므로 데몬 변경이 최소화된다.
+
+구현 항목:
+- `CUVS_OP_SEARCH_BATCH` opcode 추가. 기존 `CUVS_OP_SEARCH`(Q=1) 경로는 변경 없이 유지.
+- request shm: Q×dim float32 행렬. reply shm: Q×K (tid, distance) 행렬.
+- `pg_cuvs_batch_search(rel regclass, queries vector[], k int) RETURNS TABLE(query_idx int, ctid tid, distance float4)` SRF 구현.
+- heap recheck / MVCC visibility를 함수 내부에서 처리.
+- CAGRA / BF / sharded 경로 모두 지원.
+
+Phase 3M 완료 기준:
+- `pg_cuvs_batch_search`로 Q개 쿼리를 단일 IPC 왕복으로 처리한다.
+- 각 query_idx의 결과가 단일 쿼리 API와 동일한 top-K를 반환한다.
+- Q=1000, dim=1024 기준 단일 쿼리 반복 대비 throughput이 유의미하게 향상된다.
+- BF mode(Phase 3L)와 sharded index(Phase 3F/3G)에서도 동작한다.
+- 기존 단일 쿼리 경로는 변경 없이 동작한다.
+
+---
+
 #### Phase 3L — GPU Brute Force 검색 모드 사용자 노출
 
 목표: 내부 delta cache 전용으로만 쓰이던 `cuvs_brute_force_search` / `CuvsBfIndex`를 사용자가 직접 사용할 수 있는 GPU exact search 경로로 노출한다. (ADR-039)
@@ -929,7 +953,7 @@ Phase 3L 완료 기준:
 ---
 
 Phase 3 전체 완료 기준:
-- Phase 3A-3L의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3M의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---

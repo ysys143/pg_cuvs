@@ -1158,6 +1158,68 @@ Phase 3I 구현 중 근본적인 문제 발견: `pg_cuvs_import_hnsw(cagra_oid, 
 
 ---
 
+## ADR-040 — Phase 3M: 배치 검색 API
+
+**날짜**: 2026-06-04
+**상태**: 결정됨
+
+### 배경
+
+현재 IPC는 per-query 단일 요청 구조다. 각 backend가 쿼리 벡터 하나를 UDS로 데몬에 보내고, 데몬이 K개 결과를 반환한다. cuVS CAGRA/BF search API는 이미 Q>1 쿼리 행렬을 단일 GPU dispatch로 처리하지만, pg_cuvs IPC가 Q=1만 지원해 이 기능을 활용하지 못하고 있다.
+
+배치 검색이 유용한 시나리오:
+- 벤치마크 / GT 생성: 수천 개 쿼리를 순차 단일 요청으로 보내면 IPC 왕복 수천 회 + GPU kernel launch 수천 회 발생. 단일 배치 dispatch로 대폭 절감.
+- RAG 파이프라인: 한 요청에서 여러 청크 임베딩을 동시에 검색하는 패턴.
+- GPU brute force(Phase 3L): Q=1 latency가 bandwidth-bound라 Q를 묶을수록 throughput이 선형 향상됨.
+
+### 결정
+
+`pg_cuvs_batch_search` SQL 함수를 추가한다.
+
+```sql
+SELECT * FROM pg_cuvs_batch_search(
+    'items'::regclass,          -- 대상 테이블
+    ARRAY[q1, q2, q3]::vector[], -- 쿼리 벡터 배열
+    k := 10                     -- 각 쿼리당 반환할 결과 수
+);
+-- 반환: TABLE(query_idx int, ctid tid, distance float4)
+```
+
+내부적으로 Q개 쿼리를 단일 IPC 요청으로 데몬에 전송하고, 데몬이 Q×K 결과를 한 번의 GPU dispatch로 반환한다.
+
+### IPC 변경
+
+현재 `CuvsCmdFrame`은 단일 쿼리 벡터를 포함한다. 배치 요청은 shm을 통해 Q×dim float matrix를 전송하고, reply도 Q×K (tid, distance) 행렬을 shm으로 반환한다.
+
+- request shm payload: `[Q: uint32][dim: uint32][q0_vec...q_{Q-1}_vec]` (Q×dim float32)
+- reply shm payload: `[Q: uint32][K: uint32][tid_{0,0}...tid_{Q-1,K-1}][dist_{0,0}...dist_{Q-1,K-1}]` (Q×K × 12 bytes)
+- `CUVS_OP_SEARCH_BATCH` opcode 추가. 기존 `CUVS_OP_SEARCH`(Q=1)는 변경 없이 유지.
+
+shm 크기: Q×dim×4 (input) + Q×K×12 (output). Q=1000, dim=1024, K=10 기준 4MB input + 120KB output.
+
+### SQL 인터페이스
+
+`pg_cuvs_batch_search`는 set-returning function(SRF)으로 구현한다.
+- `query_idx`: 0-based 쿼리 인덱스 (입력 배열 순서와 동일)
+- `ctid`: heap TID (PostgreSQL heap recheck 대상)
+- `distance`: metric-dependent distance (L2/cosine/IP)
+
+heap recheck / MVCC visibility는 함수 내부에서 `heap_fetch`로 처리한다. 결과는 `query_idx` 기준으로 정렬하지 않는다(GPU 반환 순서 유지).
+
+### 적용 범위
+
+- CAGRA mode: cuVS `cagra::search`가 이미 Q×dim 행렬 입력을 지원하므로 데몬 변경이 최소화된다.
+- BF mode(Phase 3L): `cuvs::neighbors::brute_force::search`도 Q×dim 행렬 입력을 지원한다. 배칭 효과가 더 크다(bandwidth-bound).
+- sharded index(Phase 3F/3G): shard별 fanout에서 Q×dim을 그대로 전달하고, shard별 Q×K 결과를 global top-K로 merge한다.
+
+### 대안
+
+- 기존 단일 쿼리 API를 반복 호출하는 클라이언트 측 배치. 거부 — IPC 왕복 Q회 + GPU kernel launch Q회가 누적된다. Q=1000이면 UDS 왕복만 ~500ms.
+- PostgreSQL `LATERAL` + 배열 unnest로 배치 효과. 거부 — backend가 row마다 별도 index scan을 열어 IPC가 Q회 발생한다.
+- 데몬 내부 마이크로배칭(`cuvs.bf_batch_wait_us`, ADR-039). 이는 보완적 기능이다 — 마이크로배칭은 단일 쿼리 API를 쓰는 클라이언트들을 투명하게 묶고, 배치 API는 클라이언트가 명시적으로 Q개를 한 번에 전송하는 경로다.
+
+---
+
 ## ADR-039 — Phase 3L: GPU Brute Force 검색 모드 사용자 노출
 
 **날짜**: 2026-06-04
