@@ -162,10 +162,14 @@ struct CuvsBfIndexImpl {
     int64_t  n;
     uint32_t precision;   /* 0 = float32, 1 = float16 */
 
-    raft::device_matrix<float, int64_t>        *ds_f32  = nullptr;
-    cuvs::neighbors::brute_force::index<float>  *idx_f32 = nullptr;
-    raft::device_matrix<half, int64_t>          *ds_f16  = nullptr;
-    cuvs::neighbors::brute_force::index<half>   *idx_f16 = nullptr;
+    /* cuVS brute_force::index is index<DataT, DistanceT>; distances always
+     * accumulate in float, so the half variant is index<half, float> (NOT
+     * index<half, half>) to match build()'s return type and search()'s
+     * overloads. float's DistanceT already defaults to float. */
+    raft::device_matrix<float, int64_t>              *ds_f32  = nullptr;
+    cuvs::neighbors::brute_force::index<float>        *idx_f32 = nullptr;
+    raft::device_matrix<half, int64_t>               *ds_f16  = nullptr;
+    cuvs::neighbors::brute_force::index<half, float>  *idx_f16 = nullptr;
 
     CuvsBfIndexImpl(int dm, int64_t nn, uint32_t prec)
         : dim(dm), n(nn), precision(prec) {}
@@ -340,7 +344,7 @@ cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
                 raft::make_const_mdspan(impl->ds_f16->view()),
                 cuvs_distance_type(metric));
             res.sync_stream();
-            impl->idx_f16 = new cuvs::neighbors::brute_force::index<half>(std::move(idx));
+            impl->idx_f16 = new cuvs::neighbors::brute_force::index<half, float>(std::move(idx));
         } else {
             impl->ds_f32 = new raft::device_matrix<float, int64_t>(
                 raft::make_device_matrix<float, int64_t>(res, n, (int64_t)dim));
