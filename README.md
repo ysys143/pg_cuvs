@@ -53,7 +53,7 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 | Index | Storage | Use Case |
 |-------|---------|----------|
 | `USING cagra` | GPU VRAM | Low latency, hot data, fits in GPU VRAM |
-| `USING pg_cuvs_hnsw` (converts a `USING cagra` source) | GPU build / CPU serve | Fast GPU build (13x vs pgvector), then served by pgvector HNSW on CPU |
+| `USING pg_cuvs_hnsw` (built from heap, or reuses a `USING cagra` source) | GPU build / CPU serve | Fast GPU build (13x vs pgvector), then served by pgvector HNSW on CPU |
 
 > **DiskANN/NVMe cold tier** (Phase 3B): spike completed, no-go for now — cuVS PQFlash
 > API is unstable in cuVS 26.04 and DiskANN at 50M×384 timed out at 2 GB cache.
@@ -101,7 +101,7 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] Cost model with `startup_cost=1000` (models CUDA context + transfer overhead)
 - [x] `enable_cuvs`, `cuvs.cpu_hnsw_fallback` GUCs for runtime GPU toggle and CPU fallback
 - [x] `pg_stat_gpu_search` view: per-index GPU stats (build time, search count, p50/p95 latency, recall)
-- [x] `CREATE INDEX ... USING pg_cuvs_hnsw WITH (source = '<cagra>')`: CAGRA-to-pgvector HNSW DDL (Phase 3K), served by pgvector
+- [x] `CREATE INDEX ... USING pg_cuvs_hnsw`: GPU CAGRA → pgvector HNSW DDL (Phase 3K). `source` optional — built from the heap (ephemeral CAGRA, auto-dropped) or reused from a `USING cagra` index; served by pgvector
 - [x] Multi-GPU sharding (`shard_count`), GCS snapshot restore (Phase 3G)
 - [x] MIG verified (no code changes needed)
 
@@ -128,7 +128,7 @@ See [design/PLAN.md](design/PLAN.md) for the full product-roadmap plan. Some com
 | 2 — Production Ready | `pg_stat_gpu_search`, LIMIT-k/metric, write/staleness, large-build memory, tiered cache | Done |
 | 3A~3G — Scale Out | pending-delta, snapshots, replicas, multi-GPU sharding, query optimization | Done (3G complete; 3B DiskANN → **no-go**, see PHASE_3B_DECISION.md) |
 | 3I — GPU Build Accelerator | CAGRA build → pgvector HNSW export (13x faster build, recall=1.0 @ 1M×384) | Done (VM E2E verified, MIG tested) |
-| 3K — HNSW DDL | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL surface for the build accelerator | Done (VM E2E, installcheck 8/8) |
+| 3K — HNSW DDL | `CREATE INDEX ... USING pg_cuvs_hnsw`: standard DDL for the build accelerator; `source` optional (ephemeral CAGRA from heap) + metric pre-check | Done (VM E2E, installcheck 8/8) |
 | 3H — Ops Playbooks | sizing guide, when-to-use, runbooks | In progress |
 | Release Hardening | compat matrix, known limitations, README, upgrade path | Planned |
 

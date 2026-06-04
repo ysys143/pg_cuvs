@@ -13,13 +13,13 @@
 | 1, 1.5, 2, 2.1 | Proof of mechanism, test hardening, production ready single-node |
 | 3E/3F/3G | Multi-GPU sharding (placement, parallel fanout, auto shard count, DROP cleanup, snapshot, delta cache, eviction) |
 | 3I | GPU Build Accelerator — CAGRA→pgvector HNSW export (`pg_cuvs_build_hnsw`), CPU HNSW fallback, GPU-less dump/restore |
+| 3K | `CREATE INDEX ... USING pg_cuvs_hnsw` DDL 전환 + `source` optional(heap에서 ephemeral CAGRA 빌드) + metric 선검증. `pg_cuvs_build_hnsw()` deprecate. installcheck 8/8 (ADR-038/041) |
 | 3B | DiskANN/NVMe cold tier — **NO-GO** (cuVS 26.04 PQFlash 미완성, 재검토 조건: 1B+ 수요 또는 cuVS stable) |
 
 ### 미완료
 
 | Phase | 내용 | Wave |
 |-------|------|------|
-| 3K | `CREATE INDEX ... USING pg_cuvs_hnsw` DDL 전환 | 1 |
 | 3H-full | 운영 runbook 완성 (replica bootstrap, capacity-planning, upgrade) | 1 |
 | 3L | GPU brute force 검색 모드 (`cuvs.search_mode='brute_force'`) | 2 |
 | 3M | 배치 검색 API (`pg_cuvs_batch_search`) | 2 |
