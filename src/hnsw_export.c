@@ -1925,6 +1925,28 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
                     (errmsg("pg_cuvs_hnsw: source \"%s\" must be a cagra index",
                             source_name),
                      errhint("Build it first: CREATE INDEX ... USING cagra (col opclass).")));
+
+        /* Fail fast: the source CAGRA's metric must match this index's opclass
+         * BEFORE paying an IPC round-trip. cagra_index_metric() is opclass-name
+         * based, so it works for both the cagra and pg_cuvs_hnsw AMs. fill_*
+         * re-checks after fetching the adjacency; this just gives an earlier,
+         * clearer error (a CAGRA graph is bound to its build metric and cannot
+         * be reinterpreted under a different one). */
+        uint32_t src_metric = cagra_index_metric(cagra_oid);
+        uint32_t tgt_metric = cagra_index_metric(self_oid);
+        if (src_metric != tgt_metric)
+        {
+            static const char *mname[] = {"l2", "cosine", "ip"};
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                     errmsg("pg_cuvs_hnsw: metric mismatch: source cagra \"%s\" uses %s "
+                            "but this index uses %s",
+                            source_name,
+                            (src_metric < 3) ? mname[src_metric] : "unknown",
+                            (tgt_metric < 3) ? mname[tgt_metric] : "unknown"),
+                     errhint("Use the same opclass (vector_l2_ops / vector_cosine_ops "
+                             "/ vector_ip_ops) as the source cagra index.")));
+        }
     }
 
     /* Fill THIS index's relation (pgvector page format) from the CAGRA graph.

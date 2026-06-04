@@ -112,6 +112,12 @@ CREATE INDEX ph_bad2 ON ph_test USING pg_cuvs_hnsw (embedding vector_l2_ops)
     WITH (source = 'ph_hnsw');
 ERROR:  pg_cuvs_hnsw: source "ph_hnsw" must be a cagra index
 HINT:  Build it first: CREATE INDEX ... USING cagra (col opclass).
+-- Source metric (ph_cagra is L2) must match this index's opclass (cosine):
+-- fail-fast ERROR in ambuild before any daemon IPC.
+CREATE INDEX ph_bad3 ON ph_test USING pg_cuvs_hnsw (embedding vector_cosine_ops)
+    WITH (source = 'ph_cagra');
+ERROR:  pg_cuvs_hnsw: metric mismatch: source cagra "ph_cagra" uses l2 but this index uses cosine
+HINT:  Use the same opclass (vector_l2_ops / vector_cosine_ops / vector_ip_ops) as the source cagra index.
 \set ON_ERROR_STOP on
 -- ── Source-less mode (ADR-041): ephemeral CAGRA from heap, auto-dropped ──
 -- No source CAGRA: ambuild builds a temporary CAGRA on the GPU, converts it

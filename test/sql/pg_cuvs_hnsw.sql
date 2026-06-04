@@ -87,6 +87,11 @@ WHERE tablename = 'ph_test' AND indexname = 'ph_hnsw2';
 CREATE INDEX ph_bad2 ON ph_test USING pg_cuvs_hnsw (embedding vector_l2_ops)
     WITH (source = 'ph_hnsw');
 
+-- Source metric (ph_cagra is L2) must match this index's opclass (cosine):
+-- fail-fast ERROR in ambuild before any daemon IPC.
+CREATE INDEX ph_bad3 ON ph_test USING pg_cuvs_hnsw (embedding vector_cosine_ops)
+    WITH (source = 'ph_cagra');
+
 \set ON_ERROR_STOP on
 
 -- ── Source-less mode (ADR-041): ephemeral CAGRA from heap, auto-dropped ──
