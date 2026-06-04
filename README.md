@@ -1,5 +1,7 @@
 # pg_cuvs
 
+https://github.com/ysys143/pg_cuvs
+
 GPU-accelerated vector search for PostgreSQL via NVIDIA cuVS — a heterogeneous acceleration path that keeps Postgres as the control plane.
 
 ## What it is
@@ -224,6 +226,10 @@ FROM pg_stat_gpu_search;
 ```
 
 See `design/OPS_GPU_PLAYBOOK.md` for parameter tuning and MIG operations.
+
+## License
+
+PostgreSQL License. Copyright (c) 2026, JAESOL SHIN. See [LICENSE](LICENSE) for details.
 
 ## Related Work
 

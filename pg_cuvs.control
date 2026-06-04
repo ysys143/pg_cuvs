@@ -3,3 +3,4 @@ default_version = '0.1.0'
 module_pathname = '$libdir/pg_cuvs'
 relocatable = false
 requires = 'vector'
+license = 'PostgreSQL'
