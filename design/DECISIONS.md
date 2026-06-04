@@ -1414,3 +1414,80 @@ large offset은 GPU 자원 소모가 증가한다. CAGRA의 `itopk_size`가 K에
 - 서버 측 result cache(stateful pagination): daemon이 이전 검색 결과를 캐싱하고 cursor처럼 이어서 반환. 거부 — 현재 IPC는 stateless(요청-응답 1회)이며, 세션 친화 라우팅/캐시 만료/메모리 관리가 필요해 복잡도가 크게 증가한다. daemon의 `g_index_mutex` 직렬화 모델과도 충돌한다.
 - cursor 기반 keyset pagination(`WHERE distance > last_distance`): ANN 그래프에서 distance 기반으로 이어서 탐색하는 것이 구조적으로 불가능하다. 동일 distance에 여러 벡터가 있을 수 있어 deterministic한 resume point를 잡을 수 없다.
 - 별도 pagination SQL 함수(`pg_cuvs_search_page(rel, query, page, size)`): PG 표준 `LIMIT`/`OFFSET` 문법을 못 쓰면 ORM 호환이 깨져 실용 가치가 없다.
+
+---
+
+## ADR-043 — 벡터 전용 테이블의 PLAIN storage 권장 및 빌드 시 자동 감지
+
+**날짜**: 2026-06-04
+**상태**: 계획
+
+### 배경
+
+pgvector `vector` 타입은 varlena `EXTENDED` storage가 기본이다. dim >= 512이면 벡터 하나가 PG TOAST threshold(~2KB)를 초과해 거의 모든 row가 TOAST 테이블에 별도 저장된다. CAGRA 빌드 시 `cuvs_build_callback()`이 매 tuple마다 `PG_DETOAST_DATUM`(palloc + pglz decompress)을 수행하며, 이것이 heap scan 오버헤드의 50-60%를 차지한다(ADR-034 후속 분석).
+
+TOAST의 이점은 "벡터를 읽지 않는 쿼리에서 detoast 비용을 피한다"는 것인데, 벡터 전용 테이블에서는 이 이점이 적용될 일이 없다. INSERT → `CREATE INDEX USING cagra` → `SELECT ... ORDER BY embedding <-> query LIMIT K` 전 경로에서 벡터 전체를 읽는다. 벡터와 비즈니스 데이터(metadata, text 등)가 같은 테이블에 있을 때만 TOAST가 유의미하며, 이 경우에도 벡터 전용 테이블을 분리하고 id로 조인하는 것이 양쪽 모두 최적이다.
+
+핵심 원칙: **MVCC를 해치지 않는 선에서 최대의 성능 보장**. PLAIN storage는 PG의 정상 기능이며 visibility check, WAL, 트랜잭션 격리에 영향을 주지 않는다.
+
+### 결정
+
+1. **문서에 벡터 전용 테이블 + PLAIN storage를 best practice로 명시한다.**
+
+권장 스키마 패턴:
+```sql
+-- 벡터 전용 테이블 (PLAIN storage)
+CREATE TABLE vectors (
+    id bigint PRIMARY KEY,
+    embedding vector(1024)
+);
+ALTER TABLE vectors ALTER COLUMN embedding SET STORAGE PLAIN;
+
+-- 비즈니스 데이터 테이블
+CREATE TABLE documents (
+    id bigint PRIMARY KEY,
+    title text,
+    content text,
+    metadata jsonb
+);
+
+-- 검색 후 조인
+SELECT d.title, d.content
+FROM (
+    SELECT id FROM vectors
+    ORDER BY embedding <-> $1 LIMIT 10
+) v
+JOIN documents d ON d.id = v.id;
+```
+
+PLAIN storage의 효과: dim=1024 기준 빌드 시 TOAST decompression(palloc + pglz) 비용이 완전히 제거된다. heap scan 구간에서 ~25-35% 절감(~15-20s → ~10-13s) 기대.
+
+PLAIN storage의 트레이드오프: tuple이 커져(4KB+) 페이지당 row 수가 1-2개로 감소하고 heap 자체가 ~4x 커진다. 벡터를 참조하지 않는 쿼리(COUNT, id-only SELECT 등)에서 불필요하게 큰 tuple을 fetch하게 된다. 벡터 전용 테이블에서는 이런 쿼리가 드물므로 영향이 제한적이다.
+
+기존 TOAST된 데이터: `SET STORAGE PLAIN` 후에도 기존 row는 TOAST에 그대로 남는다. `VACUUM FULL` 또는 테이블 재적재(pg_dump/restore, `CREATE TABLE ... AS SELECT`)가 필요하다. 따라서 신규 테이블에서 처음부터 설정하는 것을 권장한다.
+
+2. **`CREATE INDEX USING cagra` 시점에 EXTENDED storage 자동 감지 → NOTICE 출력.**
+
+`cuvs_ambuild()`에서 indexed column의 `attstorage`를 syscache에서 읽어 `TYPSTORAGE_EXTENDED`('x')인지 확인한다. EXTENDED이면 다음 NOTICE를 출력한다:
+```
+NOTICE: pg_cuvs: column "embedding" uses EXTENDED storage (TOAST).
+HINT: For faster builds, consider: ALTER TABLE ... ALTER COLUMN embedding SET STORAGE PLAIN;
+       See: docs/best-practices.md
+```
+
+pg_cuvs가 storage를 강제 변경하지는 않는다. 사용자가 의도적으로 EXTENDED를 유지하는 경우(벡터와 비즈니스 데이터가 같은 테이블에 있고 분리할 수 없는 경우)를 존중한다.
+
+3. **`docs/best-practices.md`에 권장 스키마 패턴을 문서화한다.**
+
+### 결과
+
+- `cuvs_ambuild()`가 EXTENDED storage를 감지하면 NOTICE를 출력한다. pg_cuvs가 스키마를 변경하지 않으므로 MVCC 안전성에 영향 없다.
+- 벡터 전용 테이블 + PLAIN storage 패턴이 best practice 문서에 기록된다.
+- 구현 난이도가 낮아(syscache 읽기 + ereport 한 줄) release hardening에 포함한다.
+
+### 대안
+
+- `ambuild()`에서 자동으로 PLAIN으로 변경. 거부 — DDL 부작용이며, 사용자 동의 없는 스키마 변경은 위험하다. 다른 세션이 동일 테이블을 사용 중일 수 있고, `ALTER TABLE ... SET STORAGE`는 `AccessExclusiveLock`이 필요해 online DDL과 충돌한다.
+- 별도 binary column(`bytea PLAIN`): 거부 — 스키마 변경 강제, pgvector opclass 재사용 설계(ADR-006)와 충돌, DX 저하(ADR-034 후속 분석 (b) 참조).
+- pgvector fixed-length storage 기여: 보류 — 업스트림 의존, pg_cuvs 단독 불가(ADR-034 후속 분석 (c) 참조).
+- WARNING 대신 ERROR로 EXTENDED를 차단. 거부 — 기존 pgvector 사용자의 테이블에서 인덱스 생성 자체를 막으면 도입 장벽이 너무 높다.

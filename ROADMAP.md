@@ -67,6 +67,18 @@
 
 ---
 
+#### Release hardening — TOAST storage 감지 NOTICE + best practice 문서
+**왜**: CAGRA 빌드 시 TOAST decompression이 heap scan 오버헤드의 50-60%를 차지. 벡터 전용 테이블에서 PLAIN storage를 쓰면 ~25-35% 절감. 구현 비용 최소(syscache 읽기 + ereport).
+
+구현 항목:
+- `cuvs_ambuild()`에서 indexed column의 `attstorage`가 EXTENDED('x')인지 syscache로 확인 → NOTICE 출력
+- `docs/best-practices.md`에 벡터 전용 테이블 + PLAIN storage 권장 스키마 패턴 문서화
+- pg_cuvs가 storage를 강제 변경하지 않음 (사용자 선택 존중)
+
+스펙: ADR-043 | [design/PLAN.md — Phase 4A 장기 항목](design/PLAN.md)
+
+---
+
 ### Wave 2 — 신규 기능, 리스크 낮음 (순차)
 
 #### 3L — GPU Brute Force 검색 모드
