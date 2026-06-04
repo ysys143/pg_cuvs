@@ -993,6 +993,40 @@ Phase 3 전체 완료 기준:
 Phase 3J(direct CAGRA→pgvector) 완료 후 측정된 두 가지 병목에 대한 개선 로드맵.
 실측 기준: N=1M, dim=1024, Cohere Wikipedia, A100-40GB.
 
+### 4-preflight — 연산 지역성 프로파일링
+
+목표: Phase 4A/4B 최적화 착수 전에 빌드/검색/export 경로의 latency split을 실측해 최적화 우선순위를 정량 근거로 잡는다. 현재 ADR-034(빌드 오버헤드), ADR-035(page write 병목), ADR-043(TOAST 비용)의 근거가 코드 분석 기반 추정이므로 실측으로 검증/보정한다. (ADR-044)
+
+실행 순서: **4-pre-1 → 4-pre-2 → 4-pre-3 → 4-pre-4**.
+
+구현 항목:
+
+**4-pre-1 — nsys daemon 프로파일링** (검색 + 빌드):
+- `nsys profile --trace=cuda,nvtx,osrt`로 `pg_cuvs_server` 데몬 프로세스를 프로파일링한다.
+- GPU 커널 실행 시간, CUDA memcpy H2D/D2H, 커널 launch overhead, shm mmap 읽기/쓰기, socket send/recv를 측정한다.
+
+**4-pre-2 — perf backend 빌드 프로파일링**:
+- `perf record -g -e cache-misses,LLC-load-misses` 로 PG backend(`CREATE INDEX USING cagra`)를 프로파일링한다.
+- heap scan → detoast → memcpy → shm write 각 구간의 cache miss 핫스팟을 식별한다.
+- TOAST(EXTENDED) vs PLAIN에서 `perf stat` 비교 → ADR-043 실증 검증에 cache miss 수치 추가.
+
+**4-pre-3 — pg_stat_io + perf probe buffer manager 측정**:
+- `pg_stat_io`(PG16+)와 `perf probe`로 `write_elem_page` 경로의 buffer pool lookup/lock/WAL 비용을 측정한다.
+- ADR-035의 "buffer manager 제약" 거부 근거를 정량화한다.
+
+**4-pre-4 — 결과 문서화 + 우선순위 재검증**:
+- `docs/profiling-results.md`에 측정 환경/방법/결과를 아카이브한다.
+- ADR-044에 분해 수치를 기록하고, Phase 4A/4B 최적화 우선순위를 재검증한다.
+
+4-preflight 완료 기준:
+- 검색 경로: `ipc_us` / `gpu_kernel_us` / `memcpy_us` 분해 수치 기록.
+- 빌드 경로: `heap_scan_us` / `detoast_us` / `memcpy_us` / `shm_write_us` / `gpu_build_us` 분해 수치 기록.
+- export 경로: `page_write_us` / `buffer_mgr_overhead_us` / `wal_us` 분해 수치 기록.
+- TOAST vs PLAIN cache miss 수치 비교가 ADR-043에 반영됨.
+- 4A/4B 우선순위가 실측 근거로 확정 또는 재조정됨.
+
+---
+
 ### 4A — CAGRA 빌드 PostgreSQL 오버헤드 감소
 
 현재: pg_cuvs CAGRA build ~55s / cuVS lib 직접 ~10s (45s 차이)
