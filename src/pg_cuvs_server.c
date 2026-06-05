@@ -261,6 +261,42 @@ static pthread_cond_t  g_warmup_cond  = PTHREAD_COND_INITIALIZER;
 static int             g_warmup_nthreads = 2;
 static pthread_t       g_warmup_tids[8];
 
+/* ----------------------------------------------------------------
+ * Phase 3L-9: brute-force micro-batch worker (single consumer).
+ *
+ * When a connection thread runs an unsharded brute_force search with
+ * cmd->bf_batch_wait_us > 0, it enqueues a request here (instead of dispatching
+ * immediately) and blocks on the request's `done` flag. One dedicated worker
+ * thread coalesces queued requests that share a (db,index,precision,dim) key
+ * into a single cuvs_bf_search_batch GPU dispatch, then wakes each producer.
+ *
+ * Lock order (no thread ever holds both): a producer takes g_index_mutex for
+ * the cheap stale/metric/dim preamble, RELEASES it, then takes g_bf_mtx to
+ * enqueue; the worker moves the queue out under g_bf_mtx, RELEASES it, then
+ * takes g_index_mutex for the GPU work. Gated entirely by bf_batch_wait_us>0 —
+ * with the default 0 nothing is ever enqueued and this subsystem is inert.
+ * ---------------------------------------------------------------- */
+#define CUVS_BF_BATCH_MAX 256          /* cap on concurrently queued BF requests */
+
+typedef struct CuvsBfRequest {
+    CuvsBfKey    key;          /* db_oid, index_oid, precision, dim */
+    const float *query;        /* producer-owned, dim floats, valid until done */
+    int          k;            /* requested top-k */
+    uint32_t     wait_us;      /* this request's batch window hint */
+    CuvsResult  *out;          /* producer-owned [k]; worker writes n_out results */
+    int          n_out;        /* results written by the worker */
+    int          status;       /* CUVS_STATUS_* set by the worker */
+    int          done;         /* 0 = pending, 1 = worker finished this request */
+} CuvsBfRequest;
+
+static pthread_mutex_t g_bf_mtx       = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_bf_cond      = PTHREAD_COND_INITIALIZER; /* signaled on enqueue */
+static pthread_cond_t  g_bf_done_cond = PTHREAD_COND_INITIALIZER; /* signaled on completion */
+static CuvsBfRequest  *g_bf_queue[CUVS_BF_BATCH_MAX];
+static int             g_bf_queue_n   = 0;
+static pthread_t       g_bf_worker_tid;
+static int             g_bf_worker_started = 0;
+
 static int
 warmup_enqueue(uint32_t db_oid, uint32_t index_oid,
                uint32_t relfilenode, uint32_t table_oid,
@@ -4479,6 +4515,58 @@ connection_thread(void *arg)
  * fire while a connection thread holds g_index_mutex) and undefined
  * behavior from non-async-signal-safe calls.
  * ---------------------------------------------------------------- */
+/* Phase 3L-9: mark every queued BF request done with `status` and wake its
+ * producer. Caller holds g_bf_mtx. */
+static void
+bf_batch_fail_all_locked(int status)
+{
+    for (int i = 0; i < g_bf_queue_n; i++)
+    {
+        g_bf_queue[i]->status = status;
+        g_bf_queue[i]->done   = 1;
+    }
+    g_bf_queue_n = 0;
+    pthread_cond_broadcast(&g_bf_done_cond);
+}
+
+/* Phase 3L-9: process the currently queued BF requests. Caller holds g_bf_mtx.
+ *
+ * CP-B scaffold: degrade — fail every queued request with OOM_FALLBACK so a
+ * producer (once CP-C wires one) retries on the immediate path. Nothing
+ * enqueues until CP-C, so with the default bf_batch_wait_us=0 this is inert.
+ * CP-C replaces this body with the real coalesced batch dispatch. */
+static void
+bf_batch_process_locked(void)
+{
+    bf_batch_fail_all_locked(CUVS_STATUS_OOM_FALLBACK);
+}
+
+/* Phase 3L-9: the single BF micro-batch consumer thread. Idle (1s poll) until a
+ * request is enqueued or shutdown; drains the queue via bf_batch_process_locked. */
+static void *
+bf_batch_worker_thread(void *arg)
+{
+    (void) arg;
+    pthread_mutex_lock(&g_bf_mtx);
+    while (!g_shutdown)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 1;                 /* 1s poll so shutdown stays responsive */
+        while (g_bf_queue_n == 0 && !g_shutdown)
+            if (pthread_cond_timedwait(&g_bf_cond, &g_bf_mtx, &ts) == ETIMEDOUT)
+                break;
+        if (g_shutdown)
+            break;
+        if (g_bf_queue_n > 0)
+            bf_batch_process_locked();
+    }
+    /* Shutdown: fail any still-queued requests so producers never hang. */
+    bf_batch_fail_all_locked(CUVS_STATUS_UNAVAILABLE);
+    pthread_mutex_unlock(&g_bf_mtx);
+    return NULL;
+}
+
 static void
 sigterm_handler(int sig)
 {
@@ -4494,6 +4582,17 @@ static void
 graceful_shutdown(void)
 {
     LOG_INFO("pg_cuvs_server: SIGTERM received, serializing indexes...\n");
+
+    /* Phase 3L-9: wake the BF batch worker (g_shutdown is already set) so it
+     * fails any queued requests and exits, then join it. Always spawned. */
+    if (g_bf_worker_started)
+    {
+        pthread_mutex_lock(&g_bf_mtx);
+        pthread_cond_broadcast(&g_bf_cond);
+        pthread_mutex_unlock(&g_bf_mtx);
+        pthread_join(g_bf_worker_tid, NULL);
+        LOG_INFO("bf_batch: worker thread joined\n");
+    }
 
     /* Phase 3D: signal warmup workers to exit and wait for them. */
     if (g_snapshot_uri[0] != '\0')
@@ -4697,6 +4796,14 @@ main(int argc, char **argv)
             pthread_create(&g_warmup_tids[i], NULL, warmup_worker_thread, NULL);
         LOG_INFO("warmup: spawned %d worker threads\n", g_warmup_nthreads);
     }
+
+    /* Phase 3L-9: spawn the single BF micro-batch consumer. Always running but
+     * inert until a request with bf_batch_wait_us>0 is enqueued. */
+    if (pthread_create(&g_bf_worker_tid, NULL, bf_batch_worker_thread, NULL) == 0)
+        g_bf_worker_started = 1;
+    else
+        LOG_ERROR("pg_cuvs_server: failed to spawn BF batch worker; "
+                  "brute_force micro-batching disabled (immediate dispatch only)\n");
 
     /* Accept loop */
     while (!g_shutdown)
