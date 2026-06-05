@@ -1,0 +1,56 @@
+-- reloption_dir.sql — ADR-045: per-index index_dir reloption (self-describing index).
+--
+-- Regression for the cross-session seqscan-fallback footgun. Previously the
+-- artifact directory was resolved only from the per-session cuvs.index_dir GUC,
+-- so a backend that did NOT `SET cuvs.index_dir` resolved $PGDATA/cuvs_indexes,
+-- missed the .tids built elsewhere, and the planner gated the GPU path off
+-- (Seq Scan). With the directory stored in the index's reloptions, every backend
+-- resolves the build-time directory from the catalog, independent of its session
+-- GUC.
+--
+-- This file DELIBERATELY never `SET cuvs.index_dir` — the directory is carried
+-- only by the `WITH (index_dir = ...)` reloption. Pre-fix this query plans as a
+-- Seq Scan; post-fix it plans as an Index Scan on the cagra index.
+--
+-- REQUIRES: pg_cuvs_server running with a GPU; /tmp/cuvs_indexes writable.
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+-- NOTE: there is intentionally NO `SET cuvs.index_dir` anywhere in this file.
+-- That absence is the whole point of the regression.
+CREATE TABLE rd (id bigint, embedding vector(4));
+INSERT INTO rd VALUES
+    (1, '[1,0,0,0]'),   (2, '[0,1,0,0]'),
+    (3, '[0,0,1,0]'),   (4, '[0,0,0,1]'),
+    (5, '[1,1,0,0]'),   (6, '[1,0,1,0]'),
+    (7, '[1,1,1,0]'),   (8, '[1,1,1,1]');
+SET client_min_messages = 'warning';
+CREATE INDEX rd_cagra ON rd USING cagra (embedding vector_l2_ops)
+    WITH (index_dir = '/tmp/cuvs_indexes');
+SET client_min_messages = 'notice';
+-- The reloption round-trips through pg_class.reloptions (catalog-durable, so a
+-- fresh backend resolves the same directory without any session GUC).
+SELECT reloptions FROM pg_class WHERE relname = 'rd_cagra';
+          reloptions           
+-------------------------------
+ {index_dir=/tmp/cuvs_indexes}
+(1 row)
+
+-- PROOF OF FIX: the planner picks the GPU Index Scan even though this session
+-- never SET cuvs.index_dir — the directory comes from the index reloption.
+-- Assert deterministic PLAN SHAPE only (COSTS OFF; never cost numbers).
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM rd ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 5;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Limit
+   ->  Index Scan using rd_cagra on rd
+         Order By: (embedding <-> '[1,0,0,0]'::vector)
+(3 rows)
+
+RESET enable_seqscan;
+-- Cleanup.
+DROP TABLE rd CASCADE;
+DROP EXTENSION pg_cuvs CASCADE;

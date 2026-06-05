@@ -15,7 +15,7 @@ EXTVERSION     = 0.1.0
 DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
@@ -183,19 +183,31 @@ benchmark:
 -include .env.gpu
 export
 
+# The VM's external IP is ephemeral (GCP reassigns it on every stop/start), so the
+# GCP_VM value in .env.gpu goes stale. VM_HOST resolves the CURRENT IP from gcloud
+# at expansion time, falling back to .env.gpu's GCP_VM if the lookup fails (gcloud
+# offline/unauthenticated). Recursive '=' + unexport so gcloud runs only when a
+# remote ssh/rsync recipe references $(VM_HOST) -- never on a plain local `make`.
+GCP_USER ?= ubuntu
+VM_IP = $(shell gcloud compute instances describe $(GCP_INSTANCE) --zone $(GCP_ZONE) $(if $(GCP_PROJECT),--project $(GCP_PROJECT)) --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null)
+VM_HOST = $(if $(VM_IP),$(GCP_USER)@$(VM_IP),$(GCP_VM))
+unexport VM_IP VM_HOST
+
 .PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
 	gpu-test-unit gpu-test-regress gpu-test-daemon gpu-test-e2e gpu-test-all
 
 vm-start:
 	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.gpu"; exit 1)
-	gcloud compute instances start $(GCP_INSTANCE) --zone $(GCP_ZONE)
+	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in .env.gpu"; exit 1)
+	gcloud compute instances start $(GCP_INSTANCE) --zone $(GCP_ZONE) --project $(GCP_PROJECT)
 	@echo "Waiting for SSH..."
-	@until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $(GCP_VM) true 2>/dev/null; \
+	@until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no $(VM_HOST) true 2>/dev/null; \
 		do sleep 3; done
-	@echo "VM ready: $(GCP_VM)"
+	@echo "VM ready: $(VM_HOST)"
 
 vm-stop:
-	gcloud compute instances stop $(GCP_INSTANCE) --zone $(GCP_ZONE)
+	@test -n "$(GCP_PROJECT)" || (echo "ERROR: set GCP_PROJECT in .env.gpu"; exit 1)
+	gcloud compute instances stop $(GCP_INSTANCE) --zone $(GCP_ZONE) --project $(GCP_PROJECT)
 
 # rsync local → VM. Excludes build artifacts to avoid clobbering remote .o files
 # that were produced on the VM with the correct nvcc toolchain.
@@ -206,25 +218,25 @@ sync:
 		--exclude 'src/*.bc' \
 		--exclude '*.so' \
 		--exclude '.env.gpu' \
-		./ $(GCP_VM):~/pg_cuvs/
+		./ $(VM_HOST):~/pg_cuvs/
 
 gpu-build:
-	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make 2>&1 | tee /tmp/pg_cuvs_build.log"
 
 gpu-install:
-	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		sudo -E make install"
 
 gpu-test:
-	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make installcheck"
 
 gpu-server:
-	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make server && sudo make install-server"
 
@@ -233,13 +245,13 @@ gpu-server:
 # The script is piped over stdin (bash -s) rather than inlined to avoid
 # fragile nested quoting; plain ssh (no -tt) since it needs no remote TTY.
 gpu-postinstall:
-	CONDA_ENV=$(CONDA_ENV) ssh $(GCP_VM) "CONDA_ENV=$(CONDA_ENV) bash -s" \
+	CONDA_ENV=$(CONDA_ENV) ssh $(VM_HOST) "CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/postinstall.sh
 
 # End-to-end durability smoke: build index, restart daemon, verify reload.
 # Piped over stdin (bash -s); plain ssh, no remote TTY needed.
 gpu-e2e:
-	ssh $(GCP_VM) "bash -s" < infra/scripts/e2e-smoke.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/e2e-smoke.sh
 
 # ---- Integration test suite (Phase 1.5 #3) -----------------------------
 # Layered test targets. Unit tests run locally (no toolchain needed);
@@ -248,7 +260,7 @@ gpu-e2e:
 # Unit tests for the dependency-free helpers (cuvs_util). Runs on the VM
 # for parity with the build toolchain; identical to local `make test-unit`.
 gpu-test-unit:
-	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make test-unit"
 
@@ -256,7 +268,7 @@ gpu-test-unit:
 # CREATE INDEX paths; the production pg-cuvs-server systemd unit must be
 # active and cuvs.index_dir set to its --index-dir.
 gpu-test-regress:
-	ssh -tt $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh -tt $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make installcheck"
 
@@ -265,19 +277,19 @@ gpu-test-regress:
 # TEST socket + index dir, then restores the production daemon. Piped over
 # stdin (bash -s); CONDA_ENV is forwarded so the script can compile.
 gpu-test-daemon:
-	ssh $(GCP_VM) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/integration-test.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:
-	ssh $(GCP_VM) "bash -s" < infra/scripts/e2e-smoke.sh
+	ssh $(VM_HOST) "bash -s" < infra/scripts/e2e-smoke.sh
 
 # Full ladder: unit -> regress -> daemon faults -> e2e durability.
 gpu-test-all: gpu-test-unit gpu-test-regress gpu-test-daemon gpu-test-e2e
 
 gpu-server-start:
-	ssh -tt $(GCP_VM) "pg_cuvs_server \
+	ssh -tt $(VM_HOST) "pg_cuvs_server \
 		--socket /tmp/.s.pg_cuvs \
 		--index-dir \$$(psql -t -c 'SHOW data_directory' | tr -d ' ')/cuvs_indexes \
 		--max-vram-mb 20480 &"
@@ -286,7 +298,7 @@ gpu-server-start:
 # N/DIM/K/M forwarded to the remote `make benchmark` only when set locally.
 gpu-bench:
 	@mkdir -p design
-	ssh $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		make benchmark $(if $(N),N=$(N)) $(if $(DIM),DIM=$(DIM)) $(if $(K),K=$(K)) $(if $(M),M=$(M)) 2>&1" \
 		| tee design/bench_$(shell date +%Y%m%d_%H%M).log
@@ -298,7 +310,7 @@ gpu-bench-1m:
 
 gpu-cohere:
 	@echo "[gpu-cohere] Launching Cohere 1M benchmark (nohup, async)"
-	ssh $(GCP_VM) "cd ~/pg_cuvs && \
+	ssh $(VM_HOST) "cd ~/pg_cuvs && \
 		source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		nohup bash bench/run_cohere.sh \
 			--n $(if $(N),$(N),1000000) \
@@ -309,17 +321,17 @@ gpu-cohere:
 	echo "  make gpu-cohere-result"
 
 gpu-cohere-log:
-	ssh $(GCP_VM) "tail -50 /tmp/cohere_bench.log"
+	ssh $(VM_HOST) "tail -50 /tmp/cohere_bench.log"
 
 gpu-cohere-result:
 	@N=$(if $(N),$(N),1000000); \
-	ssh $(GCP_VM) "cat ~/pg_cuvs/bench/results/cohere_N$${N}_summary.csv 2>/dev/null \
+	ssh $(VM_HOST) "cat ~/pg_cuvs/bench/results/cohere_N$${N}_summary.csv 2>/dev/null \
 		|| echo 'Not ready yet — check: make gpu-cohere-log'"
 
 .PHONY: gpu-cohere gpu-cohere-log gpu-cohere-result
 
 gpu-shell:
-	ssh -tt $(GCP_VM)
+	ssh -tt $(VM_HOST)
 
 # Report the VM's current power state and external IP (ephemeral IPs change on
 # stop/start, so .env.gpu's GCP_VM can go stale). Usage: make vm-ip
@@ -332,7 +344,7 @@ vm-ip:
 # Run ad-hoc SQL on the VM's postgres DB from stdin. For introspection and
 # Phase 3K integration checks. Usage: make gpu-sql < query.sql  (or via heredoc)
 gpu-sql:
-	ssh -o StrictHostKeyChecking=accept-new $(GCP_VM) \
+	ssh -o StrictHostKeyChecking=accept-new $(VM_HOST) \
 		"source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		psql -d $(if $(DB),$(DB),postgres) -P pager=off -A -F '|'"
 .PHONY: gpu-sql
@@ -345,7 +357,7 @@ gpu-sql:
 # One corpus size (default 1M). Override: make gpu-anbench N=5000000
 gpu-anbench:
 	@mkdir -p design/anbench
-	ssh $(GCP_VM) "cd ~/pg_cuvs && N=$(if $(N),$(N),1000000) KS=$(if $(KS),$(KS),10,100) \
+	ssh $(VM_HOST) "cd ~/pg_cuvs && N=$(if $(N),$(N),1000000) KS=$(if $(KS),$(KS),10,100) \
 		bash infra/anbench/run_all.sh 2>&1" \
 		| tee design/anbench/run_N$(if $(N),$(N),1000000)_$(shell date +%Y%m%d_%H%M).log
 
@@ -356,9 +368,9 @@ gpu-anbench-5m:
 # Aggregate results into summary.csv/txt + Pareto plots, then pull back locally.
 gpu-anbench-agg:
 	@mkdir -p design/anbench
-	ssh $(GCP_VM) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate cuvs_py && \
+	ssh $(VM_HOST) "cd ~/pg_cuvs && source ~/miniforge3/bin/activate cuvs_py && \
 		pip install -q matplotlib 2>/dev/null; python infra/anbench/aggregate.py"
-	rsync -avz $(GCP_VM):~/pg_cuvs/design/anbench/ design/anbench/
+	rsync -avz $(VM_HOST):~/pg_cuvs/design/anbench/ design/anbench/
 
 # Convenience: full cycle on the VM (sync → build → install → test).
 gpu-cycle: sync gpu-build gpu-install gpu-test
