@@ -388,9 +388,19 @@ compatible with the local PostgreSQL heap.
 **OBJSTORE-03**
 ```
 The pg_cuvs index files shall be treated as derived data and shall not be
-included in `pg_basebackup` WAL streams. Heap/table distribution remains the
-responsibility of PostgreSQL backup and replication mechanisms.
+included in PostgreSQL physical base backup payloads (pg_basebackup) or WAL.
+Heap/table distribution remains the responsibility of PostgreSQL backup and
+replication mechanisms.
 ```
+
+> NOTE (2026-06-05): "physical base backup payload" is the precise membership —
+> `pg_basebackup` copies the entire `$PGDATA` tree plus tablespaces, and there is
+> no native per-directory exclusion. Compute locality (which physical volume) and
+> backup membership (inside the `$PGDATA` tree or not) are **orthogonal**: placing
+> `index_dir` in a sibling directory on the SAME local NVMe but OUTSIDE the
+> `$PGDATA` tree preserves locality while excluding the artifacts. The default
+> `$PGDATA/cuvs_indexes` does NOT satisfy this requirement (see DECISIONS.md
+> ADR-013 + OPS_GPU_PLAYBOOK §6).
 
 **OBJSTORE-04**
 ```

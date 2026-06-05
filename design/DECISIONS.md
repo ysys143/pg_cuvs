@@ -257,7 +257,11 @@ Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
 **결과**:
 - MVP 단계에서 구현 복잡도 최소화
 - 멀티노드 공유 필요 시 object storage snapshot source로 자연스럽게 진화
-- 인덱스 파일은 `pg_basebackup` WAL 스트림에서 제외 (`SPEC.md OBJSTORE-03` 참조) **(2026-06-05 정정/주의: 기본 경로에서 미보장)** — 기본 `index_dir`은 `$PGDATA/cuvs_indexes`(`src/pg_cuvs.c:519`)로 PGDATA 내부다. `pg_basebackup`은 PGDATA의 base 파일을 통째로 복사하며 코드에 등록된 제외(exclusion) 훅이 없으므로, 기본 설정에서는 수 GB 파생 artifact가 base backup에 포함된다(WAL 스트림 자체에는 없으나 base copy에 포함). OBJSTORE-03을 충족하려면 `index_dir`을 PGDATA 밖에 두어야 하며, 이를 운영 playbook에 반영할 것을 권장한다.
+- 인덱스 파일은 `pg_basebackup` physical base backup payload + WAL에서 제외 (`SPEC.md OBJSTORE-03` 참조) **(2026-06-05 정정/주의: 기본 경로에서 미보장 — 단, 지역성과 직교)**:
+  - **지역성 측면에선 기본값이 옳다**: artifact를 데이터와 같은 빠른 로컬 디스크에 두는 것이 연산 지역성에 맞고, 그래서 기본을 `$PGDATA/cuvs_indexes`(`src/pg_cuvs.c:519`)로 둔다.
+  - **그러나 백업 멤버십과는 별개 문제다**: `pg_basebackup`은 PGDATA 트리 + 테이블스페이스를 통째로 복사하고 네이티브 per-directory 제외가 없다. 기본 경로는 PGDATA *트리 안*이라 수 GB 파생 artifact가 base backup에 실린다(WAL 자체가 아니라 base copy 멤버십 문제).
+  - **둘은 양립 가능(직교)**: "PGDATA 밖" ≠ "느린 디스크". **같은 로컬 NVMe의 형제 디렉터리**(트리 밖, 예: `/var/lib/postgresql/pg_cuvs_indexes`)에 두면 지역성 유지 + 백업 제외 동시 달성.
+  - **비용(실측 아님, 분석)**: 데이터 오염은 아니다(relfilenode fail-closed). 진짜 비용은 백업 비대 + **`pg_basebackup`으로 standby 신규 프로비저닝 시 쓸모없는 GB 전송 → RTO/네트워크 악화**. → P2 운영 하드닝(코드: index_dir이 DataDir 하위면 WARNING; 운영: 형제 디렉터리 프로비저닝 + 복원 시 경로 부재→rebuild). 기본값 변경은 권한 footgun(`postgres`가 PGDATA 밖 쓰기 불가) + breaking이라 보류, 기본은 유지하되 WARNING/playbook으로 유도. ROADMAP "운영 하드닝" wave + OPS_GPU_PLAYBOOK §6 참조.
 - heap 없이 index artifact만 있는 노드는 사용할 수 없다. TID mapping은 로컬 PostgreSQL heap block/offset과 호환되어야 한다.
 
 ---
