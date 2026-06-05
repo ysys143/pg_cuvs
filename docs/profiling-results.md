@@ -149,8 +149,16 @@ leaf self-time: memcpy(rep_movs 10% + memmove 8% = ~18%), crc32c 3.4%, 페이지
 | **ADR-035 병렬 page write 제외** | buffer manager 제약(추정) | buffer mgr ~39% 실증 | **유지** (거부 근거 강화) |
 
 ### 종합
-1. **빌드 천장은 GPU build ~68s.** 빌드 시간의 82%가 cuVS 내부 GPU build(제어 불가)이고, pg_cuvs가 제어 가능한 backend는 ~15.5s가 천장. ADR-034의 "PG overhead 45s"는 틀린 추정. 빌드를 ~68s 밑으로 내리려면 cuVS build 파라미터(graph_degree) 또는 streaming이 필요.
-2. **4A는 가치/난이도로 판단.** 4A-1(double memcpy)은 ~2-5s지만 **난이도 낮음 → quick win**이자 4A-2의 enabler. 4A-2(parallel workers)는 ~8-12s(~10-14%)로 더 크나 난이도 중간. 빌드가 일회성이라 쿼리 경로보다 **긴급도만 낮을 뿐**, 빌드 속도가 우선이면 4A-1→4A-2 순으로 둘 다 유효.
+1. **빌드 천장은 GPU build ~68s.** 빌드 시간의 82%가 cuVS 내부 GPU build(제어 불가). 빌드를 ~68s 밑으로 내리려면 cuVS build 파라미터(graph_degree) 또는 streaming이 필요. ADR-034의 "PG overhead 45s"는 틀린 추정 — 실제 PG backend는 ~15.5s.
+
+2. **4A의 가치는 "빌드 시간 비율"이 아니라 "PG 오버헤드 제거율"로 평가해야 한다.** backend ~15.5s(EXTENDED)는 **전부 제거 가능한 PG 오버헤드**이고, 세 가지를 결합하면 거의 소멸한다:
+   - **PLAIN storage** → detoast 제거 (측정: backend 15.5s → **8.7s**)
+   - **4A-1 (shm 직접 할당)** → accumulation buffer realloc page fault(backend CPU 39%) + heap→shm double memcpy 제거
+   - **4A-2 (parallel workers)** → 남은 heap scan 분산
+   → backend가 ~15.5s에서 **~2-4s 수준**으로 축소되고, 빌드 wall-clock는 83.5s → **~70-72s**가 된다. 이는 **GPU build 68s + 최소 IPC/dispatch만 남는 것 = cuVS 직접 호출의 ~95% 성능**이며, 그것도 **PostgreSQL의 MVCC·durability·DDL 통합을 유지한 채** 달성한다.
+   비율(14.5s/83.5s ≈ 17%)로 보면 작아 보이지만, **절대 14.5s는 전부 제거 가능한 PG 오버헤드**이고 이를 거의 다 제거한다는 것이 핵심 가치다("pg_cuvs build = Postgres 안전성 + cuVS native 속도"). 개별 4A는 modest하나 **결합 효과로 평가**해야 한다. 단 빌드는 일회성(CREATE INDEX/REINDEX)이라 긴급도는 쿼리 경로보다 낮다.
+   - 착수 순서: 난이도/enabler 기준 **4A-1(저난이도, shm 직접 할당이 4A-2 전제) → 4A-2(난이도 중간)**. PLAIN은 사용자 스키마 선택(ADR-043).
+
 3. **검색 경로는 잘 최적화돼 있다.** memcpy 0.4%, GPU-bound. 마이크로배칭은 BF·동시성 시나리오로 한정.
 4. **export 병목(buffer manager 39%)은 PG 구조적 제약**으로 단기 개선 어려움(ADR-035 유지). UNLOGGED가 현실적 완화.
 

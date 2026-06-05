@@ -1523,7 +1523,8 @@ pg_cuvs의 데이터 경로(빌드/검색/export)에서 PG backend - daemon - GP
 
 **우선순위 재검증**:
 - **빌드 천장 재설정**: 빌드의 82%가 GPU build(cuVS 내부, 제어 불가), 어떤 4A도 빌드를 ~68s 밑으로 못 내림. ADR-034의 "PG overhead 45s"는 틀렸고 backend는 ~15.5s가 천장.
-- **4A는 가치/난이도(ROI)로 판단, 둘 다 유효**:
+- **4A의 가치는 "빌드 시간 비율"이 아니라 "PG 오버헤드 제거율"로 평가**: backend ~15.5s는 전부 제거 가능한 PG 오버헤드. **PLAIN(detoast 제거, 측정 15.5s→8.7s) + 4A-1(shm 직접 할당 → realloc page fault 39% + double memcpy 제거) + 4A-2(parallel workers → heap scan 분산)**를 결합하면 backend가 ~2-4s로 거의 소멸 → 빌드 83.5s→**~70-72s = GPU build 68s + 최소 dispatch ≈ cuVS native의 ~95%**, 그것도 MVCC/durability/DDL 통합 유지. 개별 4A는 modest하나 **결합 효과("Postgres 안전성 + cuVS native 속도")로 평가**해야 한다.
+- **가치/난이도(ROI), 둘 다 유효**:
   - **4A-1 (double memcpy)**: ~2-5s(~3-6%)지만 **난이도 낮음 → quick win**. memcpy ~1.7s + realloc page fault 완화. shm 직접 할당이 **4A-2 enabler**이므로 먼저.
   - **4A-2 (parallel workers)**: heap scan+detoast 병렬화 → backend ~15.5s→~7s, **~8-12s(~10-14%)**, 난이도 중간.
   - 빌드가 일회성(CREATE INDEX/REINDEX)이라 쿼리 경로 대비 **긴급도만 낮을 뿐 저가치 아님**. 빌드 속도가 우선이면 4A-1→4A-2.
