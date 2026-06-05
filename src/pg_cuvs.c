@@ -28,6 +28,8 @@
 #include "access/tableam.h"
 #include "access/table.h"          /* table_open/table_close (Phase 3M) */
 #include "access/relation.h"       /* index_open/index_close (Phase 3M) */
+#include "access/genam.h"          /* try_index_open (ADR-045 index_dir reloption) */
+#include "access/reloptions.h"     /* CAGRA index_dir reloption (ADR-045) */
 #include "utils/array.h"           /* deconstruct_array, ARR_ELEMTYPE (Phase 3M) */
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -202,11 +204,59 @@ cuvs_xact_callback(XactEvent event, void *arg)
     }
 }
 
+/* ----------------------------------------------------------------
+ * ADR-045: per-index "index_dir" reloption.
+ *
+ * CAGRA artifacts (.tids/.cagra/.delta/.tombstone/...) are keyed only by
+ * (db_oid, index_oid); the sole variable in their path is the directory, which
+ * was historically resolved from the per-session cuvs.index_dir GUC. A backend
+ * that did not SET the same value resolved a different path, so the planner
+ * gates failed to find the artifact and silently routed to seqscan. Recording
+ * the directory in the index's reloptions makes it catalog-durable and
+ * cross-backend stable: every backend resolves the build-time directory
+ * regardless of its session GUC. Mirrors the pg_cuvs_hnsw reloptions machinery
+ * (hnsw_export.c). The option is build-time-immutable -> AccessExclusiveLock.
+ * ---------------------------------------------------------------- */
+typedef struct CuvsCagraOptions
+{
+    int32 vl_len_;          /* varlena header — do not access directly */
+    int   index_dir_offset; /* relopt string offset; 0 = option absent */
+} CuvsCagraOptions;
+
+static relopt_kind cuvs_cagra_relopt_kind;
+
+/* One-time relopt registration; called from _PG_init. */
+static void
+cuvs_cagra_init_reloptions(void)
+{
+    cuvs_cagra_relopt_kind = add_reloption_kind();
+    add_string_reloption(cuvs_cagra_relopt_kind, "index_dir",
+                         "Directory holding this CAGRA index's artifacts "
+                         "(overrides cuvs.index_dir for this index).",
+                         "", NULL, AccessExclusiveLock);
+}
+
+static bytea *
+cuvs_cagra_amoptions(Datum reloptions, bool validate)
+{
+    static const relopt_parse_elt tab[] = {
+        {"index_dir", RELOPT_TYPE_STRING,
+         offsetof(CuvsCagraOptions, index_dir_offset)},
+    };
+    return (bytea *) build_reloptions(reloptions, validate,
+                                      cuvs_cagra_relopt_kind,
+                                      sizeof(CuvsCagraOptions),
+                                      tab, lengthof(tab));
+}
+
 void
 _PG_init(void)
 {
     /* Phase 3K: register pg_cuvs_hnsw WITH(source, mode, ...) reloptions. */
     cuvs_hnsw_init_reloptions();
+
+    /* ADR-045: register CAGRA WITH(index_dir) reloption. */
+    cuvs_cagra_init_reloptions();
 
     DefineCustomBoolVariable(
         "enable_cuvs",
@@ -470,6 +520,69 @@ get_index_dir(void)
     return buf;
 }
 
+/* ADR-045 directory resolution. Precedence: (1) the index's index_dir
+ * reloption, (2) the cuvs.index_dir session GUC, (3) $PGDATA/cuvs_indexes.
+ * (2)+(3) are get_index_dir(); the reloption is the catalog-durable override
+ * that survives a backend not having SET the GUC. */
+
+/* Read the index_dir reloption from an open index relation's parsed rd_options.
+ * Returns the stored directory, or NULL when the option is absent. The pointer
+ * is valid only while indexRel is open. */
+static const char *
+cuvs_reloption_index_dir(Relation indexRel)
+{
+    CuvsCagraOptions *opts = (CuvsCagraOptions *) indexRel->rd_options;
+
+    if (opts != NULL && opts->index_dir_offset != 0)
+    {
+        const char *dir = (const char *) opts + opts->index_dir_offset;
+
+        if (dir[0] != '\0')
+            return dir;
+    }
+    return NULL;
+}
+
+/* Resolver for callers holding an open index Relation (build/insert/bulkdelete):
+ * reads rd_options directly, so no relcache open. */
+static const char *
+cuvs_resolve_index_dir_rel(Relation indexRel)
+{
+    const char *reldir = cuvs_reloption_index_dir(indexRel);
+
+    return reldir != NULL ? reldir : get_index_dir();
+}
+
+/* Resolver for the plan-time gates and shared path builders, which hold only an
+ * Oid. Opens the index relcache entry WITHOUT a lock: by cost-estimation time
+ * the planner already holds the lock transitively (get_relation_info opened the
+ * same entry), so this is a refcount-only relcache lookup — no IPC, no CUDA, no
+ * lock-manager traffic — far below the stat()/fread() the gates already perform,
+ * and negligible against the per-row file I/O on the aminsert/ambulkdelete delta
+ * paths. try_index_open returns NULL if the index was concurrently dropped, in
+ * which case we fall back to the GUC/DataDir path. The resolved string is copied
+ * into a static buffer before close so no rd_options pointer escapes. */
+static const char *
+cuvs_resolve_index_dir(Oid index_oid)
+{
+    static char buf[MAXPGPATH];
+    Relation    rel = try_index_open(index_oid, NoLock);
+    bool        have_reldir = false;
+
+    if (rel != NULL)
+    {
+        const char *reldir = cuvs_reloption_index_dir(rel);
+
+        if (reldir != NULL)
+        {
+            strlcpy(buf, reldir, sizeof(buf));
+            have_reldir = true;
+        }
+        index_close(rel, NoLock);
+    }
+    return have_reldir ? buf : get_index_dir();
+}
+
 /* Plan-time stale check. The daemon writes a "<db>_<idx>.stale" sidecar when a
  * heap write marks the index stale (pg_cuvs_server.c stale_file_path); we read
  * it here so the planner can route around a stale CAGRA index. Pure stat() — no
@@ -481,7 +594,7 @@ cuvs_index_is_stale(Oid index_oid)
     struct stat st;
 
     snprintf(path, sizeof(path), "%s/%u_%u.stale",
-             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
     return stat(path, &st) == 0;
 }
 
@@ -505,7 +618,7 @@ cuvs_index_delete_drift_stale(Oid index_oid, double live_rows)
         return false;   /* gate disabled, or live count unknown */
 
     snprintf(path, sizeof(path), "%s/%u_%u.tids",
-             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
     f = AllocateFile(path, PG_BINARY_R);
     if (f == NULL)
         return false;   /* no persisted artifact -> other gates/paths handle it */
@@ -553,7 +666,7 @@ cuvs_index_has_artifact(Oid index_oid)
     struct stat st;
 
     snprintf(path, sizeof(path), "%s/%u_%u.tids",
-             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
     return stat(path, &st) == 0;
 }
 
@@ -573,7 +686,7 @@ static void
 cuvs_delta_path(Oid index_oid, char *buf, size_t buflen)
 {
     snprintf(buf, buflen, "%s/%u_%u.delta",
-             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
 }
 
 /* Read the base .tids body_crc32 (generation token). Returns true + *crc_out on
@@ -587,7 +700,7 @@ cuvs_read_tids_crc(Oid index_oid, uint32_t *crc_out)
     size_t          got;
 
     snprintf(path, sizeof(path), "%s/%u_%u.tids",
-             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
     f = AllocateFile(path, PG_BINARY_R);
     if (f == NULL)
         return false;
@@ -657,7 +770,7 @@ static void
 cuvs_tombstone_path(Oid index_oid, char *buf, size_t buflen)
 {
     snprintf(buf, buflen, "%s/%u_%u.tombstone",
-             get_index_dir(), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
+             cuvs_resolve_index_dir(index_oid), (uint32_t) MyDatabaseId, (uint32_t) index_oid);
 }
 
 static void
@@ -1109,7 +1222,7 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
         bs.n_vecs,
         bs.dim,
         bs.metric,
-        get_index_dir(),
+        cuvs_resolve_index_dir_rel(indexRel),
         heap_table_oid,
         heap_relfilenode,
         shard_count,
@@ -1182,7 +1295,7 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
         uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
         char sidecar[MAXPGPATH];
         snprintf(sidecar, sizeof(sidecar), "%s/%u_%u.relfilenode",
-                 get_index_dir(),
+                 cuvs_resolve_index_dir_rel(indexRel),
                  (uint32_t) MyDatabaseId,
                  (uint32_t) RelationGetRelid(indexRel));
         FILE *f = fopen(sidecar, "w");
@@ -1989,7 +2102,7 @@ cuvs_ambulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
         uint64_t       *base_tids = NULL;
 
         snprintf(tids_path, sizeof(tids_path), "%s/%u_%u.tids",
-                 get_index_dir(),
+                 cuvs_resolve_index_dir_rel(indexRel),
                  (uint32_t) MyDatabaseId,
                  (uint32_t) index_oid);
         f = AllocateFile(tids_path, PG_BINARY_R);
@@ -2070,6 +2183,7 @@ cuvsamhandler(PG_FUNCTION_ARGS)
     amroutine->amgettuple        = cuvs_gettuple;
     amroutine->amendscan         = cuvs_endscan;
     amroutine->amcostestimate    = cuvsamcostestimate;
+    amroutine->amoptions         = cuvs_cagra_amoptions; /* WITH (index_dir) */
 
     PG_RETURN_POINTER(amroutine);
 }
