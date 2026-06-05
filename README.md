@@ -1,8 +1,8 @@
 # pg_cuvs
 
-GPU-accelerated vector search for PostgreSQL via NVIDIA cuVS — a heterogeneous acceleration path that keeps Postgres as the control plane.
+https://github.com/ysys143/pg_cuvs
 
-**Built on**: [pgvector](https://github.com/pgvector/pgvector) · [RAPIDS cuVS](https://github.com/rapidsai/cuvs) · [PG-Strom](https://github.com/heterodb/pg-strom) (architectural inspiration) · [pgvectorscale](https://github.com/timescale/pgvectorscale) (DiskANN reference)
+GPU-accelerated vector search for PostgreSQL via NVIDIA cuVS — a heterogeneous acceleration path that keeps Postgres as the control plane.
 
 ## What it is
 
@@ -224,21 +224,6 @@ CREATE INDEX my_hnsw2  ON items USING pg_cuvs_hnsw (embedding vector_l2_ops)
 CREATE TABLE items (id bigint, embedding vector(1536));
 CREATE INDEX ON items USING cagra (embedding vector_l2_ops);
 SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
-
--- GPU brute-force exact search (Phase 3L)
-SET cuvs.search_mode = 'brute_force';  -- GPU exact search, recall@10 = 1.0
-SET cuvs.bf_precision = 'float16';     -- float16 mode: VRAM half, recall preserved
-SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
-
--- Batch search (Phase 3M) — Q queries in one GPU dispatch
-SELECT query_idx, id, distance
-FROM pg_cuvs_batch_search(
-    'items'::regclass,
-    ARRAY[q1, q2, q3]::vector[],  -- Q query vectors
-    k := 10
-) b
-JOIN items t ON t.ctid = b.ctid
-ORDER BY query_idx, distance;
 
 -- Runtime toggles
 SET enable_cuvs = off;              -- force CPU path
