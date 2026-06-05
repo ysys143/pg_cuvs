@@ -903,7 +903,16 @@ Phase 3K status: **COMPLETE** (2026-06-04, installcheck 8/8).
 
 #### Phase 3M — 배치 검색 API
 
+Phase 3M status: COMPLETE (2026-06-05, installcheck 10/10)
+
 목표: Q개 쿼리를 단일 IPC 요청으로 묶어 데몬에 전송하고, 한 번의 GPU dispatch로 Q×K 결과를 반환하는 `pg_cuvs_batch_search` SQL 함수를 추가한다. (ADR-040)
+
+구현 항목 완료:
+- `CUVS_OP_SEARCH_BATCH` opcode (기존 Q=1 경로 변경 없음)
+- request shm: Q×dim float32 / reply shm: Q×K (tid, distance)
+- `pg_cuvs_batch_search(rel regclass, queries vector[], k int) RETURNS TABLE(query_idx int, ctid tid, distance real)` SRF
+- CAGRA mode, BF mode, sharded index 모두 지원
+- heap recheck / MVCC visibility 내부 처리
 
 배경:
 - 현재 IPC는 Q=1 단일 쿼리 구조라 벤치마크 GT 생성, RAG 멀티청크 검색 등 배치성 workload에서 IPC 왕복 Q회 + GPU kernel launch Q회가 누적된다.
@@ -927,7 +936,18 @@ Phase 3M 완료 기준:
 
 #### Phase 3L — GPU Brute Force 검색 모드 사용자 노출
 
+Phase 3L status: COMPLETE (2026-06-05, installcheck 10/10)
+
 목표: 내부 delta cache 전용으로만 쓰이던 `cuvs_brute_force_search` / `CuvsBfIndex`를 사용자가 직접 사용할 수 있는 GPU exact search 경로로 노출한다. (ADR-039)
+
+구현 항목 완료:
+- `.vectors` sidecar (versioned header, CRC32, generation token 기반 torn-write 감지)
+- `cuvs.search_mode` GUC (`'cagra'` / `'brute_force'`)
+- `cuvs.bf_precision` GUC (`'float32'` / `'float16'` — float16 mode VRAM 절반, recall 동일)
+- daemon lazy load + search 분기
+- sharded BF (shard별 범위를 shard별 `CuvsBfIndex`로 분산)
+- micro-batching (`cuvs.bf_batch_wait_us`) — concurrent BF 요청을 단일 GPU dispatch로 묶음
+- `pg_stat_gpu_search.bf_batch_count` 및 `pg_stat_gpu_cache.bf_vram_bytes`/`bf_precision`
 
 배경:
 - `USING cagra` ANN 검색은 recall < 1.0일 수 있다. 소규모 데이터 또는 정확도가 중요한 workload에서 exact GPU search가 필요하다.
@@ -957,8 +977,33 @@ Phase 3L 완료 기준:
 
 ---
 
+#### Phase 3N — OFFSET-aware K 자동 조정
+
+목표: `SELECT ... ORDER BY embedding <-> query LIMIT K OFFSET N`이 GPU CAGRA/BF/sharded 경로에서 정상 동작하도록, pg_cuvs가 OFFSET을 감지해 내부 K를 `offset + limit`으로 자동 조정한다. ORM(Django, Rails, Spring Data, SQLAlchemy) pagination 호환성을 확보한다. (ADR-042)
+
+배경:
+- 현재 pg_cuvs는 LIMIT만 지원하고 OFFSET을 인식하지 못한다. OFFSET을 쓰면 executor가 seqscan fallback하거나 결과가 잘려나온다.
+- 벡터 인덱스(CAGRA, HNSW, BF)는 "이전 검색의 N번째부터 이어서 탐색"이 구조적으로 불가능하므로, `offset + limit`개를 한 번에 검색해 앞부분을 drop하는 것이 유일한 현실적 경로다(Qdrant 동일 방식).
+
+구현 항목:
+- `cuvsamcostestimate()` 또는 `cuvs_beginscan()`에서 PG Plan 노드의 LIMIT+OFFSET 감지. `IndexScanDesc`에 offset 값을 저장한다.
+- IPC search 메시지의 K 값을 `offset + limit`으로 계산해 전달한다(별도 offset 필드 추가 대신 K 자체를 확장하는 방식이 daemon 변경 최소).
+- daemon은 K=offset+limit으로 CAGRA/BF 검색을 수행하고 전체 결과를 반환한다(daemon 변경 없음).
+- backend `cuvs_gettuple()`에서 앞 offset개를 skip한 뒤 나머지를 반환한다.
+- `offset > cuvs.max_offset_warning`(기본 1000) 시 NOTICE를 남겨 keyset pagination 전환을 권고한다.
+- regression test: OFFSET 0/10/100에서 결과가 단일 `LIMIT (offset+limit)` 쿼리의 뒤쪽 slice와 일치하는지 검증.
+
+Phase 3N 완료 기준:
+- `SELECT ... ORDER BY embedding <-> query LIMIT 10 OFFSET N`이 CAGRA/BF/sharded 경로에서 정상 동작한다.
+- OFFSET 0일 때 기존 동작과 byte-identical(regression 없음).
+- `pg_stat_gpu_search.requested_k`에 `offset + limit` 값이 반영된다.
+- Django QuerySet slicing(`qs[100:110]`), SQLAlchemy `.offset(100).limit(10)` 패턴으로 GPU 인덱스가 사용됨을 `EXPLAIN`으로 확인한다.
+- large offset(>1000) 시 NOTICE 경고가 발생한다.
+
+---
+
 Phase 3 전체 완료 기준:
-- Phase 3A-3M의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3N의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---
@@ -967,6 +1012,40 @@ Phase 3 전체 완료 기준:
 
 Phase 3J(direct CAGRA→pgvector) 완료 후 측정된 두 가지 병목에 대한 개선 로드맵.
 실측 기준: N=1M, dim=1024, Cohere Wikipedia, A100-40GB.
+
+### 4-preflight — 연산 지역성 프로파일링
+
+목표: Phase 4A/4B 최적화 착수 전에 빌드/검색/export 경로의 latency split을 실측해 최적화 우선순위를 정량 근거로 잡는다. 현재 ADR-034(빌드 오버헤드), ADR-035(page write 병목), ADR-043(TOAST 비용)의 근거가 코드 분석 기반 추정이므로 실측으로 검증/보정한다. (ADR-044)
+
+실행 순서: **4-pre-1 → 4-pre-2 → 4-pre-3 → 4-pre-4**.
+
+구현 항목:
+
+**4-pre-1 — nsys daemon 프로파일링** (검색 + 빌드):
+- `nsys profile --trace=cuda,nvtx,osrt`로 `pg_cuvs_server` 데몬 프로세스를 프로파일링한다.
+- GPU 커널 실행 시간, CUDA memcpy H2D/D2H, 커널 launch overhead, shm mmap 읽기/쓰기, socket send/recv를 측정한다.
+
+**4-pre-2 — perf backend 빌드 프로파일링**:
+- `perf record -g -e cache-misses,LLC-load-misses` 로 PG backend(`CREATE INDEX USING cagra`)를 프로파일링한다.
+- heap scan → detoast → memcpy → shm write 각 구간의 cache miss 핫스팟을 식별한다.
+- TOAST(EXTENDED) vs PLAIN에서 `perf stat` 비교 → ADR-043 실증 검증에 cache miss 수치 추가.
+
+**4-pre-3 — pg_stat_io + perf probe buffer manager 측정**:
+- `pg_stat_io`(PG16+)와 `perf probe`로 `write_elem_page` 경로의 buffer pool lookup/lock/WAL 비용을 측정한다.
+- ADR-035의 "buffer manager 제약" 거부 근거를 정량화한다.
+
+**4-pre-4 — 결과 문서화 + 우선순위 재검증**:
+- `docs/profiling-results.md`에 측정 환경/방법/결과를 아카이브한다.
+- ADR-044에 분해 수치를 기록하고, Phase 4A/4B 최적화 우선순위를 재검증한다.
+
+4-preflight 완료 기준:
+- 검색 경로: `ipc_us` / `gpu_kernel_us` / `memcpy_us` 분해 수치 기록.
+- 빌드 경로: `heap_scan_us` / `detoast_us` / `memcpy_us` / `shm_write_us` / `gpu_build_us` 분해 수치 기록.
+- export 경로: `page_write_us` / `buffer_mgr_overhead_us` / `wal_us` 분해 수치 기록.
+- TOAST vs PLAIN cache miss 수치 비교가 ADR-043에 반영됨.
+- 4A/4B 우선순위가 실측 근거로 확정 또는 재조정됨.
+
+---
 
 ### 4A — CAGRA 빌드 PostgreSQL 오버헤드 감소
 
@@ -1021,7 +1100,8 @@ heap scan + varlena decode ~15-20s는 PG 오버헤드 45s 중 가장 큰 단일 
 
 현실적 대응:
 - parallel workers(4A-2)가 wall-clock 분산으로 유일한 단기 가속 수단이다.
-- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 ~25-35% 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. OPS_GPU_PLAYBOOK에 "빌드 성능 최적화 팁"으로 안내한다.
+- PLAIN storage(`ALTER TABLE ... SET STORAGE PLAIN`)는 사용자 선택이며, 빌드 성능 ~25-35% 개선이 가능하나 일반 쿼리 성능 저하 트레이드오프가 있다. **ADR-043에서 벡터 전용 테이블 + PLAIN storage를 best practice로 확정하고, `cuvs_ambuild()`에서 EXTENDED storage 자동 감지 시 NOTICE를 출력하기로 결정했다.** NOTICE 구현은 release hardening에 포함(syscache 읽기 + ereport 한 줄).
+- **TOAST vs PLAIN 실증 벤치마크**(ADR-043 §실증 검증): release hardening에서 N=1M dim=1024 Cohere A100으로 EXTENDED vs PLAIN의 빌드 시간, heap 크기, 검색 latency(GPU/CPU), INSERT throughput을 실측한다. 결과를 ADR-043 테이블과 `docs/best-practices.md`에 반영한다.
 - 장기 모니터링 대상: pgvector fixed-length storage 지원 여부, PG 코어 TOAST prefetch/streaming API.
 
 ### 4B — import_hnsw 페이지 write 병목 감소
