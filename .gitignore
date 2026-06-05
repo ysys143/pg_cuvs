@@ -44,3 +44,6 @@ design/bench_*.log
 # Comparative ANN benchmark outputs (results/plots/logs; large, regenerable)
 design/anbench/
 .claude/scheduled_tasks.lock
+
+# Local tool cache (project-path → UUID map; machine-specific)
+cache/
