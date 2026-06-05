@@ -214,6 +214,8 @@
 
 **결과**: 모든 실패 모드에서 사용자 쿼리가 성공. GPU 서비스는 PostgreSQL 가용성에 영향을 주지 않음 (ADR-002 sidecar 원칙 강화).
 
+**한계 (2026-06-05 정정)**: circuit breaker는 **백엔드 프로세스-로컬**이다 — 상태가 `cuvs_circuit_breakers` static 배열(`src/cuvs_util.c:590` `find_or_create_breaker`)에 저장돼 각 백엔드가 독립적으로 트립/리셋하고 백엔드 종료 시 사라진다. 서버 전역 공유·영속이 아니며, `pg_cuvs_reset_circuit()`도 호출 세션만 리셋한다(`src/pg_cuvs.c:2201`). "자동 비활성화"는 세션(백엔드) 단위로 이해해야 한다. (per-backend 동작 자체는 합당하나 ADR 본문이 전역 안전망처럼 읽힐 수 있어 명시.)
+
 ---
 
 ## ADR-012 — Phase 3B DiskANN/Vamana: cuVS Vamana 네이티브 방식
@@ -255,7 +257,7 @@ Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
 **결과**:
 - MVP 단계에서 구현 복잡도 최소화
 - 멀티노드 공유 필요 시 object storage snapshot source로 자연스럽게 진화
-- 인덱스 파일은 `pg_basebackup` WAL 스트림에서 제외 (`SPEC.md OBJSTORE-03` 참조)
+- 인덱스 파일은 `pg_basebackup` WAL 스트림에서 제외 (`SPEC.md OBJSTORE-03` 참조) **(2026-06-05 정정/주의: 기본 경로에서 미보장)** — 기본 `index_dir`은 `$PGDATA/cuvs_indexes`(`src/pg_cuvs.c:519`)로 PGDATA 내부다. `pg_basebackup`은 PGDATA의 base 파일을 통째로 복사하며 코드에 등록된 제외(exclusion) 훅이 없으므로, 기본 설정에서는 수 GB 파생 artifact가 base backup에 포함된다(WAL 스트림 자체에는 없으나 base copy에 포함). OBJSTORE-03을 충족하려면 `index_dir`을 PGDATA 밖에 두어야 하며, 이를 운영 playbook에 반영할 것을 권장한다.
 - heap 없이 index artifact만 있는 노드는 사용할 수 없다. TID mapping은 로컬 PostgreSQL heap block/offset과 호환되어야 한다.
 
 ---
@@ -356,10 +358,10 @@ MVP:
 
 초기 지표:
 - database OID, index OID, index name.
-- calls, success, fallback, error.
+- ~~calls, success, fallback, error.~~ **(2026-06-05 정정: 부분 구현)** — 실제 노출은 `search_count`(=OK 검색)·`error_count`뿐(`src/pg_cuvs_server.c:133-134`). 별도 "calls" 합계·"success"·"fallback" 카운터는 없다. fallback은 백엔드 plan-time 결정(`src/pg_cuvs.c:932`)이라 데몬 stats에 도달하지 않아 이 view에서 구조적으로 관측 불가.
 - requested k, returned k, rows returned.
 - average latency, p95 latency.
-- GPU kernel time, IPC time, CPU recheck time.
+- ~~GPU kernel time, IPC time, CPU recheck time.~~ **(2026-06-05 정정: 미구현)** — 데몬은 단일 wall-clock `total_latency_us`만 기록하고(`src/pg_cuvs_server.c:135`), SRF에 `gpu_kernel_us`/`ipc_us`/`cpu_recheck_us` 컬럼이 없다. latency split은 PLAN.md(Phase 2 deferral)에서 보류로 명시했고, 외부 측정은 ADR-044(nsys/perf)로 수행했다.
 - VRAM cache hits/misses, reload count.
 - last status, last error, last search timestamp.
 
@@ -367,6 +369,7 @@ MVP:
 - Phase 2 기능의 운영성과 성능을 SQL에서 확인할 수 있다.
 - playbook이 log scraping에만 의존하지 않는다.
 - 추후 PostgreSQL native `pgstat` integration으로 확장할 수 있다.
+- **(2026-06-05 정정)** 위 "초기 지표" 중 latency split(GPU/IPC/recheck)과 fallback·success·calls 카운터는 미구현이다(상세는 해당 항목 취소선 참조). 실제 `pg_cuvs_gpu_search_stats` 컬럼은 `search_count`/`error_count`/`avg·p50·p95·p99_latency_us` 등 wall-clock 기반이며, "초기 지표"는 의도였을 뿐 일부만 구현됐다. 운영자가 view를 보고 split/fallback이 있다고 오인하지 않도록 본 정정으로 명시한다.
 
 **대안**: daemon log만 사용. 거부 — SQL 운영자가 index별 상태와 fallback reason을 조회하기 어렵다.
 
@@ -1209,7 +1212,7 @@ shm 크기: Q×dim×4 (input) + Q×K×12 (output). Q=1000, dim=1024, K=10 기준
 - `ctid`: heap TID (PostgreSQL heap recheck 대상)
 - `distance`: metric-dependent distance (L2/cosine/IP)
 
-heap recheck / MVCC visibility는 함수 내부에서 `heap_fetch`로 처리한다. 결과는 `query_idx` 기준으로 정렬하지 않는다(GPU 반환 순서 유지).
+~~heap recheck / MVCC visibility는 함수 내부에서 `heap_fetch`로 처리한다.~~ **(2026-06-05 정정: 본문 오기 — 아래 구현현황과 모순)** 실제로는 함수 내부에서 `heap_fetch`를 하지 않고 raw ctid + 데몬 distance를 반환하며, caller가 `JOIN ... ON ctid`로 visibility를 처리한다(`src/pg_cuvs.c:2300`, 본 ADR 구현현황과 일치). 결과는 `query_idx` 기준으로 정렬하지 않는다(GPU 반환 순서 유지).
 
 ### 적용 범위
 
