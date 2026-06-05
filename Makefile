@@ -48,6 +48,13 @@ PG_CONFIG     ?= pg_config
 PGXS         := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+# PGXS's implicit .c->.o rule does NOT track header dependencies, so a change to
+# a shared header (e.g. a wire struct in cuvs_ipc.h) would otherwise leave stale
+# extension objects linked against the old layout — an ABI mismatch vs the
+# daemon. Force every extension object to rebuild when ANY project header
+# changes. (The server objects already list their header prereqs explicitly.)
+$(OBJS): $(wildcard src/*.h)
+
 # Build CUDA object before linking the .so. Pattern rule overrides PGXS
 # default for this specific file since .cu needs nvcc, not gcc.
 src/cuvs_wrapper.o: src/cuvs_wrapper.cu src/cuvs_wrapper.h
