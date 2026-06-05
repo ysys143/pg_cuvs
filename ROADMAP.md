@@ -24,6 +24,7 @@
 
 | Phase | 내용 | Wave |
 |-------|------|------|
+| 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 2 |
 | 3A | Pending delta / delta exact search | 3 |
 | 4-preflight | 연산 지역성 프로파일링 (nsys/perf/pg_stat_io) | 4 |
 | 4A-1 | CAGRA 빌드 double memcpy 제거 | 4 |
@@ -68,6 +69,19 @@
 
 ---
 
+#### Release hardening — TOAST storage 감지 NOTICE + best practice 문서
+**왜**: CAGRA 빌드 시 TOAST decompression이 heap scan 오버헤드의 50-60%를 차지. 벡터 전용 테이블에서 PLAIN storage를 쓰면 ~25-35% 절감. 구현 비용 최소(syscache 읽기 + ereport).
+
+구현 항목:
+- `cuvs_ambuild()`에서 indexed column의 `attstorage`가 EXTENDED('x')인지 syscache로 확인 → NOTICE 출력
+- `docs/best-practices.md`에 벡터 전용 테이블 + PLAIN storage 권장 스키마 패턴 문서화
+- pg_cuvs가 storage를 강제 변경하지 않음 (사용자 선택 존중)
+- **TOAST vs PLAIN 실증 벤치마크**: N=1M dim=1024 Cohere A100에서 EXTENDED vs PLAIN의 빌드 시간, heap 크기, 검색 latency(GPU+CPU), INSERT throughput 실측. 결과를 ADR-043 테이블과 `docs/best-practices.md`에 반영
+
+스펙: ADR-043 | [design/PLAN.md — Phase 4A 장기 항목](design/PLAN.md)
+
+---
+
 ### Wave 2 — 신규 기능, 리스크 낮음 (순차)
 
 #### 3L — GPU Brute Force 검색 모드
@@ -107,6 +121,25 @@
 - Q=1000, dim=1024 기준 단일 쿼리 반복 대비 throughput 유의미하게 향상
 
 스펙: [design/PLAN.md — Phase 3M](design/PLAN.md) | ADR-040
+
+---
+
+#### 3N — OFFSET-aware K 자동 조정
+**왜**: ORM pagination(Django, Rails, Spring Data, SQLAlchemy)이 `LIMIT K OFFSET N` 문법을 사용하는데 현재 pg_cuvs는 OFFSET을 인식하지 못함. DDL(3K) 이후 DML까지 "PostgreSQL 인덱스답게" 동작하는 범위를 확장.
+
+구현 항목:
+- `cuvsamcostestimate()` 또는 `cuvs_beginscan()`에서 Plan의 LIMIT+OFFSET 감지
+- IPC의 K를 `offset + limit`으로 계산해 전달 (daemon 변경 없음)
+- `cuvs_gettuple()`에서 앞 offset개 skip 후 반환
+- `offset > cuvs.max_offset_warning`(기본 1000) 시 NOTICE 경고
+- regression test: OFFSET 0/10/100 결과 일관성
+
+완료 기준:
+- `SELECT ... ORDER BY ... <-> ... LIMIT 10 OFFSET N`이 CAGRA/BF/sharded 경로에서 정상 동작
+- OFFSET 0일 때 기존 동작 동일 (regression 없음)
+- Django/SQLAlchemy의 `.offset().limit()` 패턴이 GPU 인덱스를 사용함을 `EXPLAIN`으로 확인
+
+스펙: [design/PLAN.md — Phase 3N](design/PLAN.md) | ADR-042
 
 ---
 

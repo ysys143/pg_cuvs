@@ -958,8 +958,33 @@ Phase 3L 완료 기준:
 
 ---
 
+#### Phase 3N — OFFSET-aware K 자동 조정
+
+목표: `SELECT ... ORDER BY embedding <-> query LIMIT K OFFSET N`이 GPU CAGRA/BF/sharded 경로에서 정상 동작하도록, pg_cuvs가 OFFSET을 감지해 내부 K를 `offset + limit`으로 자동 조정한다. ORM(Django, Rails, Spring Data, SQLAlchemy) pagination 호환성을 확보한다. (ADR-042)
+
+배경:
+- 현재 pg_cuvs는 LIMIT만 지원하고 OFFSET을 인식하지 못한다. OFFSET을 쓰면 executor가 seqscan fallback하거나 결과가 잘려나온다.
+- 벡터 인덱스(CAGRA, HNSW, BF)는 "이전 검색의 N번째부터 이어서 탐색"이 구조적으로 불가능하므로, `offset + limit`개를 한 번에 검색해 앞부분을 drop하는 것이 유일한 현실적 경로다(Qdrant 동일 방식).
+
+구현 항목:
+- `cuvsamcostestimate()` 또는 `cuvs_beginscan()`에서 PG Plan 노드의 LIMIT+OFFSET 감지. `IndexScanDesc`에 offset 값을 저장한다.
+- IPC search 메시지의 K 값을 `offset + limit`으로 계산해 전달한다(별도 offset 필드 추가 대신 K 자체를 확장하는 방식이 daemon 변경 최소).
+- daemon은 K=offset+limit으로 CAGRA/BF 검색을 수행하고 전체 결과를 반환한다(daemon 변경 없음).
+- backend `cuvs_gettuple()`에서 앞 offset개를 skip한 뒤 나머지를 반환한다.
+- `offset > cuvs.max_offset_warning`(기본 1000) 시 NOTICE를 남겨 keyset pagination 전환을 권고한다.
+- regression test: OFFSET 0/10/100에서 결과가 단일 `LIMIT (offset+limit)` 쿼리의 뒤쪽 slice와 일치하는지 검증.
+
+Phase 3N 완료 기준:
+- `SELECT ... ORDER BY embedding <-> query LIMIT 10 OFFSET N`이 CAGRA/BF/sharded 경로에서 정상 동작한다.
+- OFFSET 0일 때 기존 동작과 byte-identical(regression 없음).
+- `pg_stat_gpu_search.requested_k`에 `offset + limit` 값이 반영된다.
+- Django QuerySet slicing(`qs[100:110]`), SQLAlchemy `.offset(100).limit(10)` 패턴으로 GPU 인덱스가 사용됨을 `EXPLAIN`으로 확인한다.
+- large offset(>1000) 시 NOTICE 경고가 발생한다.
+
+---
+
 Phase 3 전체 완료 기준:
-- Phase 3A-3M의 subphase 완료 기준을 모두 만족한다.
+- Phase 3A-3N의 subphase 완료 기준을 모두 만족한다.
 - 각 subphase는 독립적으로 중단/릴리스 가능하며, 다음 subphase 미완료가 이전 subphase의 정합성을 깨지 않는다.
 
 ---
