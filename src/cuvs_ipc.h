@@ -226,6 +226,12 @@ int cuvs_ipc_search_batch(
  * vecs:  corpus vectors, shape [n_vecs][dim], row-major float32
  * tids:  corresponding heap TIDs, length n_vecs
  *
+ * prefilled_shm_key (ADR-034 §4A-1): when non-NULL, the caller has already
+ * written the [vectors][tids] payload into this shm segment, so vecs/tids are
+ * ignored and no second copy is made; the caller owns the segment's lifetime
+ * (this function does not shm_unlink it). When NULL, the legacy path applies:
+ * a fresh segment is created from vecs/tids and unlinked here before returning.
+ *
  * Returns CUVS_STATUS_OK on success.
  */
 int cuvs_ipc_build(
@@ -241,7 +247,8 @@ int cuvs_ipc_build(
     uint32_t       table_oid,   /* heap relation OID */
     uint32_t       relfilenode, /* heap relfilenode (heap compat identity) */
     uint32_t       shard_count, /* Phase 3F: 0/1 = unsharded, >=2 = N shards */
-    uint32_t       use_cpu_hnsw /* Phase 3I-1: 1 = serialize .hnsw sidecar */
+    uint32_t       use_cpu_hnsw,/* Phase 3I-1: 1 = serialize .hnsw sidecar */
+    const char    *prefilled_shm_key /* ADR-034 §4A-1: caller-owned shm, or NULL */
 );
 
 /*

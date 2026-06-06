@@ -62,6 +62,7 @@
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"
 #include "cuvs_util.h"
+#include "cuvs_build_shm.h"   /* ADR-034 §4A-1: build payload in shm (no heap->shm memcpy) */
 #include "hnsw_export.h"
 
 PG_MODULE_MAGIC;
@@ -1106,11 +1107,16 @@ typedef struct CuvsBuildState {
     int      dim;
     int64_t  n_vecs;
     int64_t  n_allocated;
-    float   *vectors;     /* malloc'd: [n_allocated][dim] */
-    uint64_t *tids;       /* malloc'd: [n_allocated] */
+    float   *vectors;     /* [n_allocated][dim]: shm mapping when use_shm, else malloc'd */
+    uint64_t *tids;       /* malloc'd: [n_allocated] — always heap (tiny, 8B/row) */
     uint32_t metric;      /* CUVS_METRIC_* */
     double   reltuples;
     size_t   cap_bytes;   /* build memory limit (0 = none); see Step 5 */
+    /* ADR-034 §4A-1: vectors accumulate directly in this shm segment, so the
+     * post-scan heap->shm memcpy of the (multi-GB) corpus is eliminated. When
+     * shm setup is unavailable we fall back to a heap buffer (use_shm=false). */
+    bool          use_shm;
+    CuvsBuildShm  shm;    /* vectors region; bs.vectors == shm.base when use_shm */
 } CuvsBuildState;
 
 static void
@@ -1121,16 +1127,14 @@ grow_build_buffers(CuvsBuildState *bs)
         new_size = 64;
 
     /* Runtime guard: catch tables whose preflight estimate was unavailable
-     * (never ANALYZEd) or too low. Free what we hold before erroring so the
-     * ereport longjmp does not leak the malloc'd buffers. */
+     * (never ANALYZEd) or too low. On ERROR the caller's PG_FINALLY reclaims
+     * the shm segment and the heap buffers, so we must not free here (doing so
+     * would double-free with the FINALLY cleanup). */
     if (bs->cap_bytes > 0)
     {
         size_t projected = (size_t) new_size * bs->dim * sizeof(float)
                          + (size_t) new_size * sizeof(uint64_t);
         if (projected > bs->cap_bytes)
-        {
-            free(bs->vectors); bs->vectors = NULL;
-            free(bs->tids);    bs->tids = NULL;
             ereport(ERROR,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("pg_cuvs: build corpus exceeds the build memory limit (%zu MB)",
@@ -1138,18 +1142,34 @@ grow_build_buffers(CuvsBuildState *bs)
                      errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
                              "cuvs.build_mem_safety_ratio, shard the table, or see "
                              "docs/playbooks/large-dataset-benchmark.md.")));
-        }
     }
 
-    bs->vectors = realloc(bs->vectors,
-                          (size_t)new_size * bs->dim * sizeof(float));
-    bs->tids    = realloc(bs->tids,
-                          (size_t)new_size * sizeof(uint64_t));
+    /* Vectors: grow the shm segment in place (ftruncate + remap) so no separate
+     * heap buffer is ever allocated; or realloc the heap buffer on the fallback
+     * path. TIDs stay on the heap either way (8 bytes/row — negligible). */
+    if (bs->use_shm)
+    {
+        if (cuvs_build_shm_resize(&bs->shm, (size_t) new_size * bs->dim * sizeof(float)) != 0)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OUT_OF_MEMORY),
+                     errmsg("pg_cuvs: failed to grow shm build buffer: %m")));
+        bs->vectors = (float *) bs->shm.base;
+    }
+    else
+    {
+        bs->vectors = realloc(bs->vectors,
+                              (size_t)new_size * bs->dim * sizeof(float));
+        if (!bs->vectors)
+            ereport(ERROR,
+                    (errcode(ERRCODE_OUT_OF_MEMORY),
+                     errmsg("pg_cuvs: out of memory accumulating index vectors")));
+    }
 
-    if (!bs->vectors || !bs->tids)
+    bs->tids = realloc(bs->tids, (size_t)new_size * sizeof(uint64_t));
+    if (!bs->tids)
         ereport(ERROR,
                 (errcode(ERRCODE_OUT_OF_MEMORY),
-                 errmsg("pg_cuvs: out of memory accumulating index vectors")));
+                 errmsg("pg_cuvs: out of memory accumulating index TIDs")));
 
     bs->n_allocated = new_size;
 }
@@ -1211,105 +1231,161 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
     bs.cap_bytes = cuvs_effective_build_cap_bytes();
 
     /* Preflight: estimate the corpus size from the planner's row estimate and
-     * the indexed column's declared dimension, and fail before scanning if it
-     * would blow the build memory limit. (Unknown dim/reltuples -> skip; the
-     * runtime guard in grow_build_buffers still protects accumulation.) */
-    if (bs.cap_bytes > 0)
+     * the indexed column's declared dimension. Used to (a) fail fast if the
+     * corpus would blow the build memory limit, and (b) size the shm segment.
+     * (Unknown dim/reltuples -> skip the cap check; the runtime guard in
+     * grow_build_buffers still protects accumulation.) */
+    AttrNumber heap_attno = indexInfo->ii_IndexAttrNumbers[0];
+    int32 typmod = (heap_attno >= 1)
+        ? TupleDescAttr(RelationGetDescr(heapRel), heap_attno - 1)->atttypmod
+        : -1;
+    double reltuples_est = heapRel->rd_rel->reltuples;
+
+    if (bs.cap_bytes > 0 && typmod > 0 && reltuples_est > 0)
     {
-        AttrNumber heap_attno = indexInfo->ii_IndexAttrNumbers[0];
-        int32 typmod = (heap_attno >= 1)
-            ? TupleDescAttr(RelationGetDescr(heapRel), heap_attno - 1)->atttypmod
-            : -1;
-        double reltuples = heapRel->rd_rel->reltuples;
-        if (typmod > 0 && reltuples > 0)
+        size_t est = (size_t) reltuples_est * (size_t) typmod * sizeof(float)
+                   + (size_t) reltuples_est * sizeof(uint64_t);
+        if (est > bs.cap_bytes)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("pg_cuvs: estimated build corpus %zu MB exceeds the "
+                            "build memory limit (%zu MB)",
+                            est / (1024 * 1024), bs.cap_bytes / (1024 * 1024)),
+                     errdetail("%s",
+                               cuvs_max_build_mem_mb > 0
+                               ? "Limit is the cuvs.max_build_mem_mb hard cap."
+                               : "Limit is auto (MemAvailable * cuvs.build_mem_safety_ratio)."),
+                     errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
+                             "cuvs.build_mem_safety_ratio, shard the table, or see "
+                             "docs/playbooks/large-dataset-benchmark.md.")));
+    }
+
+    /* ADR-034 §4A-1: when the column has a declared dimension (vector(N) — the
+     * common case), accumulate vectors directly in a POSIX shm segment sized to
+     * the row estimate. This removes the post-scan heap->shm copy of the whole
+     * corpus and the realloc page faults of a growing heap buffer. A column with
+     * no declared dimension, or a /dev/shm that cannot satisfy the request,
+     * falls back to heap accumulation (use_shm stays false) — correctness is
+     * identical, only the extra copy returns. */
+    if (typmod > 0)
+    {
+        int64_t init_rows = (reltuples_est > 0) ? (int64_t) reltuples_est : 64;
+        if (init_rows < 64)
+            init_rows = 64;
+        if (cuvs_build_shm_create(&bs.shm,
+                                  (size_t) init_rows * (size_t) typmod * sizeof(float)) == 0)
         {
-            size_t est = (size_t) reltuples * (size_t) typmod * sizeof(float)
-                       + (size_t) reltuples * sizeof(uint64_t);
-            if (est > bs.cap_bytes)
+            bs.use_shm     = true;
+            bs.dim         = typmod;            /* declared dim; callback rechecks per row */
+            bs.vectors     = (float *) bs.shm.base;
+            bs.n_allocated = init_rows;
+        }
+        else
+            ereport(WARNING,
+                    (errmsg("pg_cuvs: shm build buffer unavailable (%m); "
+                            "using heap accumulation for this build"),
+                     errhint("Check /dev/shm free space (df -h /dev/shm). The build "
+                             "still succeeds; the shm path only avoids an extra "
+                             "in-memory copy of the corpus.")));
+    }
+
+    /* The scan can longjmp (query cancel, statement_timeout, detoast error, the
+     * build-memory guard in grow_build_buffers); PG_FINALLY reclaims the shm
+     * segment and heap buffers on every exit path so a cancelled CREATE INDEX
+     * never leaks a /dev/shm object. */
+    int rc = CUVS_STATUS_OK;
+    PG_TRY();
+    {
+        /* Scan all live heap tuples; vectors land in shm (or heap), TIDs in heap. */
+        bs.reltuples = table_index_build_scan(
+            heapRel, indexRel, indexInfo,
+            true, true,
+            cuvs_build_callback, &bs, NULL);
+
+        if (out_reltuples) *out_reltuples = bs.reltuples;
+        *out_n_vecs = bs.n_vecs;
+
+        if (bs.n_vecs > 0)
+        {
+            /* Finalize the shm layout to exactly what the daemon maps: one
+             * segment of [vectors (n_vecs*dim*4)][tids (n_vecs*8)] contiguous.
+             * Shrink to the exact total (dropping doubling slack) and append the
+             * TID region — the single small (~8 bytes/row) copy that remains. */
+            if (bs.use_shm)
+            {
+                size_t vec_bytes = (size_t) bs.n_vecs * bs.dim * sizeof(float);
+                size_t tid_bytes = (size_t) bs.n_vecs * sizeof(uint64_t);
+                if (cuvs_build_shm_resize(&bs.shm, vec_bytes + tid_bytes) != 0)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_OUT_OF_MEMORY),
+                             errmsg("pg_cuvs: failed to finalize shm build buffer: %m")));
+                memcpy((char *) bs.shm.base + vec_bytes, bs.tids, tid_bytes);
+            }
+
+            /* Send corpus to daemon for CAGRA build. With shm we hand over the
+             * pre-filled segment by key (no second copy); the heap fallback lets
+             * cuvs_ipc_build create+copy the segment as before (prefilled=NULL). */
+            uint32_t heap_table_oid   = (uint32_t) RelationGetRelid(heapRel);
+            uint32_t heap_relfilenode = (uint32_t) heapRel->rd_rel->relfilenode;
+            rc = cuvs_ipc_build(
+                cuvs_socket_path,
+                (uint32_t) MyDatabaseId,
+                build_index_oid,
+                bs.use_shm ? NULL : bs.vectors,
+                bs.use_shm ? NULL : (const uint64_t *) bs.tids,
+                bs.n_vecs,
+                bs.dim,
+                bs.metric,
+                cuvs_resolve_index_dir_rel(indexRel),
+                heap_table_oid,
+                heap_relfilenode,
+                shard_count,
+                use_cpu_hnsw ? 1 : 0,             /* Phase 3I-1: serialize .hnsw sidecar */
+                bs.use_shm ? bs.shm.key : NULL);  /* ADR-034 §4A-1: prefilled shm segment */
+
+            if (rc != CUVS_STATUS_OK)
+            {
+                /* DDL durability contract: CREATE INDEX must produce a durable
+                 * index on success. We fail the transaction so the catalog entry
+                 * is rolled back and the user knows to retry. */
+                const char *hint;
+                switch (rc)
+                {
+                    case CUVS_STATUS_UNAVAILABLE:
+                        hint = "pg_cuvs_server is not reachable. Start it and retry "
+                               "CREATE INDEX, or use SET enable_cuvs = off + pgvector "
+                               "HNSW if GPU acceleration is not required.";
+                        break;
+                    case CUVS_STATUS_OOM_FALLBACK:
+                        hint = "GPU VRAM exhausted. Free VRAM (drop other cagra "
+                               "indexes or restart pg_cuvs_server) and retry, or use "
+                               "pgvector HNSW instead.";
+                        break;
+                    default:
+                        hint = "Check pg_cuvs_server journal (journalctl -u "
+                               "pg-cuvs-server) for the underlying error. "
+                               "Common causes: disk full or permission denied on "
+                               "cuvs.index_dir.";
+                        break;
+                }
                 ereport(ERROR,
-                        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                         errmsg("pg_cuvs: estimated build corpus %zu MB exceeds the "
-                                "build memory limit (%zu MB)",
-                                est / (1024 * 1024), bs.cap_bytes / (1024 * 1024)),
-                         errdetail("%s",
-                                   cuvs_max_build_mem_mb > 0
-                                   ? "Limit is the cuvs.max_build_mem_mb hard cap."
-                                   : "Limit is auto (MemAvailable * cuvs.build_mem_safety_ratio)."),
-                         errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
-                                 "cuvs.build_mem_safety_ratio, shard the table, or see "
-                                 "docs/playbooks/large-dataset-benchmark.md.")));
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
+                                "aborted to preserve catalog durability", rc),
+                         errhint("%s", hint)));
+            }
         }
     }
-
-    /* Scan all live heap tuples, collect vectors + TIDs */
-    bs.reltuples = table_index_build_scan(
-        heapRel, indexRel, indexInfo,
-        true, true,
-        cuvs_build_callback, &bs, NULL);
-
-    if (out_reltuples) *out_reltuples = bs.reltuples;
-    *out_n_vecs = bs.n_vecs;
-
-    if (bs.n_vecs == 0)
+    PG_FINALLY();
     {
-        /* Empty table — nothing to build */
-        if (bs.vectors) free(bs.vectors);
-        if (bs.tids)    free(bs.tids);
-        return;
+        if (bs.use_shm)
+            cuvs_build_shm_destroy(&bs.shm);   /* munmap + close + shm_unlink (idempotent) */
+        else if (bs.vectors)
+            free(bs.vectors);
+        if (bs.tids)
+            free(bs.tids);
     }
-
-    /* Send corpus to daemon for CAGRA build */
-    uint32_t heap_table_oid   = (uint32_t)RelationGetRelid(heapRel);
-    uint32_t heap_relfilenode = (uint32_t)heapRel->rd_rel->relfilenode;
-    int rc = cuvs_ipc_build(
-        cuvs_socket_path,
-        (uint32_t)MyDatabaseId,
-        build_index_oid,
-        bs.vectors,
-        (const uint64_t *)bs.tids,
-        bs.n_vecs,
-        bs.dim,
-        bs.metric,
-        cuvs_resolve_index_dir_rel(indexRel),
-        heap_table_oid,
-        heap_relfilenode,
-        shard_count,
-        use_cpu_hnsw ? 1 : 0);  /* Phase 3I-1: serialize .hnsw sidecar */
-
-    free(bs.vectors);
-    free(bs.tids);
-
-    if (rc != CUVS_STATUS_OK)
-    {
-        /* DDL durability contract: CREATE INDEX must produce a durable
-         * index on success. We fail the transaction so the catalog entry
-         * is rolled back and the user knows to retry. */
-        const char *hint;
-        switch (rc)
-        {
-            case CUVS_STATUS_UNAVAILABLE:
-                hint = "pg_cuvs_server is not reachable. Start it and retry "
-                       "CREATE INDEX, or use SET enable_cuvs = off + pgvector "
-                       "HNSW if GPU acceleration is not required.";
-                break;
-            case CUVS_STATUS_OOM_FALLBACK:
-                hint = "GPU VRAM exhausted. Free VRAM (drop other cagra "
-                       "indexes or restart pg_cuvs_server) and retry, or use "
-                       "pgvector HNSW instead.";
-                break;
-            default:
-                hint = "Check pg_cuvs_server journal (journalctl -u "
-                       "pg-cuvs-server) for the underlying error. "
-                       "Common causes: disk full or permission denied on "
-                       "cuvs.index_dir.";
-                break;
-        }
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
-                        "aborted to preserve catalog durability", rc),
-                 errhint("%s", hint)));
-    }
+    PG_END_TRY();
 }
 
 /* ----------------------------------------------------------------
