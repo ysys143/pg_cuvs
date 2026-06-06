@@ -121,6 +121,7 @@ test_golden_no_grow(int64_t n, int dim)
     free(vecs); free(tids); free(golden);
 }
 
+#ifdef __linux__
 /* Mirror the real backend path — create small, append vectors one tuple at a
  * time with capacity doubling (grow_build_buffers), then shrink to the exact
  * total and append the TID region (finalize). Prove byte-identity. */
@@ -190,6 +191,7 @@ test_grow_preserves_bytes(void)
     cuvs_build_shm_destroy(&sh);
     free(vecs); free(tids);
 }
+#endif /* __linux__ */
 
 /* destroy() is idempotent and safe on an empty handle. */
 static void
@@ -215,9 +217,13 @@ main(void)
     test_golden_no_grow(/*n=*/64,   /*dim=*/4);
     test_golden_no_grow(/*n=*/1000, /*dim=*/16);
     test_golden_no_grow(/*n=*/333,  /*dim=*/3);
+#ifdef __linux__
     test_golden_with_grow(/*n=*/1000, /*dim=*/16, /*init_rows=*/64);
     test_golden_with_grow(/*n=*/333,  /*dim=*/3,  /*init_rows=*/333); /* exact fit */
     test_grow_preserves_bytes();
+#else
+    fprintf(stderr, "[INFO] shm grow/resize tests skipped (macOS: shm ftruncate is one-shot)\n");
+#endif
     test_destroy_idempotent();
 
     fprintf(stderr, "test_build_shm: %d passed, %d failed\n", g_pass, g_fail);
