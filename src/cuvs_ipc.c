@@ -713,32 +713,23 @@ cuvs_ipc_build(
     uint32_t       table_oid,
     uint32_t       relfilenode,
     uint32_t       shard_count,
-    uint32_t       use_cpu_hnsw,
-    const char    *prefilled_shm_key)
+    uint32_t       use_cpu_hnsw)
 {
     char shm_key[64];
     int  shm_fd = -1;
     int  sock   = -1;
     int  rc     = CUVS_STATUS_ERROR;
-    /* ADR-034 §4A-1: with a prefilled segment the caller owns its lifetime, so
-     * we neither create nor shm_unlink it here. Otherwise we create+copy+unlink
-     * (legacy path / heap fallback). */
-    int own_shm = (prefilled_shm_key == NULL);
 
-    if (own_shm) {
-        make_shm_key(shm_key, sizeof(shm_key));
-        shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
-        if (shm_fd < 0) {
-            LOG_ERROR("[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n",
-                    errno, strerror(errno));
-            goto cleanup;
-        }
-    } else {
-        strncpy(shm_key, prefilled_shm_key, sizeof(shm_key) - 1);
-        shm_key[sizeof(shm_key) - 1] = '\0';
+    make_shm_key(shm_key, sizeof(shm_key));
+    LOG_DEBUG("[cuvs_ipc_build] shm_key=%s socket=%s n_vecs=%lld dim=%d\n",
+        shm_key, socket_path, (long long)n_vecs, dim);
+
+    shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
+    if (shm_fd < 0) {
+        LOG_ERROR("[cuvs_ipc_build] shm_write FAILED errno=%d (%s)\n",
+                errno, strerror(errno));
+        goto cleanup;
     }
-    LOG_DEBUG("[cuvs_ipc_build] shm_key=%s socket=%s n_vecs=%lld dim=%d own_shm=%d\n",
-        shm_key, socket_path, (long long)n_vecs, dim, (int)own_shm);
 
     sock = uds_connect_ex(socket_path, 600);  /* BUILD can take minutes */
     if (sock < 0) {
@@ -789,8 +780,7 @@ cleanup:
         close(sock);
     if (shm_fd >= 0)
         close(shm_fd);
-    if (own_shm)
-        shm_unlink(shm_key);   /* prefilled segments are unlinked by the caller */
+    shm_unlink(shm_key);
     return rc;
 }
 

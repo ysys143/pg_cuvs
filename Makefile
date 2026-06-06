@@ -28,7 +28,7 @@ ISOLATION_OPTS = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o src/cuvs_build_shm.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -154,12 +154,9 @@ install-server-test: server-test
 # Deliberately independent of PGXS/pg_config/CUDA so it runs on a laptop.
 # librt exists on Linux (CI/VM) but not macOS — link it only where present.
 TEST_RT_LIB := $(shell [ "$$(uname -s)" = "Linux" ] && echo -lrt)
-test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h \
-           test/unit/test_build_shm.c src/cuvs_build_shm.c src/cuvs_build_shm.h
+test-unit: test/unit/test_cuvs_util.c src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 	$(CC) -I src -DCUVS_TEST_HOOKS -o test-unit test/unit/test_cuvs_util.c src/cuvs_util.c $(TEST_RT_LIB)
 	./test-unit
-	$(CC) -I src -o test-build-shm test/unit/test_build_shm.c src/cuvs_build_shm.c $(TEST_RT_LIB)
-	./test-build-shm
 
 .PHONY: test-unit
 
@@ -408,6 +405,3 @@ gpu-anbench-agg:
 
 # Convenience: full cycle on the VM (sync → build → install → test).
 gpu-cycle: sync gpu-build gpu-install gpu-test
-check-extend:
-	ssh $$(VM_HOST) "find /usr/local/include ~/miniforge3 /opt/conda -name cagra.h -path '*/cuvs/*' 2>/dev/null | head -3 && echo --- && grep -i extend \$$(find /usr/local/include ~/miniforge3 /opt/conda -name cagra.h -path '*/cuvs/*' 2>/dev/null | head -1) 2>/dev/null | head -40"
-
