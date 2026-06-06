@@ -348,7 +348,7 @@ query vector
 Delivered scope:
 - **3A-1 CPU-exact MVP**: backend-side `.delta` append + CPU exact merge로 INSERT/UPDATE new version을 보정한다.
 - **3A-2 GPU delta cache core**: daemon이 `.delta`를 generation/mtime 기준 lazy reload하고, resident GPU brute-force delta cache를 base CAGRA 결과와 merge한다. IPC reply의 `delta_merged` flag로 backend가 CPU merge fallback을 생략할지 결정한다.
-- **3A-3 delta controls/stats**: `cuvs.delta_search=auto|cpu|gpu`와 `pg_stat_gpu_search` delta columns(`delta_rows`, `delta_generation`, `delta_vram_bytes`, `delta_merged_count`, `delta_search_mode`)로 delta 경로를 관측·강제할 수 있다.
+- **3A-3 delta controls/stats**: `cuvs.delta_search`(정수 GUC: 0=auto, 1=cpu, 2=gpu)와 `pg_stat_gpu_search` delta columns(`delta_rows`, `delta_generation`, `delta_vram_bytes`, `delta_merged_count`, `delta_search_mode`)로 delta 경로를 관측·강제할 수 있다. (GUC는 `DefineCustomIntVariable`이라 정수만 받는다 — `auto`/`cpu`/`gpu` 문자열은 `invalid value` ERROR. 향후 enum 전환은 ADR-047 후속 항목.)
 - **3A-4 tombstone/cleanup**: `.tombstone` sidecar와 snapshot-aware backend filtering으로 DELETE/UPDATE-old dead TID를 보정한다. `ambulkdelete`는 dead TID를 tombstone으로 기록하고, tombstone append 실패·cap 초과·unusable 상태에서만 stale fallback으로 닫힌다.
 - daemon-side GPU delta cache는 성능 경로이고, backend CPU merge/tombstone filter는 daemon이 merge하지 못한 경우의 correctness fallback이다.
 
@@ -397,6 +397,8 @@ Phase 3A 완료 기준:
 - DELETE/VACUUM은 tombstone correction을 기본 경로로 사용하고, tombstone이 안전하지 않을 때 `.stale` CPU reroute로 닫힌다.
 - delta 손상 또는 cleanup 실패는 CPU fallback으로 닫힌다.
 - over-fetch recall, restart fail-closed, metric-specific merge가 regression/integration/property test로 검증된다.
+
+**완료 (2026-06-06, ADR-047)**: 메커니즘은 2026-05 WIP로 기구현·정확했으나 위 완료 기준이 요구하는 검증이 비어 미완 표기됐던 것을, 본 세션에서 회귀+격리+e2e로 certify(false-done 역방향 해소). 검증 산출물: `test/sql/pending_delta.sql`(cap fail-closed·Sc15 GPU delta cache built·tri-mode·max_delta_rows=0), `test/sql/delta_recall.sql`(delete-drift recall — over-fetch fix red→green), `test/specs/delta_tombstone_snapshot.spec`·`delta_interleaving.spec`(pg_isolation_regress: 동시 DELETE 가시성·미커밋 delta 격리), `infra/scripts/delta-restart-e2e.sh`(valid delta restart 생존 + corrupt delta fail-closed), `test/unit/test_cuvs_util.c::test_tombstone_format`. VM(A100/PG16): installcheck 15/15 + isolation 2/2 GREEN, e2e PASS. 발견·수정: delete-drift 임계 아래 + top-k 집중 삭제에서 recall<LIMIT → `cuvs_gettuple` tombstone-aware over-fetch(`k += min(n_tomb, cuvs_k)`).
 
 Phase 3A follow-ups:
 - random INSERT/UPDATE/DELETE/query interleaving property test를 더 넓은 데이터 크기와 transaction snapshot 조합으로 확장한다.

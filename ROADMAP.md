@@ -22,12 +22,12 @@
 | 하드닝 | orphan artifact GC (`pg_cuvs_gc_orphans(do_delete)`) — 데몬-down DROP / DROP DATABASE / 재시작 좀비 재로드로 인한 VRAM+디스크 누수 근절. backend가 `index_dir`을 `pg_index`/`pg_database`와 대조(daemon은 sidecar라 카탈로그 불가). dry-run 기본. installcheck GREEN(gc_orphans) + 데몬-down e2e 검증. ADR-009 정정 반영 (ADR-046) |
 | 4-preflight | 연산 지역성 프로파일링 완료 (A100/PG16, N=1M dim=1024). 검색 GPU:IPC≈2:1(GPU-bound), 빌드 GPU 82%/backend 18%, export buffer-mgr 39%, TOAST vs PLAIN 8%. 측정 근거로 4A 하향. `docs/profiling-results.md` (ADR-044) |
 | Release-hardening | 빌드-time 권고 emit 3종 — TOAST NOTICE(고차원 toastable→PLAIN 권고), index_dir이 $PGDATA 하위면 WARNING(basebackup 비대), pgvector 0.5–0.8 밖이면 WARNING(HNSW 포맷 drift). `docs/best-practices.md`. installcheck GREEN(release_hardening) + 수동 e2e (ADR-043/ADR-013/ADR-038) |
+| 3A | Pending delta / delta exact search — INSERT/UPDATE `.delta` append(false stale 없음) + CPU/GPU 병합, snapshot-aware `.tombstone`, tri-mode `cuvs.delta_search`(int 0/1/2), delta cap fail-closed, tombstone-aware over-fetch로 delete-drift recall 보존. installcheck 15/15 + isolation 2/2 GREEN + restart e2e PASS (ADR-047). **비고**: 메커니즘은 3F/3G·phase3a WIP(2026-05)로 구현됐으나 완료 기준(회귀/격리 검증) 미충족으로 미완 표기됐던 것을 본 세션에서 검증·certify(false-done 역방향 해소) |
 
 ### 미완료
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 3A | Pending delta / delta exact search | 릴리스 후 기능 |
 | 4A-1 | CAGRA 빌드 double memcpy 제거 (**quick win**: ~2-5s, 난이도 낮음, 4A-2 enabler) | 릴리스 후 기능 |
 | 4A-2 | parallel maintenance workers — heap scan/detoast 병렬화 (~8-12s/~10-14%, 난이도 중간) | 릴리스 후 기능 |
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
@@ -42,40 +42,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-RAG/검색 시스템은 문서가 계속 추가/수정된다. INSERT 하나만 해도 GPU path가 완전히 포기되는 현재 구조로는 streaming write가 있는 모든 워크로드에서 pg_cuvs를 실운용할 수 없다. **3L에서 완성한 `CuvsBfIndex` 인프라를 3A-2 GPU delta cache가 직접 재사용한다.**
-
-#### 3A — Pending Delta
-
-##### 3A-1 — CPU-exact MVP
-- `aminsert`에서 `.delta` sidecar에 (TID, vector, generation) append — 성공 시 `MARK_STALE` 전송 안 함
-- `.delta` append 실패 시 기존 stale path로 fail-closed
-- query 시 base CAGRA(k+slop) + CPU exact search over delta rows + top-k merge
-- generation mismatch 시 CPU reroute
-- `cuvs.max_delta_rows` 초과 시 GPU+delta 중단 + REINDEX 권고
-- REINDEX 후 `.delta` compaction
-
-##### 3A-2 — GPU BF delta cache
-- daemon이 `.delta`를 generation/mtime 기준 lazy reload → `CuvsBfIndex`로 로드 (3L 인프라 재사용)
-- base CAGRA search + GPU BF delta search → daemon 내 merge → `delta_merged` flag
-- `delta_merged=1`이면 backend CPU merge 생략
-
-##### 3A-3 — delta controls/stats
-- `cuvs.delta_search=auto|cpu|gpu` GUC
-- `pg_stat_gpu_search` delta 컬럼 (`delta_rows`, `delta_generation`, `delta_vram_bytes`, `delta_search_mode`)
-
-##### 3A-4 — tombstone/cleanup
-- `.tombstone` sidecar + snapshot-aware dead TID filtering
-- `ambulkdelete`가 dead TID를 tombstone으로 기록
-- tombstone cap 초과/unusable 시에만 `.stale` CPU reroute
-
-완료 기준:
-- INSERT/UPDATE 후 REINDEX 없이 GPU+delta merged top-k가 pgvector ground truth와 일치
-- DELETE/VACUUM은 tombstone correction 기본 경로 사용
-- daemon restart 후 delta 유실 시 incomplete GPU 결과 서빙 안 함
-
-스펙: [design/PLAN.md — Phase 3A](design/PLAN.md)
-
----
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. 순차 경로는 4A부터다.
 
 #### 4A — 빌드 성능 (4-preflight 측정으로 범위·기대치 재조정)
 
