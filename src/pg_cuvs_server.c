@@ -3583,13 +3583,13 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     void *mem;
     if (passed_fd >= 0)
     {
-        LOG_DEBUG("[handle_build] mmap passed memfd fd=%d total=%zu\n", passed_fd, total);
+        LOG_INFO("[handle_build] corpus via memfd(SCM_RIGHTS) fd=%d total=%zu\n", passed_fd, total);
         mem = mmap(NULL, total, PROT_READ, MAP_SHARED, passed_fd, 0);
         close(passed_fd);   /* mapping holds the memory; daemon's ref is dropped here */
     }
     else
     {
-        LOG_DEBUG("[handle_build] shm_open(%s)...\n", cmd->shm_key);
+        LOG_INFO("[handle_build] corpus via shm_open(%s)\n", cmd->shm_key);
         int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
         if (shm_fd < 0)
         {
