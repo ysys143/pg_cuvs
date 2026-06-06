@@ -518,6 +518,19 @@ _PG_init(void)
     prev_object_access_hook = object_access_hook;
     object_access_hook = cuvs_object_access;
     RegisterXactCallback(cuvs_xact_callback, NULL);
+
+    /* ADR-048: test seam — CUVS_FORCE_CORPUS=memfd|shm|heap pins the build tier
+     * for every backend (inherited from the postmaster env). Unset => auto. Used
+     * by the leak-verification harness to exercise the T2 reaper / heap path on
+     * a memfd-capable host. */
+    cuvs_corpus_force_kind(getenv("CUVS_FORCE_CORPUS"));
+
+    /* ADR-048: at server (re)start, reclaim any T2 build-corpus shm orphans a
+     * crashed/killed build left in a previous lifetime. The default memfd tier
+     * leaves no /dev/shm name (nothing to reap); this only matters where memfd
+     * is unavailable (old kernel / seccomp) and named shm is used. flock-based:
+     * only dead-owner segments are unlinked, never a live build's. */
+    cuvs_corpus_reap_orphans(1);
 }
 
 /* Resolve cuvs.index_dir: if empty, default to DataDir/cuvs_indexes */
