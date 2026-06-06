@@ -54,6 +54,10 @@
 #include "miscadmin.h"
 #include "nodes/pg_list.h"       /* list_make1 */
 #include "access/genam.h"        /* GetSysCacheOid3 */
+#include "access/table.h"        /* table_open/table_close (pgvector version guard) */
+#include "access/stratnum.h"     /* BTEqualStrategyNumber */
+#include "catalog/pg_extension.h"/* ExtensionRelationId, Anum_pg_extension_* */
+#include "utils/fmgroids.h"      /* F_OIDEQ */
 
 #include <math.h>
 #include <stdio.h>
@@ -454,6 +458,55 @@ write_elem_page(Relation rel,
     pfree(ntup);
 }
 
+/* Wave 1 release-hardening (ADR-038 3K 잔여): pg_cuvs writes pgvector on-disk
+ * HNSW pages pinned to HNSW_VERSION=1 (stable across pgvector 0.5.0–0.8.x). Warn
+ * if the installed pgvector is outside that tested range — a future on-disk
+ * format bump could make exported indexes unreadable. Existence is enforced as
+ * an ERROR by the callers; this only adds the version-range WARNING. */
+static void
+cuvs_warn_pgvector_version(void)
+{
+    Oid          ext_oid = get_extension_oid("vector", true /* missing_ok */);
+    Relation     rel;
+    SysScanDesc  scan;
+    ScanKeyData  key;
+    HeapTuple    tup;
+
+    if (!OidIsValid(ext_oid))
+        return;   /* absence is handled (ERROR) by the callers */
+
+    rel = table_open(ExtensionRelationId, AccessShareLock);
+    ScanKeyInit(&key, Anum_pg_extension_oid, BTEqualStrategyNumber,
+                F_OIDEQ, ObjectIdGetDatum(ext_oid));
+    scan = systable_beginscan(rel, ExtensionOidIndexId, true, NULL, 1, &key);
+    tup = systable_getnext(scan);
+    if (HeapTupleIsValid(tup))
+    {
+        bool  isnull;
+        Datum d = heap_getattr(tup, Anum_pg_extension_extversion,
+                               RelationGetDescr(rel), &isnull);
+        if (!isnull)
+        {
+            char *ver = text_to_cstring(DatumGetTextPP(d));
+            int   major = -1, minor = -1;
+
+            /* known-good: pgvector 0.5.x – 0.8.x (HNSW_VERSION=1). */
+            if (sscanf(ver, "%d.%d", &major, &minor) == 2
+                && !(major == 0 && minor >= 5 && minor <= 8))
+                ereport(WARNING,
+                        (errmsg("pg_cuvs: pgvector %s is outside the tested range "
+                                "(0.5.x–0.8.x) for HNSW page export", ver),
+                         errhint("pg_cuvs writes pgvector HNSW_VERSION=1 on-disk pages; "
+                                 "a pgvector on-disk format change could make exported "
+                                 "indexes unreadable. Verify compatibility before "
+                                 "relying on this build.")));
+            pfree(ver);
+        }
+    }
+    systable_endscan(scan);
+    table_close(rel, AccessShareLock);
+}
+
 /* ================================================================
  * Main SQL function
  * ================================================================ */
@@ -476,6 +529,7 @@ fill_hnsw_from_hnswlib(Oid cagra_oid, Oid hnsw_oid, bool use_shm)
                     (errmsg("pg_cuvs: pgvector extension is not installed; "
                             "pg_cuvs_import_hnsw requires pgvector 0.5.0+"),
                      errhint("Run: CREATE EXTENSION vector;")));
+        cuvs_warn_pgvector_version();   /* Wave 1: version-range guard */
     }
 
     /* ---- 1. Open CAGRA source index to get db_oid, index_oid, dim ---- */
@@ -1226,6 +1280,7 @@ fill_hnsw_from_cagra_ipc(Oid cagra_oid, Oid hnsw_oid, const char *mode)
                     (errmsg("pg_cuvs: pgvector extension is not installed; "
                             "pg_cuvs_import_cagra requires pgvector 0.5.0+"),
                      errhint("Run: CREATE EXTENSION vector;")));
+        cuvs_warn_pgvector_version();   /* Wave 1: version-range guard */
     }
 
     /* ---- 1. Source CAGRA index: get dim ---- */

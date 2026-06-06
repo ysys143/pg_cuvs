@@ -1278,6 +1278,52 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     int64_t n_vecs    = 0;
     double  reltuples = 0.0;
 
+    /* Wave 1 release-hardening: build-time advisories (ADR-043 / OBJSTORE-03).
+     * Emitted once per CREATE INDEX / REINDEX; never force a change. */
+    {
+        /* (1) TOAST: a toastable vector column pays detoast overhead (~25-35%
+         * of build heap scan) when rows are large enough to be stored out-of-line.
+         * pgvector's `vector` default storage is EXTERNAL ('e'); EXTENDED ('x')
+         * also toasts. Only warn when the declared dimension is large enough that
+         * rows actually TOAST (~2KB) — small vectors stay inline regardless of
+         * storage class, so there is no detoast cost to avoid. Never force a change. */
+        AttrNumber heap_attno = indexInfo->ii_IndexAttrNumbers[0];
+        if (heap_attno >= 1)
+        {
+            Form_pg_attribute att =
+                TupleDescAttr(RelationGetDescr(heapRel), heap_attno - 1);
+            if (att->attstorage != 'p'   /* toastable (not PLAIN); vector default is 'e' */
+                && att->atttypmod > 0
+                && (int64) att->atttypmod * (int64) sizeof(float) >= 2000)
+                ereport(NOTICE,
+                        (errmsg("pg_cuvs: indexed column \"%s\" uses TOAST-able storage and "
+                                "toasts at this dimension; PLAIN storage avoids detoast "
+                                "overhead during build", NameStr(att->attname)),
+                         errhint("For vector-only tables: ALTER TABLE %s ALTER COLUMN %s "
+                                 "SET STORAGE PLAIN; VACUUM FULL; then rebuild. "
+                                 "See docs/best-practices.md.",
+                                 RelationGetRelationName(heapRel), NameStr(att->attname))));
+        }
+
+        /* (2) index_dir inside $PGDATA is copied wholesale by pg_basebackup
+         * (backup bloat + standby-provisioning cost). Locality is satisfied by
+         * any local volume, so a sibling dir OUTSIDE the PGDATA tree is preferred. */
+        {
+            const char *idir = cuvs_resolve_index_dir_rel(indexRel);
+            size_t dlen = (DataDir != NULL) ? strlen(DataDir) : 0;
+            if (idir != NULL && dlen > 0
+                && strncmp(idir, DataDir, dlen) == 0
+                && (idir[dlen] == '/' || idir[dlen] == '\0'))
+                ereport(WARNING,
+                        (errmsg("pg_cuvs: index_dir \"%s\" is inside the data directory; "
+                                "its artifacts will be included in pg_basebackup", idir),
+                         errhint("CAGRA artifacts are rebuildable and multi-GB. Place index_dir "
+                                 "in a sibling directory on the same local volume but OUTSIDE "
+                                 "$PGDATA (preserves locality, excludes from base backups). "
+                                 "See docs/best-practices.md and OPS_GPU_PLAYBOOK section 6.")));
+        }
+    }
+
     /* Scan the heap and build the CAGRA index on the daemon under this index's
      * own OID (shard_count / cpu_hnsw from GUCs). */
     cuvs_build_cagra_from_heap(heapRel, indexRel, indexInfo,

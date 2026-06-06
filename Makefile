@@ -15,7 +15,7 @@ EXTVERSION     = 0.1.0
 DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).

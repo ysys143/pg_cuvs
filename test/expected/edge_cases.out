@@ -237,6 +237,8 @@ SELECT g, (SELECT '[' || string_agg((((g+i)%10))::text, ',') || ']'
            FROM generate_series(1, 2000) i)::vector
 FROM generate_series(1, 20) g;
 CREATE INDEX ec_d2000_cagra ON ec_d2000 USING cagra (embedding vector_l2_ops);
+NOTICE:  pg_cuvs: indexed column "embedding" uses TOAST-able storage and toasts at this dimension; PLAIN storage avoids detoast overhead during build
+HINT:  For vector-only tables: ALTER TABLE ec_d2000 ALTER COLUMN embedding SET STORAGE PLAIN; VACUUM FULL; then rebuild. See docs/best-practices.md.
 SET enable_seqscan = off;
 SELECT count(*) AS dim2000_rows
 FROM (SELECT id FROM ec_d2000
