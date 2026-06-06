@@ -66,6 +66,16 @@ int  cuvs_corpus_resize(CuvsBuildCorpus *c, size_t new_bytes);
 void cuvs_corpus_close(CuvsBuildCorpus *c);
 
 /*
+ * Release this process's mapping/fd WITHOUT shm_unlink, returning the segment
+ * name (copied into `name_out`, size `name_len`) so another process can open it
+ * by name (§4A-2 parallel build: a worker hands its T2 partial to the leader,
+ * which opens + unlinks it after merge). Only meaningful for CORPUS_SHM; for
+ * memfd/heap there is no name to hand off — name_out is set "" and the segment
+ * is closed normally. Clears *c.
+ */
+void cuvs_corpus_detach(CuvsBuildCorpus *c, char *name_out, size_t name_len);
+
+/*
  * T2 reaper: scan /dev/shm for `pg_cuvs_bld_*` segments whose owner is dead
  * (no live flock holder) and, if do_unlink, shm_unlink them. Segments younger
  * than a few seconds are skipped (create-window race guard). Returns the number

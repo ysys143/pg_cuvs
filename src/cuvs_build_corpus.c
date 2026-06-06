@@ -218,6 +218,39 @@ cuvs_corpus_close(CuvsBuildCorpus *c)
     c->kind = CORPUS_NONE;
 }
 
+void
+cuvs_corpus_detach(CuvsBuildCorpus *c, char *name_out, size_t name_len)
+{
+    if (name_out != NULL && name_len > 0)
+        name_out[0] = '\0';
+
+    /* Hand off the name only for a named (T2) segment. */
+    if (c->kind == CORPUS_SHM && c->shm_name[0] != '\0'
+        && name_out != NULL && name_len > 0)
+    {
+        strncpy(name_out, c->shm_name, name_len - 1);
+        name_out[name_len - 1] = '\0';
+        /* drop our mapping/fd but keep the segment linked for the opener */
+        if (c->base != NULL)
+        {
+            munmap(c->base, c->map_bytes);
+            c->base = NULL;
+        }
+        if (c->fd >= 0)
+        {
+            close(c->fd);
+            c->fd = -1;
+        }
+        c->shm_name[0] = '\0';   /* not ours to unlink anymore */
+        c->map_bytes = 0;
+        c->kind = CORPUS_NONE;
+        return;
+    }
+
+    /* memfd/heap (or no name requested): nothing to hand off — close normally. */
+    cuvs_corpus_close(c);
+}
+
 /* ---- T2 reaper --------------------------------------------------------- */
 int
 cuvs_corpus_reap_orphans(int do_unlink)

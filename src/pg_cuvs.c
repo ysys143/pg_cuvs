@@ -28,6 +28,11 @@
 #include "access/tableam.h"
 #include "access/table.h"          /* table_open/table_close (Phase 3M) */
 #include "access/relation.h"       /* index_open/index_close (Phase 3M) */
+#include "access/parallel.h"       /* ParallelContext (ADR-034 §4A-2 parallel build) */
+#include "access/xact.h"           /* GetTransactionSnapshot (re-include safe) */
+#include "optimizer/optimizer.h"   /* plan_create_index_workers (§4A-2) */
+#include "storage/shm_toc.h"       /* shm_toc for the parallel DSM (§4A-2) */
+#include "utils/snapmgr.h"         /* SnapshotAny / RegisterSnapshot (§4A-2) */
 #include "access/genam.h"          /* try_index_open (ADR-045 index_dir reloption) */
 #include "access/reloptions.h"     /* CAGRA index_dir reloption (ADR-045) */
 #include "utils/array.h"           /* deconstruct_array, ARR_ELEMTYPE (Phase 3M) */
@@ -53,6 +58,7 @@
 
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock */
+#include <sys/mman.h>   /* shm_open/mmap (§4A-2 parallel partial merge) */
 #include <fcntl.h>      /* O_RDWR, O_CREAT */
 #include <unistd.h>     /* lseek, pread, pwrite, ftruncate, unlink */
 #include <dirent.h>     /* opendir/readdir (ADR-046 orphan GC) */
@@ -1219,6 +1225,309 @@ cuvs_build_callback(Relation index,
     bs->n_vecs++;
 }
 
+/* ================================================================
+ * ADR-034 §4A-2: parallel CAGRA build.
+ *
+ * Each participant (leader + workers) scans a DISJOINT share of the heap via a
+ * shared ParallelTableScanDesc into its own named-shm (T2) partial corpus
+ * ([vectors][tids]). After the workers finish, the leader concatenates all
+ * partials into a single memfd corpus (ADR-057) and hands it to the daemon.
+ *
+ * Correctness: CAGRA is order-independent and the daemon shards the corpus by
+ * POSITION with positional (vectors[i], tids[i]) pairing — so a plain concat
+ * (no sort) of per-worker partials, which preserves each pair, is equivalent to
+ * the single-process corpus. max_parallel_maintenance_workers = 0 keeps the
+ * single-process path (byte-identical).
+ * ================================================================ */
+#define PCUVS_KEY_SHARED   UINT64CONST(0xC5005001)
+#define PCUVS_KEY_SCAN     UINT64CONST(0xC5005002)
+
+typedef struct CuvsPartialSlot {
+    int64   n_vecs;          /* vectors this participant produced (0 = empty share) */
+    double  reltuples;       /* heap tuples it scanned (for pg_class stats) */
+    char    shm_name[64];    /* named-shm holding its [vecs][tids]; "" if empty */
+} CuvsPartialSlot;
+
+typedef struct ParallelCuvsShared {
+    Oid     heap_oid;
+    Oid     index_oid;
+    int     dim;
+    uint32  metric;
+    Size    cap_bytes;
+    int     nparticipants;   /* nworkers + 1 (leader slot is slots[nparticipants-1]) */
+    CuvsPartialSlot slots[FLEXIBLE_ARRAY_MEMBER];
+} ParallelCuvsShared;
+
+/* Scan a (parallel) share into a named-shm partial; record (n_vecs, reltuples,
+ * shm_name) into *slot. The segment is detached by name (the leader opens +
+ * unlinks it at merge). On error or empty share, no live segment is left. */
+static void
+cuvs_scan_shm_partial(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
+                      ParallelTableScanDesc pscan, int dim, uint32 metric,
+                      Size cap_bytes, CuvsPartialSlot *slot)
+{
+    CuvsBuildState bs;
+
+    slot->n_vecs = 0;
+    slot->reltuples = 0;
+    slot->shm_name[0] = '\0';
+
+    memset(&bs, 0, sizeof(bs));
+    bs.metric = metric;
+    bs.cap_bytes = cap_bytes;
+    bs.dim = dim;
+    bs.corpus.kind = CORPUS_HEAP;
+    bs.corpus.fd = -1;
+
+    /* The partial must be openable by name from the leader -> force the shm tier
+     * for this open only (restored immediately; corpus_open never longjmps). */
+    cuvs_corpus_force_kind("shm");
+    if (cuvs_corpus_open(&bs.corpus, (Size) 64 * dim * sizeof(float)) != 0
+        || bs.corpus.kind != CORPUS_SHM)
+    {
+        cuvs_corpus_force_kind(NULL);
+        if (bs.corpus.kind != CORPUS_NONE)
+            cuvs_corpus_close(&bs.corpus);
+        ereport(ERROR,
+                (errcode(ERRCODE_OUT_OF_MEMORY),
+                 errmsg("pg_cuvs: parallel build: shm partial unavailable: %m")));
+    }
+    cuvs_corpus_force_kind(NULL);
+    bs.vectors = (float *) bs.corpus.base;
+    bs.tids = (uint64_t *) malloc((Size) 64 * sizeof(uint64_t));
+    if (bs.tids == NULL)
+    {
+        cuvs_corpus_close(&bs.corpus);
+        ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+                        errmsg("pg_cuvs: out of memory (parallel TID buffer)")));
+    }
+    bs.n_allocated = 64;
+
+    PG_TRY();
+    {
+        /* table_index_build_scan needs a TableScanDesc; derive one from the
+         * shared parallel scan (it ends the scan internally). */
+        TableScanDesc scan = table_beginscan_parallel(heapRel, pscan);
+        bs.reltuples = table_index_build_scan(heapRel, indexRel, indexInfo,
+                                              true, true, cuvs_build_callback, &bs, scan);
+        slot->reltuples = bs.reltuples;
+        if (bs.n_vecs > 0)
+        {
+            Size vb = (Size) bs.n_vecs * dim * sizeof(float);
+            Size tb = (Size) bs.n_vecs * sizeof(uint64_t);
+            if (cuvs_corpus_resize(&bs.corpus, vb + tb) != 0)
+                ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+                                errmsg("pg_cuvs: parallel partial finalize: %m")));
+            memcpy((char *) bs.corpus.base + vb, bs.tids, tb);
+            slot->n_vecs = bs.n_vecs;
+            cuvs_corpus_detach(&bs.corpus, slot->shm_name, sizeof(slot->shm_name));
+        }
+        else
+        {
+            cuvs_corpus_close(&bs.corpus);   /* empty share: nothing to hand off */
+        }
+    }
+    PG_FINALLY();
+    {
+        if (bs.tids)
+            free(bs.tids);
+        /* On error before detach, the segment is still ours -> unlink it. */
+        if (bs.corpus.kind == CORPUS_SHM)
+            cuvs_corpus_close(&bs.corpus);
+    }
+    PG_END_TRY();
+}
+
+/* Parallel worker entry point (resolved by ParallelContext via library+name). */
+PGDLLEXPORT void cuvs_build_worker_main(dsm_segment *seg, shm_toc *toc);
+void
+cuvs_build_worker_main(dsm_segment *seg, shm_toc *toc)
+{
+    ParallelCuvsShared    *shared = shm_toc_lookup(toc, PCUVS_KEY_SHARED, false);
+    ParallelTableScanDesc  pscan  = shm_toc_lookup(toc, PCUVS_KEY_SCAN, false);
+    Relation   heapRel  = table_open(shared->heap_oid, ShareLock);
+    Relation   indexRel = index_open(shared->index_oid, AccessExclusiveLock);
+    IndexInfo *indexInfo = BuildIndexInfo(indexRel);
+
+    (void) seg;
+    cuvs_scan_shm_partial(heapRel, indexRel, indexInfo, pscan,
+                          shared->dim, shared->metric, shared->cap_bytes,
+                          &shared->slots[ParallelWorkerNumber]);
+
+    index_close(indexRel, AccessExclusiveLock);
+    table_close(heapRel, ShareLock);
+}
+
+/* Leader: run the build with `request_workers` parallel workers. Returns true if
+ * it handled the build (caller returns), false to fall back to single-process
+ * (e.g. DSM unavailable). Sets *out_n_vecs / *out_reltuples. */
+static bool
+cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
+                    uint32_t build_index_oid, uint32_t shard_count, bool use_cpu_hnsw,
+                    int dim, uint32 metric, Size cap_bytes, int request_workers,
+                    int64_t *out_n_vecs, double *out_reltuples)
+{
+    ParallelContext       *pcxt;
+    ParallelCuvsShared    *shared;
+    ParallelTableScanDesc  pscan;
+    Size       scan_sz, shared_sz;
+    int        nparticipants = request_workers + 1;   /* leader participates */
+    int        i;
+    CuvsPartialSlot *slots;
+    int64      total = 0;
+    double     reltuples = 0;
+    CuvsBuildCorpus final;
+    int        rc = CUVS_STATUS_OK;
+
+    EnterParallelMode();
+    pcxt = CreateParallelContext("pg_cuvs", "cuvs_build_worker_main", request_workers);
+
+    scan_sz   = table_parallelscan_estimate(heapRel, SnapshotAny);
+    shared_sz = offsetof(ParallelCuvsShared, slots)
+              + (Size) nparticipants * sizeof(CuvsPartialSlot);
+    shm_toc_estimate_chunk(&pcxt->estimator, shared_sz);
+    shm_toc_estimate_chunk(&pcxt->estimator, scan_sz);
+    shm_toc_estimate_keys(&pcxt->estimator, 2);
+
+    InitializeParallelDSM(pcxt);
+    if (pcxt->seg == NULL)
+    {
+        /* no DSM available -> caller falls back to single-process */
+        DestroyParallelContext(pcxt);
+        ExitParallelMode();
+        return false;
+    }
+
+    shared = shm_toc_allocate(pcxt->toc, shared_sz);
+    shared->heap_oid  = RelationGetRelid(heapRel);
+    shared->index_oid = RelationGetRelid(indexRel);
+    shared->dim       = dim;
+    shared->metric    = metric;
+    shared->cap_bytes = cap_bytes;
+    shared->nparticipants = nparticipants;
+    for (i = 0; i < nparticipants; i++)
+    {
+        shared->slots[i].n_vecs = 0;
+        shared->slots[i].reltuples = 0;
+        shared->slots[i].shm_name[0] = '\0';
+    }
+    shm_toc_insert(pcxt->toc, PCUVS_KEY_SHARED, shared);
+
+    pscan = shm_toc_allocate(pcxt->toc, scan_sz);
+    table_parallelscan_initialize(heapRel, pscan, SnapshotAny);
+    shm_toc_insert(pcxt->toc, PCUVS_KEY_SCAN, pscan);
+
+    LaunchParallelWorkers(pcxt);
+
+    /* Leader scans its own share into the last slot. */
+    cuvs_scan_shm_partial(heapRel, indexRel, indexInfo, pscan, dim, metric, cap_bytes,
+                          &shared->slots[nparticipants - 1]);
+
+    WaitForParallelWorkersToFinish(pcxt);
+
+    /* Copy results out of DSM (freed by DestroyParallelContext), then leave
+     * parallel mode before the daemon handoff. The partials persist by name. */
+    slots = (CuvsPartialSlot *) palloc(nparticipants * sizeof(CuvsPartialSlot));
+    memcpy(slots, shared->slots, nparticipants * sizeof(CuvsPartialSlot));
+    DestroyParallelContext(pcxt);
+    ExitParallelMode();
+
+    for (i = 0; i < nparticipants; i++)
+    {
+        total     += slots[i].n_vecs;
+        reltuples += slots[i].reltuples;
+    }
+    *out_n_vecs = total;
+    if (out_reltuples) *out_reltuples = reltuples;
+
+    if (total == 0)
+    {
+        pfree(slots);
+        return true;   /* empty table — nothing to build */
+    }
+
+    /* Merge: concat each partial's [vecs][tids] into one memfd corpus. */
+    {
+        Size vec_total = (Size) total * dim * sizeof(float);
+        Size tid_total = (Size) total * sizeof(uint64_t);
+
+        memset(&final, 0, sizeof(final));
+        final.kind = CORPUS_HEAP;
+        final.fd = -1;
+        if (cuvs_corpus_open(&final, vec_total + tid_total) != 0
+            || final.kind == CORPUS_HEAP)
+        {
+            if (final.kind != CORPUS_NONE)
+                cuvs_corpus_close(&final);
+            for (i = 0; i < nparticipants; i++)
+                if (slots[i].shm_name[0])
+                    shm_unlink(slots[i].shm_name);
+            pfree(slots);
+            ereport(ERROR,
+                    (errcode(ERRCODE_OUT_OF_MEMORY),
+                     errmsg("pg_cuvs: parallel build: merged corpus unavailable: %m")));
+        }
+
+        PG_TRY();
+        {
+            Size voff = 0, toff = 0;
+            for (i = 0; i < nparticipants; i++)
+            {
+                Size  pvb, ptb;
+                int   pfd;
+                void *pm;
+
+                if (slots[i].n_vecs == 0)
+                    continue;
+                pvb = (Size) slots[i].n_vecs * dim * sizeof(float);
+                ptb = (Size) slots[i].n_vecs * sizeof(uint64_t);
+                pfd = shm_open(slots[i].shm_name, O_RDONLY, 0);
+                if (pfd < 0)
+                    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                                    errmsg("pg_cuvs: parallel merge: open partial %s: %m",
+                                           slots[i].shm_name)));
+                pm = mmap(NULL, pvb + ptb, PROT_READ, MAP_SHARED, pfd, 0);
+                close(pfd);
+                if (pm == MAP_FAILED)
+                    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                                    errmsg("pg_cuvs: parallel merge: mmap partial: %m")));
+                memcpy((char *) final.base + voff, pm, pvb);
+                memcpy((char *) final.base + vec_total + toff, (char *) pm + pvb, ptb);
+                munmap(pm, pvb + ptb);
+                voff += pvb;
+                toff += ptb;
+            }
+
+            rc = cuvs_ipc_build(
+                cuvs_socket_path, (uint32_t) MyDatabaseId, build_index_oid,
+                &final, NULL, NULL, total, dim, metric,
+                cuvs_resolve_index_dir_rel(indexRel),
+                (uint32_t) RelationGetRelid(heapRel),
+                (uint32_t) heapRel->rd_rel->relfilenode,
+                shard_count, use_cpu_hnsw ? 1 : 0);
+
+            if (rc != CUVS_STATUS_OK)
+                ereport(ERROR,
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("pg_cuvs: BUILD failed (status %d); CREATE INDEX "
+                                "aborted to preserve catalog durability", rc),
+                         errhint("Check pg_cuvs_server journal (journalctl -u "
+                                 "pg-cuvs-server).")));
+        }
+        PG_FINALLY();
+        {
+            cuvs_corpus_close(&final);
+            for (i = 0; i < nparticipants; i++)
+                if (slots[i].shm_name[0])
+                    shm_unlink(slots[i].shm_name);
+        }
+        PG_END_TRY();
+    }
+
+    pfree(slots);
+    return true;
+}
+
 /* ----------------------------------------------------------------
  * Phase 3K: shared heap-scan + CAGRA build.
  *
@@ -1272,6 +1581,23 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                      errhint("Raise cuvs.max_build_mem_mb (hard cap) or "
                              "cuvs.build_mem_safety_ratio, shard the table, or see "
                              "docs/playbooks/large-dataset-benchmark.md.")));
+    }
+
+    /* ADR-034 §4A-2: parallelize the heap scan + detoast across maintenance
+     * workers when the planner grants any (respects max_parallel_maintenance_
+     * workers + table size). Skipped for CONCURRENTLY (snapshot handling) and
+     * undeclared-dim columns. When the parallel path runs it does the whole
+     * build (scan -> merge -> daemon) and we return; it falls back to the
+     * single-process path below only if DSM is unavailable. */
+    if (typmod > 0 && !indexInfo->ii_Concurrent)
+    {
+        int nworkers = plan_create_index_workers(RelationGetRelid(heapRel),
+                                                 RelationGetRelid(indexRel));
+        if (nworkers > 0
+            && cuvs_build_parallel(heapRel, indexRel, indexInfo, build_index_oid,
+                                   shard_count, use_cpu_hnsw, typmod, bs.metric,
+                                   bs.cap_bytes, nworkers, out_n_vecs, out_reltuples))
+            return;
     }
 
     /* ADR-057: when the column has a declared dimension (vector(N), the common
