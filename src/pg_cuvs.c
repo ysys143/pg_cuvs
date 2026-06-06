@@ -1275,6 +1275,18 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
         if (cuvs_build_shm_create(&bs.shm,
                                   (size_t) init_rows * (size_t) typmod * sizeof(float)) == 0)
         {
+            /* Pre-sizing n_allocated means grow_build_buffers will not fire for
+             * the first init_rows tuples, so the heap TID buffer (grown there in
+             * the legacy path) must be allocated up front too — otherwise the
+             * callback writes through a NULL bs.tids. */
+            bs.tids = (uint64_t *) malloc((size_t) init_rows * sizeof(uint64_t));
+            if (bs.tids == NULL)
+            {
+                cuvs_build_shm_destroy(&bs.shm);   /* don't leak the segment */
+                ereport(ERROR,
+                        (errcode(ERRCODE_OUT_OF_MEMORY),
+                         errmsg("pg_cuvs: out of memory allocating build TID buffer")));
+            }
             bs.use_shm     = true;
             bs.dim         = typmod;            /* declared dim; callback rechecks per row */
             bs.vectors     = (float *) bs.shm.base;
