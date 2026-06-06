@@ -24,15 +24,18 @@ build_shm_key(char *key, size_t keylen)
 int
 cuvs_build_shm_create(CuvsBuildShm *sh, size_t bytes)
 {
+    char  key[64];
+    int   fd;
+    void *mem;
+
     sh->fd = -1;
     sh->base = NULL;
     sh->key[0] = '\0';
     sh->map_bytes = 0;
 
-    char key[64];
     build_shm_key(key, sizeof(key));
 
-    int fd = shm_open(key, O_CREAT | O_RDWR, 0666);
+    fd = shm_open(key, O_CREAT | O_RDWR, 0666);
     if (fd < 0)
         return -1;
 
@@ -48,7 +51,7 @@ cuvs_build_shm_create(CuvsBuildShm *sh, size_t bytes)
         return -1;
     }
 
-    void *mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    mem = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mem == MAP_FAILED)
     {
         int e = errno;
@@ -69,6 +72,8 @@ cuvs_build_shm_create(CuvsBuildShm *sh, size_t bytes)
 int
 cuvs_build_shm_resize(CuvsBuildShm *sh, size_t new_bytes)
 {
+    void *mem;
+
     if (sh->fd < 0)
     {
         errno = EINVAL;
@@ -90,7 +95,7 @@ cuvs_build_shm_resize(CuvsBuildShm *sh, size_t new_bytes)
     if (ftruncate(sh->fd, (off_t) new_bytes) < 0)
         return -1;  /* errno set; segment exists at old size; destroy() still cleans up */
 
-    void *mem = mmap(NULL, new_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, sh->fd, 0);
+    mem = mmap(NULL, new_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, sh->fd, 0);
     if (mem == MAP_FAILED)
         return -1;  /* errno set; no mapping; destroy() still closes+unlinks */
 
