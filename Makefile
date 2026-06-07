@@ -15,7 +15,7 @@ EXTVERSION     = 0.1.0
 DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Isolation tests (pg_isolation_regress) for concurrent-session correctness that
