@@ -125,11 +125,21 @@ not PostgreSQL WAL records. They are fsynced and validated, but they are not
 atomically logged with heap changes in the same way as native PostgreSQL index
 pages.
 
-### It does not guarantee exact nearest-neighbor top-k
+### It does not claim the default CAGRA path is exact
 
-CAGRA is an approximate nearest-neighbor structure. pg_cuvs protects database
-visibility and failure semantics; it does not turn approximate ANN into exact
-search. Recall must be measured and tuned.
+The default `search_mode='cagra'` path is an approximate nearest-neighbor
+structure; its recall must be measured and tuned. pg_cuvs does **not** turn that
+approximate CAGRA path into exact search.
+
+It does, however, ship an **exact** GPU search path: `search_mode='brute_force'`
+(3L/ADR-039) returns recall=1.0, exact even at `bf_precision='float16'`. Exactness
+is therefore a real, shippable property of the brute-force path — just not of
+CAGRA. At small N the planner can auto-select brute-force because it is both
+exact and cheaper than CAGRA ANN; for filtered/selective queries, brute-force
+over the filtered subset is exact and cost-effective (no graph build; work
+bounded by the filter), which is the basis of the ADR-061 exact-filtered wedge.
+CAGRA remains the choice for large unfiltered corpora where O(N) brute-force
+search is too costly.
 
 ### It does not make cuVS transactional
 
@@ -160,7 +170,8 @@ PostgreSQL mechanism. pg_cuvs snapshots are warmup caches, not database backup.
 | DELETE correctness | Mixed | Wrong-row prevention strong; recall remains conditional |
 | Multi-GPU logical index behavior | Strong | 2x A100 hardware acceptance passed |
 | GCS snapshot/warmup | Strong after real bucket verification | Real GCS round-trip exposed and fixed 3C bugs |
-| Exact ANN recall | Not guaranteed | Benchmark/parameter problem, not DB semantics |
+| Exact recall (brute-force mode) | Guaranteed | `search_mode='brute_force'`, recall=1.0 (3L/ADR-039), exact at fp16; O(N) search, cheapest when N small or filtered/selective |
+| Exact recall (CAGRA default path) | Not guaranteed | Approximate ANN; recall measured/tuned |
 | Native PostgreSQL index equivalence | Not claimed | Derived accelerator, not WAL-logged mutable index |
 
 ## Differentiation
@@ -173,6 +184,8 @@ The differentiator is the combination:
 - PostgreSQL remains the query, transaction, and data-control plane.
 - pgvector-compatible SQL surface is preserved.
 - cuVS is used for high-cost candidate generation.
+- exact GPU search on demand (`search_mode='brute_force'`, recall=1.0) alongside
+  approximate CAGRA, with the planner choosing by cost at small N.
 - database failure modes are explicit: fallback, ERROR, or fail-closed, rather
   than silent stale/partial GPU results.
 - multi-GPU sharding is hidden behind one PostgreSQL index.
@@ -201,6 +214,13 @@ or:
 PostgreSQL remains the source of truth; cuVS provides GPU candidate generation.
 ```
 
+or, where it is true (brute-force path):
+
+```text
+exact GPU vector search via brute-force mode (recall=1.0); for small-N or
+filtered/selective queries it is exact and cheaper than approximate CAGRA.
+```
+
 Avoid:
 
 ```text
@@ -208,13 +228,17 @@ cuVS as a transactional database
 ```
 
 ```text
-exact GPU vector search for PostgreSQL
-```
-
-```text
 drop-in PostgreSQL native index equivalence
 ```
 
-Those claims overstate the current design. The honest claim is stronger: pg_cuvs
-is valuable because it explicitly respects the boundary between PostgreSQL's
-database semantics and cuVS's GPU ANN primitives.
+```text
+the default CAGRA path is exact (it is approximate; only brute-force mode is exact)
+```
+
+Both remaining "Avoid" claims overstate the current design. But a blanket "no
+exact GPU search" is itself wrong: brute-force mode (`search_mode='brute_force'`,
+3L/ADR-039) delivers exact GPU search, and is the cost-effective exact path for
+small-N and filtered/selective workloads (the ADR-061 wedge). The honest claim is
+stronger: pg_cuvs respects the PostgreSQL/cuVS boundary AND offers exact GPU
+search where it is cheap to do so, while being clear that the default CAGRA path
+is approximate.

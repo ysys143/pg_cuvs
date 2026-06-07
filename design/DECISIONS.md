@@ -2241,9 +2241,10 @@ GPU에 넘겨 brute-force exact top-k. killer app = **멀티테넌트 SaaS RAG**
 - 3A/3Q는 cuVS `tiered_index` 네이티브화 검토.
 
 **미해결 쟁점**:
-- **포지셔닝 충돌(E)**: `PROJECT_POSITIONING.md`가 "exact GPU vector search"를 Avoid 메시징으로 명시. 해소 방향 =
-  "**고선택성 필터 경로에 한해 exact**, 그 외는 근사 ANN"으로 한정(무조건적 exact 주장은 여전히 Avoid). D 채택 시
-  PROJECT_POSITIONING에 단서 추가 필요(현재 미반영).
+- ~~**포지셔닝 충돌(E)**~~ **해소됨(2026-06-07)**: `PROJECT_POSITIONING.md`의 "exact GPU vector search" Avoid 문구는
+  **stale이었음** — pg_cuvs는 3L(ADR-039)에서 이미 `search_mode='brute_force'` exact 검색(recall=1.0, fp16에서도
+  exact, 소규모 N에선 CAGRA보다 저렴해 planner 자동선택)을 출하했다. Avoid에서 제거하고 BF=exact / CAGRA-default=근사로
+  분리, 메시징을 scoped Prefer로 교정. 경계: BF는 무필터 대규모 N에선 O(N)이라 "소규모/필터·선택적에서 exact+저렴"으로 한정.
 - D 확장판(host backing + VRAM 파티션 LRU 캐시)의 PCIe 예산 현실성, 저선택성↔graph 분기 임계값 추정.
 - tiered_index가 `.delta` 머신을 어디까지 대체하나(별도 스파이크).
 - PG plumbing: `WHERE + ORDER BY <-> LIMIT`을 filter→brute-force 경로로 라우팅(custom scan/bitmap 소비).

@@ -18,8 +18,8 @@
 | A | 분모: 벡터당 vs 쿼리당 비용 | 어느 분모에 지배되는 워크로드냐가 CPU/GPU를 가른다 | 프레임 확정 |
 | B | 메모리 계층 절벽 | GPU는 VRAM→PCIe 절벽, spill 계층 없음 = 규모 약점의 *근본* 원인 | 프레임 확정 |
 | C | 알고리즘은 하드웨어 종속 | 필터 검색 최적해가 CPU(graph traversal)와 GPU(brute-force)에서 다름 | 핵심 통찰 |
-| D | exact filtered brute-force wedge | C+B의 합성. 3O·3P를 동시 흡수하는 후보 | **검증 필요** |
-| E | 포지셔닝 충돌 | 기존 문서가 "exact GPU search"를 Avoid로 못박음 ↔ D의 클레임 | **해소 필요** |
+| D | exact filtered brute-force wedge | C+B의 합성. 3O·3P를 동시 흡수하는 후보 | **검증됨 (cuVS API, 2026-06-07)** |
+| E | 포지셔닝 충돌 | 기존 문서가 "exact GPU search"를 Avoid로 못박음 ↔ D의 클레임 | **해소됨 (2026-06-07)** |
 | F | 작업 우선순위 재평가 | north-star / 3O / 3P / 3A·3Q / D / GPU-native pipeline | 잠정 |
 
 ---
@@ -96,20 +96,26 @@ VM 헤더 조사 중 `cuvs/neighbors/tiered_index.h` 발견. **pg_cuvs가 `.delt
 
 ---
 
-## E. 포지셔닝 충돌 (해소 필요)
+## E. 포지셔닝 충돌 (해소됨 2026-06-07)
 
-`PROJECT_POSITIONING.md`는 메시징에서 다음을 **Avoid로 명시**한다:
-- line 211: "exact GPU vector search for PostgreSQL"
-- line 128-132: "It does not guarantee exact nearest-neighbor top-k" (CAGRA = 근사)
+`PROJECT_POSITIONING.md`가 "exact GPU vector search for PostgreSQL"를 **Avoid 메시징**으로,
+"It does not guarantee exact nearest-neighbor top-k"를 명시했다. 그런데 D의 클레임은 "**exact**
+filtered vector search at GPU speed" — 충돌처럼 보였다.
 
-그런데 D의 클레임은 "**exact** filtered vector search at GPU speed".
+**핵심 발견**: Avoid 문구가 **stale**이었다. pg_cuvs는 이미 **3L(ADR-039)에서 GPU exact brute-force
+검색을 출하**했다 — `search_mode='brute_force'`, recall=1.0(fp16에서도 exact). ADR-039는 *"N이 작을수록
+CAGRA ANN보다 저렴 → planner 자동 선택"*까지 적어, "bf가 더 싸고 정확"이 이미 설계에 있다. 즉 Avoid는
+*이미 가진 기능을 부정*하던 문서 버그였다(CAGRA-중심 시각으로 BF 모드를 메시징에서 누락).
 
-**해소 방향 (잠정)**: 둘은 *다른 경로에 대한 진술*이라 양립 가능하다 —
-- CAGRA(무필터/저선택성 graph 경로) = 근사, "exact 아님"은 그 경로에 대해 여전히 참.
-- filter→brute-force(고선택성 경로) = exact. 이건 brute-force라 진짜 exact.
-- 따라서 정직한 클레임은 "**고선택성 필터 쿼리에 한해 exact**, 그 외 경로는 근사 ANN". 무조건 "exact GPU search"는 여전히 과장 → Avoid 유지.
+**교정 (PROJECT_POSITIONING.md, 2026-06-07 반영)**:
+- "does not guarantee exact" 절 → **default CAGRA 경로는 근사**로 한정 + **BF 모드는 exact**(3L/ADR-039) 명시.
+- assurance 표 → "Exact recall (brute-force mode) = Guaranteed" / "(CAGRA default) = Not guaranteed" 2행 분리.
+- 메시징: Avoid에서 "exact GPU vector search" 제거 → Prefer에 scoped 클레임 추가
+  ("BF 모드 exact, 소규모/필터·선택적에서 CAGRA보다 싸고 정확"). 새 Avoid = "default CAGRA가 exact다"(이건 거짓).
+- Differentiation에 "exact GPU search on demand(BF) + planner 비용 선택" 1행 추가.
 
-**TODO**: D를 채택하면 PROJECT_POSITIONING.md에 "selective filtered 경로는 exact" 단서를 추가하고 Avoid 문구를 "무조건적 exact 주장"으로 한정. (지금은 노트로만, 미반영.)
+**정직성 경계 (새 overclaim 방지)**: BF는 무필터 대규모 N에선 O(N)이라 CAGRA보다 비싸다. 그래서 "항상 더 싸다"가
+아니라 **"소규모/필터·선택적 쿼리에서 exact이면서 더 싸다"**로 한정 — ADR-039 planner 자동선택 임계가 그 경계.
 
 ---
 
@@ -132,4 +138,4 @@ VM 헤더 조사 중 `cuvs/neighbors/tiered_index.h` 발견. **pg_cuvs가 `.delt
 2. **다음 한 수**:
    - (a) **cuVS API 검증 스파이크** — **완료 (2026-06-07).** D 실현 가능 확정(brute-force+BITSET prefilter), tiered_index 보너스 발견.
    - (b) **전략 ADR 승격** — **완료 → ADR-061** (A·B·C·D·E + 스파이크 결과). 다음 세션의 "3P가 핵심" 잘못된 출발 차단.
-3. **미해결 (ADR-061 "미해결 쟁점"으로 이관)**: E(포지셔닝 충돌) 반영, D 확장판 LRU 파티션 캐시 PCIe 예산, 저선택성 임계값 추정, tiered_index가 `.delta`를 어디까지 대체하나(별도 스파이크).
+3. **미해결 (ADR-061 "미해결 쟁점")**: ~~E(포지셔닝 충돌)~~ **해소됨(PROJECT_POSITIONING 교정)**. 남은 것: D 확장판 LRU 파티션 캐시 PCIe 예산, 저선택성 임계값 추정, tiered_index가 `.delta`를 어디까지 대체하나(별도 스파이크), D near-term PoC(VRAM 상주 + BITSET prefilter).
