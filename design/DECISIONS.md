@@ -2242,9 +2242,10 @@ GPU에 넘겨 brute-force exact top-k. killer app = **멀티테넌트 SaaS RAG**
 - **온라인 대용량 = 파티션 pruning + 기존 LRU** (정련, 스파이크 검증 2026-06-07): tenant LIST/RANGE 파티션 →
   `WHERE tenant=X` planner pruning → 작은 파티션 인덱스 → 데몬 기존 LRU(3D cold registry + eviction)가 VRAM 캐시로
   동작. 스파이크 실증: pruning이 단일 인덱스 스캔(Append 없음, GPU==CPU exact), `--max-vram-mb 4`에서 2/6 상주 +
-  cold reload 정합 유지, 캐시-미스 꼬리 ~13–15ms vs hot <0.5ms. **새 아키텍처 0줄** — 온라인-스케일 모델이 기존
-  코드로 작동함을 확인. 갭: tenant-pruning recipe/test 없음, MAX_INDEXES=64·cold registry @ 수천 테넌트 미검증,
-  꼬리지연 @ 현실 인덱스 크기 미측정(north-star가 갚음).
+  cold reload 정합 유지. **단 범위는 ≤64 활성 파티션** — recipe+회귀테스트 정식화 완료(#32), 스케일 측정(2026-06-08):
+  **`MAX_INDEXES=64`가 하드월**(130 파티션 → 64만 resident=슬롯캡, VRAM 아님; 축출 파티션 쿼리는 ERROR+REINDEX 필요,
+  런타임 슬롯-캡 축출은 auto-reload 안 됨), 현실크기 캐시-미스 꼬리 **~750ms/122MB**(~150MB/s, GB급은 수 초; north-star가 깎음).
+  → 수백+ 테넌트 온라인은 **선결: MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload 배선**(ROADMAP 백로그). 상세 STRATEGY_NOTES §G.
 - **3A는 완료(ADR-047)** — `.delta` pending-delta 동작 중, 미완 아님. **3Q(미래)**의 streaming updates
   (`cuvsCagraExtend/Merge`)에 대해 cuVS `tiered_index`(base ANN + bfknn 버퍼 + 자동 compaction)가 네이티브 구현
   후보. 3A의 `.delta`를 tiered_index로 이관하는 건 선택적 미래 리팩터(갭 아님).
@@ -2254,8 +2255,8 @@ GPU에 넘겨 brute-force exact top-k. killer app = **멀티테넌트 SaaS RAG**
   **stale이었음** — pg_cuvs는 3L(ADR-039)에서 이미 `search_mode='brute_force'` exact 검색(recall=1.0, fp16에서도
   exact, 소규모 N에선 CAGRA보다 저렴해 planner 자동선택)을 출하했다. Avoid에서 제거하고 BF=exact / CAGRA-default=근사로
   분리, 메시징을 scoped Prefer로 교정. 경계: BF는 무필터 대규모 N에선 O(N)이라 "소규모/필터·선택적에서 exact+저렴"으로 한정.
-- 온라인-스케일 파티션 갭(스파이크는 작동 확인, 정식화 미완): tenant-pruning recipe/test 부재(`multigpu-partition-recipe.sql`은
-  hash-on-id라 prune 불가 — 다른 패턴), `MAX_INDEXES=64`·cold registry @ 수천 테넌트 미검증, 캐시-미스 꼬리 @ 현실 인덱스 크기.
+- ~~온라인-스케일 파티션 갭~~ **정식화·측정 완료(2026-06-08)**: recipe+회귀테스트(#32), MAX_INDEXES=64 하드월 특성화, 캐시-미스
+  ~750ms/122MB 측정. **잔여 = 백로그**(MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload). 정확한 64 vs 128 경계 + PG planning @ 많은 파티션은 미특성화.
 - D 확장판(host backing + VRAM 파티션 LRU 캐시)의 PCIe 예산 현실성, 저선택성↔graph 분기 임계값 추정.
 - tiered_index가 `.delta` 머신을 어디까지 대체하나(3Q 후보, 별도 스파이크).
 - PG plumbing: `WHERE + ORDER BY <-> LIMIT`을 filter→brute-force 경로로 라우팅(custom scan/bitmap 소비).
