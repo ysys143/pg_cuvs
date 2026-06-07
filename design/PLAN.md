@@ -1269,6 +1269,12 @@ cuVS bitset API가 필요해 멀티세션·고위험. 저비용 대안 **접근 
 
 ## Phase 3S — statement_timeout / 취소 전파
 
+**상태: 구현·검증 완료 (2026-06-07, ADR-053).** backend의 reply 대기를 `recv_all_interruptible`(poll 250ms 슬라이스 +
+wait 콜백)로 인터럽트 가능하게 만들어 `statement_timeout`/cancel이 걸린 GPU 검색을 ~544ms에 끊는다(이전 무기한).
+콜백은 longjmp 없이 `QueryCancelPending`/`ProcDiePending`만 검사, PG 호출자가 `CHECK_FOR_INTERRUPTS`로 raise.
+데몬은 `signal(SIGPIPE, SIG_IGN)`로 client mid-reply disconnect에서 생존(기존 잠재 크래시 버그도 해소). `CUVS_OP_CANCEL`
+미도입(소켓 close로 충분). integration sc24 + installcheck 17/17 GREEN. 상세·정정은 ADR-053. (아래는 원안.)
+
 목표: PG의 `statement_timeout` 및 `pg_cancel_backend()`가 daemon IPC로 전파되도록 한다. GPU 검색이 걸려도 backend가 timeout 이후 무기한 대기하지 않아 연결 고갈을 방지한다. (ADR-053)
 
 ### 구현 항목
