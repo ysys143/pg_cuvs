@@ -156,11 +156,23 @@ void _PG_init(void);
  * DROP would destroy a still-live index's artifacts) — instead we record the
  * dropped index OIDs and fire cuvs_ipc_drop only when the transaction COMMITS.
  * Daemon-down at commit is non-fatal: WARNING, and cleanup falls to a restart.
- * (Known edge: a DROP inside a rolled-back SAVEPOINT is still recorded; same
- * REINDEX recovery as the daemon-down case.)
+ *
+ * ADR-060: each pending DROP remembers the subtransaction that observed it, and
+ * a SubXactCallback discards drops whose subxact rolled back (ROLLBACK TO
+ * savepoint) and reparents drops whose subxact committed. So
+ * `SAVEPOINT s; DROP INDEX i; ROLLBACK TO s; COMMIT;` leaves i's artifacts
+ * intact — matching PostgreSQL's own transactional outcome (i survives).
  * ---------------------------------------------------------------- */
 static object_access_hook_type prev_object_access_hook = NULL;
-static List *cuvs_pending_drops = NIL;   /* index OIDs, allocated in TopMemoryContext */
+
+/* A pending DROP and the subtransaction that observed it (ADR-060). */
+typedef struct CuvsPendingDrop
+{
+    Oid              oid;
+    SubTransactionId subid;
+} CuvsPendingDrop;
+
+static List *cuvs_pending_drops = NIL;   /* of CuvsPendingDrop*, in TopMemoryContext */
 
 static void
 cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
@@ -180,7 +192,10 @@ cuvs_object_access(ObjectAccessType access, Oid classId, Oid objectId,
                 OidIsValid(cf->relam))
             {
                 MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
-                cuvs_pending_drops = lappend_oid(cuvs_pending_drops, objectId);
+                CuvsPendingDrop *pd = (CuvsPendingDrop *) palloc(sizeof(CuvsPendingDrop));
+                pd->oid   = objectId;
+                pd->subid = GetCurrentSubTransactionId();
+                cuvs_pending_drops = lappend(cuvs_pending_drops, pd);
                 MemoryContextSwitchTo(old);
             }
             ReleaseSysCache(tup);
@@ -199,13 +214,13 @@ cuvs_xact_callback(XactEvent event, void *arg)
         ListCell *lc;
         foreach(lc, cuvs_pending_drops)
         {
-            Oid ioid = lfirst_oid(lc);
+            CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
             int rc = cuvs_ipc_drop(cuvs_socket_path,
-                                   (uint32_t) MyDatabaseId, (uint32_t) ioid);
+                                   (uint32_t) MyDatabaseId, (uint32_t) pd->oid);
             if (rc != CUVS_STATUS_OK)
                 ereport(WARNING,
                         (errmsg("pg_cuvs: daemon DROP-notify failed for index %u (status %d)",
-                                ioid, rc),
+                                pd->oid, rc),
                          errhint("GPU VRAM/artifacts for the dropped index may persist; "
                                  "a daemon restart will NOT clean them (it reloads them as "
                                  "zombies). Run SELECT pg_cuvs_gc_orphans(true); to reclaim "
@@ -217,8 +232,45 @@ cuvs_xact_callback(XactEvent event, void *arg)
     if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT ||
         event == XACT_EVENT_PREPARE)
     {
-        list_free(cuvs_pending_drops);
+        list_free_deep(cuvs_pending_drops);   /* frees the CuvsPendingDrop structs too */
         cuvs_pending_drops = NIL;
+    }
+}
+
+/* ADR-060: a DROP collected inside a subtransaction follows that subxact's fate.
+ * On ABORT (ROLLBACK TO savepoint, error rollback of a subxact) discard its
+ * drops — the index is still live. On COMMIT (RELEASE SAVEPOINT) reparent its
+ * drops to the parent subxact so they survive until the parent resolves; only a
+ * fully-committed top transaction fires cuvs_ipc_drop. */
+static void
+cuvs_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+                      SubTransactionId parentSubid, void *arg)
+{
+    ListCell *lc;
+
+    if (cuvs_pending_drops == NIL)
+        return;
+
+    if (event == SUBXACT_EVENT_ABORT_SUB)
+    {
+        foreach(lc, cuvs_pending_drops)
+        {
+            CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
+            if (pd->subid == mySubid)
+            {
+                pfree(pd);
+                cuvs_pending_drops = foreach_delete_current(cuvs_pending_drops, lc);
+            }
+        }
+    }
+    else if (event == SUBXACT_EVENT_COMMIT_SUB)
+    {
+        foreach(lc, cuvs_pending_drops)
+        {
+            CuvsPendingDrop *pd = (CuvsPendingDrop *) lfirst(lc);
+            if (pd->subid == mySubid)
+                pd->subid = parentSubid;   /* drop now owned by the parent subxact */
+        }
     }
 }
 
@@ -560,6 +612,7 @@ _PG_init(void)
     prev_object_access_hook = object_access_hook;
     object_access_hook = cuvs_object_access;
     RegisterXactCallback(cuvs_xact_callback, NULL);
+    RegisterSubXactCallback(cuvs_subxact_callback, NULL);  /* ADR-060 */
 
     /* ADR-057: test seam — CUVS_FORCE_CORPUS=memfd|shm|heap pins the build tier
      * for every backend (inherited from the postmaster env). Unset => auto. Used
