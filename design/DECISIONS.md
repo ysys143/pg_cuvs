@@ -2197,3 +2197,57 @@ ADR-057 flock reaper backstop(누수 클래스 불변 — 노출 시간만 김).
 - **wall-clock 천장**: GPU build(~33s)가 빌드를 지배 → 어떤 backend 최적화도 wall-clock을 ~33s 밑으로 못 내림.
   ADR-059의 가치는 north-star(backend 오버헤드·peak RSS 제거)이지 wall-clock이 아니다.
 
+---
+
+## ADR-061 — 전략 포지셔닝: 쿼리당-비용 세그먼트 + exact filtered brute-force wedge
+
+**날짜**: 2026-06-07
+**상태**: 전략 방향 채택 (구현 미착수). 상세 분석·쟁점은 [design/STRATEGY_NOTES.md](STRATEGY_NOTES.md).
+
+**배경**: 경쟁 데이터(VectorChord 0.4 / 3B 사례)가 그동안의 암묵적 전제 "cuVS 핵심가치 = 대규모 → 3P(IVF-PQ)가
+로드맵 핵심"을 깼다. VectorChord는 **32억 벡터를 GPU 없이 CPU+NVMe로 월 $12k**(p50 761ms, top-500)에 서빙하며
+"in-memory/GPU의 막대한 비용 회피"를 명시한다. 즉 *규모만으로는 GPU가 정당화되지 않으며*, 저장-바운드 규모는
+CPU+디스크가 비용으로 구조적으로 이긴다.
+
+**결정 (전략 방향)**: 아래 세 렌즈로 pg_cuvs를 재포지셔닝하고, 그에 따라 우선순위를 조정한다.
+
+1. **분모(A)**: 워크로드는 *벡터당 비용*(아카이브/배치 → CPU+디스크) 또는 *쿼리당 비용*(온라인 RAG/추천, 높은 QPS·
+   저지연 → GPU)에 지배된다. **pg_cuvs는 쿼리당-비용 지배 세그먼트만 표적한다.** 거대-corpus-저비용은 쫓지 않는다.
+2. **메모리 계층(B)**: GPU는 VRAM→PCIe 절벽(~80×)으로 우아한 spill이 없다. 이게 규모 약점의 *근본*이며, 3P조차
+   못 없앤다. CPU+디스크의 매끄러운 비용 경사(RAM→NVMe→S3)를 GPU는 갖지 못한다.
+3. **알고리즘은 하드웨어 종속(C)**: 필터 검색의 최적해가 다르다. CPU는 brute-force가 비싸 graph-traversal-with-filter
+   (ACORN/bit-vector graph scan)를 쓴다. **GPU는 brute-force가 거의 공짜라 filter→brute-force가 지배**하며, 이는
+   **exact(recall=1.0)**라 ACORN의 연결성/recall 문제가 애초에 없다. pg_cuvs는 VectorChord의 prefilter를 베끼지
+   말고 GPU-네이티브 exact filtered brute-force를 해야 한다.
+
+**채택 wedge (D)**: **exact filtered brute-force.** 고선택성 `WHERE` + 벡터 검색에서 PG가 평가한 필터를 bitset으로
+GPU에 넘겨 brute-force exact top-k. killer app = **멀티테넌트 SaaS RAG**(테넌트당 데이터 작음, 항상 `tenant_id`
+필터, 높은 QPS = 쿼리당-비용 지배). 전체 corpus가 수십억이어도 GPU는 필터된 부분만 들고 exact·sub-ms.
+
+**근거 (cuVS 26.04 헤더 스파이크, 2026-06-07, VM cuvs_dev)**:
+- `cuvsBruteForceSearch(..., cuvsFilter prefilter)` 네이티브 지원(`brute_force.h:148`). `cuvsFilter={addr,type}`,
+  `type∈{NO_FILTER,BITSET,BITMAP}`(`common.h:23-39`). **BITSET(1D row-allow)이 WHERE-필터에 정확히 맞음.**
+  CAGRA/IVF-Flat/IVF-PQ도 `cuvsFilter` 지원 → 저선택성은 CAGRA+filter(근사)로 분기. bitset 빌더 C API는 없어
+  DLManagedTensor(packed bits)로 우리가 구성(소항목).
+- 보너스: `cuvs/neighbors/tiered_index.h`(base ANN + incremental **bfknn** 버퍼 + 자동 compaction) +
+  `cuvsCagraExtend/Merge` 확인. **3A/3Q(`.delta`)의 네이티브 대체 후보**이자 D와 같은 brute-force 메커니즘으로 수렴.
+
+**우선순위 조정**:
+- north-star(빌드/H2D 오버헤드) = **해자 1순위 유지** (빌드 속도 = GPU의 베끼기 어려운 edge; 4A/ADR-059가 옳았음).
+- **D = 신규 1순위 후보** (해자 + 차별화 클레임 + killer app, 빌드 부담 낮음). 3O(ADR-048)를 흡수 — D가 3O의
+  GPU-네이티브 정답 버전.
+- **3P(ADR-049) 우선순위 하락**: "규모 핵심"이 아니라 "VRAM working-set 천장 올리기"로 재정의. 압축 품질은
+  RaBitQ에 짐. selectivity로 규모를 다르게 푸는 D가 필터 워크로드엔 우월.
+- 3A/3Q는 cuVS `tiered_index` 네이티브화 검토.
+
+**미해결 쟁점**:
+- **포지셔닝 충돌(E)**: `PROJECT_POSITIONING.md`가 "exact GPU vector search"를 Avoid 메시징으로 명시. 해소 방향 =
+  "**고선택성 필터 경로에 한해 exact**, 그 외는 근사 ANN"으로 한정(무조건적 exact 주장은 여전히 Avoid). D 채택 시
+  PROJECT_POSITIONING에 단서 추가 필요(현재 미반영).
+- D 확장판(host backing + VRAM 파티션 LRU 캐시)의 PCIe 예산 현실성, 저선택성↔graph 분기 임계값 추정.
+- tiered_index가 `.delta` 머신을 어디까지 대체하나(별도 스파이크).
+- PG plumbing: `WHERE + ORDER BY <-> LIMIT`을 filter→brute-force 경로로 라우팅(custom scan/bitmap 소비).
+
+**대안 기각**: 3P를 규모 해법으로 선두 추진 — VectorChord 데이터상 거대-corpus는 CPU+디스크가 비용으로 이김,
+GPU가 질 게임. 3O 접근 B(CPU식 graph prefilter) — GPU에선 brute-force가 더 단순·exact·빠름.
+

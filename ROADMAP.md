@@ -29,10 +29,13 @@
 
 ### 미완료
 
+> **전략 재평가 (2026-06-07, ADR-061 / [design/STRATEGY_NOTES.md](design/STRATEGY_NOTES.md))**: 경쟁 데이터(VectorChord가 32억 벡터를 CPU+NVMe 월 $12k로 서빙)가 "규모=GPU" 전제를 깸. pg_cuvs 표적 = **쿼리당-비용 지배 세그먼트**(온라인 RAG, 멀티테넌트). 신규 1순위 후보 = **exact filtered brute-force**(D) — cuVS `cuvsBruteForceSearch` + BITSET prefilter 네이티브 지원 확인됨. 3O를 흡수, 3P(아래)는 "규모 핵심" → "VRAM working-set 천장"으로 격하. 아래 표는 미반영(전략 확정 후 재정렬 예정).
+
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상. **보류(2026-06-07, 접근 미정)**: PG AM이 비-인덱스-컬럼 qual을 안 넘겨 원안(bitvector)은 custom-scan+멀티세션·고위험; 저비용 대안=iterative over-fetch(접근 A). 실수요 시 A부터 (ADR-048) | 릴리스 후 기능(보류) |
-| 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량) | 릴리스 후 기능 |
+| **D** | **exact filtered brute-force (신규 1순위 후보, ADR-061)** — 고선택성 WHERE를 PG가 평가→bitset→`cuvsBruteForceSearch` exact top-k. killer app=멀티테넌트 SaaS RAG. 3O의 GPU-네이티브 정답 버전. PG plumbing(custom scan/bitmap)·저선택성 분기 임계값 미해결 | 전략 wedge |
+| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상. **D로 흡수(2026-06-07, ADR-061)**; 기존 분석 ADR-048(보류) | D로 대체 |
+| 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량). **격하(ADR-061)**: "규모"가 아니라 "VRAM working-set 천장 올리기"; 압축 품질은 RaBitQ에 짐 | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
