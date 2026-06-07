@@ -57,6 +57,7 @@
 #define CUVS_STATUS_METRIC_MISMATCH 8  /* index built with a different metric → REINDEX */
 #define CUVS_STATUS_STALE          9   /* index stale (writes since build) → CPU fallback */
 #define CUVS_STATUS_NO_VECTORS    10   /* Phase 3L: brute_force requested but .vectors sidecar missing → REINDEX */
+#define CUVS_STATUS_CANCELED      11   /* 3S: backend aborted the wait (statement_timeout / query cancel) */
 
 /* ----------------------------------------------------------------
  * Command frame (sent over UDS, fixed size)
@@ -191,7 +192,17 @@ typedef struct CuvsIndexStats {
  * Returns CUVS_STATUS_OOM_FALLBACK if daemon has no VRAM → use CPU.
  * Returns CUVS_STATUS_ERROR if daemon is unreachable → use CPU.
  * Returns CUVS_STATUS_NOT_FOUND if index not loaded → use CPU.
+ * Returns CUVS_STATUS_CANCELED if the wait callback (3S) aborted the reply wait.
  */
+
+/* 3S: register a callback the search reply-wait polls (~250ms) to detect a
+ * pending query cancel / statement_timeout. Return nonzero to abort the wait
+ * (cuvs_ipc_search then returns CUVS_STATUS_CANCELED after cleanup). The callback
+ * must NOT longjmp (no CHECK_FOR_INTERRUPTS) — it only inspects flags; the PG
+ * caller raises the interrupt after cuvs_ipc_search returns. NULL = no cancel
+ * checking (blocking wait, legacy behavior). */
+void cuvs_ipc_set_wait_callback(int (*cb)(void));
+
 int cuvs_ipc_search(
     const char   *socket_path,
     uint32_t      db_oid,

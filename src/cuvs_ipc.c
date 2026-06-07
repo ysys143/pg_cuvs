@@ -28,6 +28,7 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <time.h>
+#include <poll.h>   /* 3S: interruptible reply wait */
 
 /* Circuit breaker state machine moved to cuvs_util.c (structural commit). */
 
@@ -110,6 +111,68 @@ recv_all(int fd, void *buf, size_t len)
         if (n == 0)
             return -1;      /* peer closed */
         received += (size_t)n;
+    }
+    return 0;
+}
+
+/* 3S: query-cancel / statement_timeout hook. The backend registers a callback
+ * that reports whether an interrupt is pending; the search reply-wait polls it. */
+static int (*g_wait_cb)(void) = NULL;
+
+void
+cuvs_ipc_set_wait_callback(int (*cb)(void))
+{
+    g_wait_cb = cb;
+}
+
+/* Interruptible recv: like recv_all, but poll()s in short slices so a pending
+ * PG cancel/statement_timeout (reported by g_wait_cb) can abort a long reply
+ * wait instead of blocking the backend uninterruptibly. Returns 0 on full read,
+ * -1 on error/EOF/overall-timeout, 1 if the wait callback asked to abort. */
+static int
+recv_all_interruptible(int fd, void *buf, size_t len, int timeout_sec)
+{
+    char  *p = buf;
+    size_t got = 0;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    while (got < len)
+    {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, 250 /* ms slice */);
+
+        if (pr < 0)
+        {
+            if (errno == EINTR)
+            {
+                if (g_wait_cb && g_wait_cb())
+                    return 1;   /* signal delivered a pending cancel */
+                continue;
+            }
+            return -1;
+        }
+        if (pr == 0)            /* slice timed out: check cancel + overall deadline */
+        {
+            struct timespec now;
+            if (g_wait_cb && g_wait_cb())
+                return 1;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if ((now.tv_sec - start.tv_sec) >= timeout_sec)
+                return -1;      /* daemon never replied within the budget */
+            continue;
+        }
+
+        ssize_t n = read(fd, p + got, len - got);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            return -1;          /* peer closed */
+        got += (size_t)n;
     }
     return 0;
 }
@@ -299,9 +362,16 @@ cuvs_ipc_search(
     if (send_all(sock, &cmd, sizeof(cmd)) < 0)
         goto cleanup;
 
+    /* 3S: wait for the reply header interruptibly so a query cancel /
+     * statement_timeout aborts a long GPU search instead of blocking the backend.
+     * On abort we close the socket (cleanup) -> the daemon's reply send fails and
+     * its per-connection thread cleans up; the backend raises the interrupt. */
     CuvsReplyHeader hdr;
-    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
-        goto cleanup;
+    {
+        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30 /* sec budget */);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
 
     rc = (int)hdr.status;
     if (latency_us_out)

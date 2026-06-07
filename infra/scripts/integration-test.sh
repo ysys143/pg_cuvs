@@ -1486,6 +1486,48 @@ NAR=$(echo "$OUT" | grep -E '^\s*[0-9]+\s*$' | tr -d ' ' | head -1)
 stop_test_daemon
 psql -d "$DB" -c "DROP TABLE IF EXISTS s23a; DROP TABLE IF EXISTS s23b;" >/dev/null 2>&1 || true
 
+# ---------------------------------------------------------------------------
+# Scenario 24 (3S): a stuck GPU search is cancelable by statement_timeout, and a
+# backend disconnecting mid-reply does NOT crash the daemon (SIGPIPE ignored).
+# The test daemon delays EVERY search reply 3s (CUVS_FAULT_SEARCH_DELAY_MS).
+echo "[it] --- scenario 24: 3S statement_timeout cancels stuck search + daemon survives ---"
+start_test_daemon CUVS_FAULT_SEARCH_DELAY_MS=3000
+# (build is not delayed; guard run_sql exit so set -e doesn't abort the suite)
+BR=0
+run_sql "DROP TABLE IF EXISTS s3s;
+CREATE TABLE s3s (id bigint, v vector(8));
+INSERT INTO s3s SELECT id, array_agg(random() ORDER BY d)::real[]::vector(8)
+  FROM generate_series(1,500) id, generate_series(1,8) d GROUP BY id;
+CREATE INDEX s3s_cagra ON s3s USING cagra (v vector_l2_ops);" || BR=$?
+[ "$BR" -eq 0 ] && pass "sc24: index built on delayed daemon (build not delayed)" \
+               || fail "sc24: build failed: $OUT"
+
+# Cancel: statement_timeout 500ms vs 3000ms reply delay -> must abort FAST. The
+# search run_sql is EXPECTED to fail (timeout); guard it so set -e doesn't exit.
+T0=$(date +%s%N)
+RC=0
+run_sql "SET statement_timeout=500; SET enable_cuvs=on; SET enable_seqscan=off; SET cuvs.k=5;
+SELECT id FROM s3s ORDER BY v <-> (SELECT v FROM s3s WHERE id=1) LIMIT 5;" || RC=$?
+EL=$(( ($(date +%s%N) - T0) / 1000000 ))
+if [ "$RC" -ne 0 ] && echo "$OUT" | grep -qi "statement timeout" && [ "$EL" -lt 2000 ]; then
+    pass "sc24: search canceled by statement_timeout in ${EL}ms (<< 3000ms delay) — interruptible wait"
+else
+    fail "sc24: search not promptly canceled (rc=$RC elapsed=${EL}ms): $OUT"
+fi
+
+# Daemon survived the canceled client's mid-reply disconnect (SIGPIPE)? A
+# generous-timeout search (> 3s delay) must succeed and the daemon stay alive.
+SC=0
+run_sql "SET statement_timeout=8000; SET enable_cuvs=on; SET enable_seqscan=off; SET cuvs.k=5;
+SELECT count(*) FROM (SELECT id FROM s3s ORDER BY v <-> (SELECT v FROM s3s WHERE id=1) LIMIT 5) q;" || SC=$?
+if [ "$SC" -eq 0 ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    pass "sc24: daemon survived mid-reply disconnect (SIGPIPE ignored), still serves searches"
+else
+    fail "sc24: daemon did not survive / follow-up search failed: $OUT"
+fi
+stop_test_daemon
+psql -d "$DB" -c "DROP TABLE IF EXISTS s3s;" >/dev/null 2>&1 || true
+
 echo "[it] === summary ==="
 if [ "$FAILED" = "0" ]; then
     echo "[PASS] all integration scenarios passed"
