@@ -1229,6 +1229,13 @@ reloption 미지정(0/NULL) → cuVS 기본값 통과. 값 지정 시만 overrid
 
 ## Phase 3O — Pre-filter ANN (필터 검색)
 
+**상태: 보류 (2026-06-07, 접근 미정 — ADR-048 설계 분석).** 착수 직전 코드 확인에서 **핵심 장벽** 발견: PG 인덱스 AM은
+인덱스 컬럼이 아닌 WHERE qual을 AM에 안 넘긴다(`cuvs_gettuple`은 orderByData만, 다른-컬럼 qual은 executor가 heap에서
+post-filter). 따라서 "WHERE→bitvector→daemon"(아래 원안 = 접근 B)은 custom scan/planner hook + TID→position 매핑 +
+cuVS bitset API가 필요해 멀티세션·고위험. 저비용 대안 **접근 A — iterative over-fetch**(executor 필터 유지 + `cuvs_gettuple`
+소진 시 k 키워 재검색)가 사용자 문제(고선택성 필터 시 결과 부족)를 ~1세션에 해결한다. 실수요 미확인이라 보류, 재개 시
+접근 A 우선. 상세·결정은 ADR-048. (아래는 원안=접근 B 상세, 이력 보존.)
+
 목표: WHERE 조건을 cuVS bitvector mask로 daemon에 전달해, GPU가 조건을 만족하는 벡터만 탐색한다. 고선택성 필터에서 GPU 후보 품질을 높이고 IPC·recheck 낭비를 줄인다. (ADR-048)
 
 ### 구현 항목

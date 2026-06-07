@@ -30,7 +30,7 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상 | 릴리스 후 기능 |
+| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상. **보류(2026-06-07, 접근 미정)**: PG AM이 비-인덱스-컬럼 qual을 안 넘겨 원안(bitvector)은 custom-scan+멀티세션·고위험; 저비용 대안=iterative over-fetch(접근 A). 실수요 시 A부터 (ADR-048) | 릴리스 후 기능(보류) |
 | 3S | statement_timeout / 취소 전파 — UDS recv timeout + CHECK_FOR_INTERRUPTS + CUVS_OP_CANCEL, 연결 고갈 방지 | 릴리스 후 기능 |
 | 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량) | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
@@ -50,24 +50,12 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052) — 순차 경로는 3O부터다.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052) — **3O(Pre-filter ANN)는 보류**(접근 미정, ADR-048) — 순차 경로는 3S부터다.
 
-#### 3O — Pre-filter ANN (필터 검색)
-**왜**: 3R 완료 후(다음 순차). WHERE 조건을 cuVS bitvector mask로 daemon에 전달해 GPU가 조건을 만족하는 벡터만 탐색. 고선택성 필터에서 IPC·recheck 낭비 제거.
-
-구현 항목:
-- `CuvsCmdFrame`에 `filter_shm_key[64]` 추가
-- backend: filter 조건 → TID 비트맵 → shm 전달
-- daemon: cuVS filtered search API 호출
-- fallback: 비트맵 shm 실패 시 기존 post-filter 경로 + WARNING
-- GUC `cuvs.prefilter_threshold` (밀도 기반 pre/post 자동 전환)
-
-완료 기준: 고선택성 WHERE 쿼리에서 pre-filter 경로 동작 확인, recall@10 동일성, 기존 test suite PASS
-
-스펙: [design/PLAN.md — Phase 3O](design/PLAN.md) | ADR-048
+> **3O 보류 (2026-06-07)**: 착수 직전 코드 확인에서 PG 인덱스 AM이 비-인덱스-컬럼 WHERE qual을 AM에 안 넘긴다는 핵심 장벽 발견. 원안(WHERE→bitvector→daemon, 접근 B)은 custom scan/planner hook + cuVS bitset API 필요 → 멀티세션·고위험. 저비용 대안 접근 A(iterative over-fetch)가 사용자 문제를 ~1세션에 해결. 실수요 미확인이라 보류, 재개 시 접근 A 우선. 분석·결정은 ADR-048, [design/PLAN.md — Phase 3O](design/PLAN.md).
 
 #### 3S — statement_timeout / 취소 전파
-**왜**: 3O 완료 후. PG cancel이 daemon IPC로 전파되지 않아 GPU 검색이 걸리면 statement_timeout 이후에도 backend가 대기. 연결 고갈 방지 필수.
+**왜**: 다음 순차(3O 보류). PG cancel이 daemon IPC로 전파되지 않아 GPU 검색이 걸리면 statement_timeout 이후에도 backend가 대기. 연결 고갈 방지 필수.
 
 구현 항목:
 - UDS recv에 `poll(fd, ipc_timeout_ms)` 루프 + `CHECK_FOR_INTERRUPTS()` 감지
