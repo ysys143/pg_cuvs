@@ -161,3 +161,29 @@
 재검토 조건: PG 코어에 bulk page write API 추가 또는 `ReadBuffer` concurrent extension 완화.
 
 스펙: [design/PLAN.md — Phase 4B](design/PLAN.md) | ADR-035
+
+---
+
+## cuVS 에코시스템 진입 계획
+
+상세: [docs/ecosystem-strategy.md](docs/ecosystem-strategy.md) | ADR-062
+
+### 전제 조건 (진입 전 필수)
+
+| 항목 | 필요 작업 |
+|------|-----------|
+| GitHub repo 공개 | public release + 라이선스 확인 |
+| 재현 가능한 벤치마크 공개 | `BENCHMARK.md` (pgvector vs pg_cuvs 핵심 수치) |
+| 외부 사용자용 설치 가이드 | README 정비 (설치, quick start) |
+| 기본 CI | GitHub Actions 최소 구성 |
+
+### 진입 단계
+
+| 단계 | 목표 | 전제 조건 | 타이밍 |
+|------|------|-----------|--------|
+| 1 | repo 공개 + 벤치마크 공개 | 없음 | 즉시 가능 |
+| 2 | cuvs-bench backend PR | 3Q 완료 | 3Q 완료 후 |
+| 3 | cuVS 문서/README 링크 요청 | 2단계 merge | 2단계 후 |
+| 4 | NVIDIA 채널 노출 | 3단계 등재 | 3단계 후 |
+
+**현황**: PostgreSQL 관련 언급이 cuVS 생태계에 전무 — 선점 기회. 현재 공식 통합: Milvus, Faiss, Elasticsearch(진행 중), Kinetica.

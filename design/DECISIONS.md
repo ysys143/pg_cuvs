@@ -2230,25 +2230,71 @@ GPU에 넘겨 brute-force exact top-k. killer app = **멀티테넌트 SaaS RAG**
   CAGRA/IVF-Flat/IVF-PQ도 `cuvsFilter` 지원 → 저선택성은 CAGRA+filter(근사)로 분기. bitset 빌더 C API는 없어
   DLManagedTensor(packed bits)로 우리가 구성(소항목).
 - 보너스: `cuvs/neighbors/tiered_index.h`(base ANN + incremental **bfknn** 버퍼 + 자동 compaction) +
-  `cuvsCagraExtend/Merge` 확인. **3A/3Q(`.delta`)의 네이티브 대체 후보**이자 D와 같은 brute-force 메커니즘으로 수렴.
+  `cuvsCagraExtend/Merge` 확인. **3Q(`.delta` 대체; 3A는 완료)의 네이티브 구현 후보**이자 D와 같은 brute-force 메커니즘으로 수렴.
 
 **우선순위 조정**:
 - north-star(빌드/H2D 오버헤드) = **해자 1순위 유지** (빌드 속도 = GPU의 베끼기 어려운 edge; 4A/ADR-059가 옳았음).
 - **D = 신규 1순위 후보** (해자 + 차별화 클레임 + killer app, 빌드 부담 낮음). 3O(ADR-048)를 흡수 — D가 3O의
   GPU-네이티브 정답 버전.
 - **3P(ADR-049) 우선순위 하락**: "규모 핵심"이 아니라 "VRAM working-set 천장 올리기"로 재정의. 압축 품질은
-  RaBitQ에 짐. selectivity로 규모를 다르게 푸는 D가 필터 워크로드엔 우월.
-- 3A/3Q는 cuVS `tiered_index` 네이티브화 검토.
+  RaBitQ에 짐. selectivity로 규모를 다르게 푸는 D가 필터 워크로드엔 우월. **온라인 대용량의 1차 답은 파티션(아래)이고,
+  3P는 whale/global fallback으로 더 격하.**
+- **온라인 대용량 = 파티션 pruning + 기존 LRU** (정련, 스파이크 검증 2026-06-07): tenant LIST/RANGE 파티션 →
+  `WHERE tenant=X` planner pruning → 작은 파티션 인덱스 → 데몬 기존 LRU(3D cold registry + eviction)가 VRAM 캐시로
+  동작. 스파이크 실증: pruning이 단일 인덱스 스캔(Append 없음, GPU==CPU exact), `--max-vram-mb 4`에서 2/6 상주 +
+  cold reload 정합 유지, 캐시-미스 꼬리 ~13–15ms vs hot <0.5ms. **새 아키텍처 0줄** — 온라인-스케일 모델이 기존
+  코드로 작동함을 확인. 갭: tenant-pruning recipe/test 없음, MAX_INDEXES=64·cold registry @ 수천 테넌트 미검증,
+  꼬리지연 @ 현실 인덱스 크기 미측정(north-star가 갚음).
+- **3A는 완료(ADR-047)** — `.delta` pending-delta 동작 중, 미완 아님. **3Q(미래)**의 streaming updates
+  (`cuvsCagraExtend/Merge`)에 대해 cuVS `tiered_index`(base ANN + bfknn 버퍼 + 자동 compaction)가 네이티브 구현
+  후보. 3A의 `.delta`를 tiered_index로 이관하는 건 선택적 미래 리팩터(갭 아님).
 
 **미해결 쟁점**:
 - ~~**포지셔닝 충돌(E)**~~ **해소됨(2026-06-07)**: `PROJECT_POSITIONING.md`의 "exact GPU vector search" Avoid 문구는
   **stale이었음** — pg_cuvs는 3L(ADR-039)에서 이미 `search_mode='brute_force'` exact 검색(recall=1.0, fp16에서도
   exact, 소규모 N에선 CAGRA보다 저렴해 planner 자동선택)을 출하했다. Avoid에서 제거하고 BF=exact / CAGRA-default=근사로
   분리, 메시징을 scoped Prefer로 교정. 경계: BF는 무필터 대규모 N에선 O(N)이라 "소규모/필터·선택적에서 exact+저렴"으로 한정.
+- 온라인-스케일 파티션 갭(스파이크는 작동 확인, 정식화 미완): tenant-pruning recipe/test 부재(`multigpu-partition-recipe.sql`은
+  hash-on-id라 prune 불가 — 다른 패턴), `MAX_INDEXES=64`·cold registry @ 수천 테넌트 미검증, 캐시-미스 꼬리 @ 현실 인덱스 크기.
 - D 확장판(host backing + VRAM 파티션 LRU 캐시)의 PCIe 예산 현실성, 저선택성↔graph 분기 임계값 추정.
-- tiered_index가 `.delta` 머신을 어디까지 대체하나(별도 스파이크).
+- tiered_index가 `.delta` 머신을 어디까지 대체하나(3Q 후보, 별도 스파이크).
 - PG plumbing: `WHERE + ORDER BY <-> LIMIT`을 filter→brute-force 경로로 라우팅(custom scan/bitmap 소비).
+- H streaming/out-of-core BF(미착수, 분석은 STRATEGY_NOTES §H): exact throughput 플레이, 온라인 단일-쿼리엔 부적합.
 
 **대안 기각**: 3P를 규모 해법으로 선두 추진 — VectorChord 데이터상 거대-corpus는 CPU+디스크가 비용으로 이김,
 GPU가 질 게임. 3O 접근 B(CPU식 graph prefilter) — GPU에선 brute-force가 더 단순·exact·빠름.
 
+
+---
+
+## ADR-062 — cuVS 에코시스템 진입 전략
+
+**날짜**: 2026-06-08
+**상태**: 전략 채택 — 단계별 실행 대기
+
+**배경**: cuVS(rapidsai/cuvs) 에코시스템 조사(2026-06-08) 결과:
+- 현재 공식 통합: Milvus, Faiss, Elasticsearch(진행 중), Kinetica
+- PostgreSQL 관련 언급 전무 — 선점 기회
+- 통합 모델: DB 자체 repo에서 cuVS dependency 사용 → cuVS 문서에 링크
+- cuVS repo에 코드를 직접 기여하는 유일한 경로: **cuvs-bench pluggable backend**
+- cuVS 팀 특성: NVIDIA 엔지니어, 마케팅보다 기술 증거(벤치마크, 작동 코드)에 반응
+
+**결정**: 4단계 순차 진입.
+
+| 단계 | 내용 | 타이밍 |
+|------|------|--------|
+| 1 | repo 공개 + 벤치마크 공개(`BENCHMARK.md`) | 즉시 가능 |
+| 2 | cuvs-bench backend PR | 3Q 완료 후 |
+| 3 | cuVS 문서/README 링크 요청 | 2단계 merge 후 |
+| 4 | NVIDIA 채널(뉴스레터/블로그) 노출 | 3단계 후 |
+
+**2단계가 핵심**: cuvs-bench PR은 cuVS repo에 코드가 들어가는 유일한 경로이자,
+NVIDIA 팀과 직접 기술 교류를 시작하는 접점. Elasticsearch backend PR이 선례.
+
+**3Q와의 연계**: `cuvsCagraExtend`/`cuvsCagraMerge`가 완료되면 cuVS C API를
+PostgreSQL 수준에서 실제 활용하는 유일한 사례가 된다 — cuVS 팀에 가장 강하게 어필할 수 있는 타이밍.
+
+**대안 기각**: 대규모 마케팅 캠페인 선행 — cuVS 팀은 엔지니어 조직이므로
+기술 기여(코드, 벤치마크)가 마케팅보다 효과적. 홍보는 링크 등재 이후 자연스럽게.
+
+상세 계획: [docs/ecosystem-strategy.md](../docs/ecosystem-strategy.md)
