@@ -99,12 +99,17 @@ void cuvs_bf_free(CuvsBfIndex index, int device_id);
 typedef void *CuvsCagraIndex;
 
 /* metric is a CUVS_METRIC_* value (see cuvs_ipc.h). It is baked into the
- * CAGRA graph at build time; search inherits it. */
+ * CAGRA graph at build time; search inherits it. 3R: graph_degree /
+ * intermediate_graph_degree (<=0 keep cuVS defaults 64/128) and build_algo
+ * (CUVS_CAGRA_BUILD_*; AUTO keeps cuVS heuristic) come from index reloptions. */
 CuvsCagraIndex cuvs_cagra_build(
     const float *vecs,
     int64_t      n_vecs,
     int          dim,
     uint32_t     metric,
+    int          graph_degree,
+    int          intermediate_graph_degree,
+    uint32_t     build_algo,
     int          device_id
 );
 
@@ -114,6 +119,7 @@ CuvsCagraIndex cuvs_cagra_build(
  * ([n_each[i]][dim] at vecs[i]) is copied to its row offset. Σ n_each == total.
  * Used by the daemon to stream parallel-build worker partials straight to the
  * GPU (no leader merge copy). cuvs_cagra_build is the n_parts==1 special case.
+ * 3R build params as in cuvs_cagra_build.
  */
 CuvsCagraIndex cuvs_cagra_build_multi(
     const float **vecs,
@@ -122,6 +128,9 @@ CuvsCagraIndex cuvs_cagra_build_multi(
     int64_t       total,
     int           dim,
     uint32_t      metric,
+    int           graph_degree,
+    int           intermediate_graph_degree,
+    uint32_t      build_algo,
     int           device_id
 );
 

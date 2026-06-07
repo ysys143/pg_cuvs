@@ -1922,6 +1922,8 @@ cuvs_hnsw_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
          * (a sharded CAGRA cannot export its adjacency); no .hnsw sidecar. */
         cuvs_build_cagra_from_heap(heapRel, indexRel, indexInfo,
                                    (uint32_t) self_oid, 1, false,
+                                   /* 3R: ephemeral CAGRA uses cuVS defaults (no user reloptions). */
+                                   0, 0, CUVS_CAGRA_BUILD_AUTO,
                                    &n_vecs, &reltuples);
         result->heap_tuples  = reltuples;
         result->index_tuples = (double) n_vecs;

@@ -239,9 +239,29 @@ typedef struct CuvsCagraOptions
 {
     int32 vl_len_;          /* varlena header — do not access directly */
     int   index_dir_offset; /* relopt string offset; 0 = option absent */
+    /* 3R: CAGRA build params. ints carry their default when the option is
+     * absent; build_algo is a string offset (0 = absent = auto). */
+    int   graph_degree;
+    int   intermediate_graph_degree;
+    int   build_algo_offset;
 } CuvsCagraOptions;
 
 static relopt_kind cuvs_cagra_relopt_kind;
+
+/* 3R: validate the build_algo string reloption at DDL time (fail-closed on typo). */
+static void
+cuvs_validate_build_algo(const char *value)
+{
+    if (value == NULL || value[0] == '\0')
+        return;   /* absent -> auto */
+    if (strcmp(value, "auto") != 0 &&
+        strcmp(value, "ivf_pq") != 0 &&
+        strcmp(value, "nn_descent") != 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_cuvs: invalid build_algo \"%s\"", value),
+                 errhint("Valid values: auto, ivf_pq, nn_descent.")));
+}
 
 /* One-time relopt registration; called from _PG_init. */
 static void
@@ -252,6 +272,16 @@ cuvs_cagra_init_reloptions(void)
                          "Directory holding this CAGRA index's artifacts "
                          "(overrides cuvs.index_dir for this index).",
                          "", NULL, AccessExclusiveLock);
+    /* 3R: CAGRA graph-construction tuning. Build-time-immutable -> AccessExclusiveLock. */
+    add_int_reloption(cuvs_cagra_relopt_kind, "graph_degree",
+                      "CAGRA graph degree (neighbors per node).",
+                      64, 8, 512, AccessExclusiveLock);
+    add_int_reloption(cuvs_cagra_relopt_kind, "intermediate_graph_degree",
+                      "CAGRA intermediate graph degree (must be >= graph_degree).",
+                      128, 8, 1024, AccessExclusiveLock);
+    add_string_reloption(cuvs_cagra_relopt_kind, "build_algo",
+                         "CAGRA graph build algorithm: auto | ivf_pq | nn_descent.",
+                         "auto", cuvs_validate_build_algo, AccessExclusiveLock);
 }
 
 static bytea *
@@ -260,6 +290,12 @@ cuvs_cagra_amoptions(Datum reloptions, bool validate)
     static const relopt_parse_elt tab[] = {
         {"index_dir", RELOPT_TYPE_STRING,
          offsetof(CuvsCagraOptions, index_dir_offset)},
+        {"graph_degree", RELOPT_TYPE_INT,
+         offsetof(CuvsCagraOptions, graph_degree)},
+        {"intermediate_graph_degree", RELOPT_TYPE_INT,
+         offsetof(CuvsCagraOptions, intermediate_graph_degree)},
+        {"build_algo", RELOPT_TYPE_STRING,
+         offsetof(CuvsCagraOptions, build_algo_offset)},
     };
     return (bytea *) build_reloptions(reloptions, validate,
                                       cuvs_cagra_relopt_kind,
@@ -583,6 +619,44 @@ cuvs_resolve_index_dir_rel(Relation indexRel)
     const char *reldir = cuvs_reloption_index_dir(indexRel);
 
     return reldir != NULL ? reldir : get_index_dir();
+}
+
+/* 3R: resolve CAGRA build params from a cagra index's reloptions. ints carry
+ * their reloption default (64/128) when rd_options is set; defaults are applied
+ * when the index has no reloptions at all. build_algo string -> CUVS_CAGRA_BUILD_*.
+ * Validates intermediate_graph_degree >= graph_degree (a cuVS requirement).
+ * Only called from the CAGRA ambuild path (indexRel is a cagra index). */
+static void
+cuvs_resolve_build_params_rel(Relation indexRel, int *graph_degree,
+                              int *intermediate_graph_degree, uint32_t *build_algo)
+{
+    CuvsCagraOptions *opts = (CuvsCagraOptions *) indexRel->rd_options;
+
+    *graph_degree              = 64;
+    *intermediate_graph_degree = 128;
+    *build_algo                = CUVS_CAGRA_BUILD_AUTO;
+
+    if (opts != NULL)
+    {
+        *graph_degree              = opts->graph_degree;
+        *intermediate_graph_degree = opts->intermediate_graph_degree;
+        if (opts->build_algo_offset != 0)
+        {
+            const char *s = (const char *) opts + opts->build_algo_offset;
+            if (strcmp(s, "ivf_pq") == 0)
+                *build_algo = CUVS_CAGRA_BUILD_IVF_PQ;
+            else if (strcmp(s, "nn_descent") == 0)
+                *build_algo = CUVS_CAGRA_BUILD_NN_DESCENT;
+            /* else "auto"/"" -> AUTO */
+        }
+    }
+
+    if (*intermediate_graph_degree < *graph_degree)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("pg_cuvs: intermediate_graph_degree (%d) must be >= "
+                        "graph_degree (%d)",
+                        *intermediate_graph_degree, *graph_degree)));
 }
 
 /* Resolver for the plan-time gates and shared path builders, which hold only an
@@ -1365,6 +1439,7 @@ static bool
 cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                     uint32_t build_index_oid, uint32_t shard_count, bool use_cpu_hnsw,
                     int dim, uint32 metric, Size cap_bytes, int request_workers,
+                    int graph_degree, int intermediate_graph_degree, uint32_t build_algo,
                     int64_t *out_n_vecs, double *out_reltuples)
 {
     ParallelContext       *pcxt;
@@ -1472,7 +1547,8 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                 cuvs_resolve_index_dir_rel(indexRel),
                 (uint32_t) RelationGetRelid(heapRel),
                 (uint32_t) heapRel->rd_rel->relfilenode,
-                shard_count, use_cpu_hnsw ? 1 : 0);
+                shard_count, use_cpu_hnsw ? 1 : 0,
+                (uint32_t) graph_degree, (uint32_t) intermediate_graph_degree, build_algo);
 
             if (rc != CUVS_STATUS_OK)
                 ereport(ERROR,
@@ -1509,7 +1585,9 @@ cuvs_build_parallel(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
 void
 cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *indexInfo,
                            uint32_t build_index_oid, uint32_t shard_count,
-                           bool use_cpu_hnsw, int64_t *out_n_vecs, double *out_reltuples)
+                           bool use_cpu_hnsw, int graph_degree,
+                           int intermediate_graph_degree, uint32_t build_algo,
+                           int64_t *out_n_vecs, double *out_reltuples)
 {
     CuvsBuildState bs;
     AttrNumber heap_attno;
@@ -1564,7 +1642,9 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
         if (nworkers > 0
             && cuvs_build_parallel(heapRel, indexRel, indexInfo, build_index_oid,
                                    shard_count, use_cpu_hnsw, typmod, bs.metric,
-                                   bs.cap_bytes, nworkers, out_n_vecs, out_reltuples))
+                                   bs.cap_bytes, nworkers,
+                                   graph_degree, intermediate_graph_degree, build_algo,
+                                   out_n_vecs, out_reltuples))
             return;
     }
 
@@ -1644,7 +1724,10 @@ cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel, IndexInfo *index
                 heap_table_oid,
                 heap_relfilenode,
                 shard_count,
-                use_cpu_hnsw ? 1 : 0);  /* Phase 3I-1: serialize .hnsw sidecar */
+                use_cpu_hnsw ? 1 : 0,  /* Phase 3I-1: serialize .hnsw sidecar */
+                (uint32_t) graph_degree,
+                (uint32_t) intermediate_graph_degree,
+                build_algo);  /* 3R: CAGRA build params from reloptions */
 
             if (rc != CUVS_STATUS_OK)
             {
@@ -1751,12 +1834,18 @@ cuvs_ambuild(Relation heapRel, Relation indexRel, IndexInfo *indexInfo)
     }
 
     /* Scan the heap and build the CAGRA index on the daemon under this index's
-     * own OID (shard_count / cpu_hnsw from GUCs). */
-    cuvs_build_cagra_from_heap(heapRel, indexRel, indexInfo,
-                               (uint32_t) RelationGetRelid(indexRel),
-                               (uint32_t) cuvs_shard_count,
-                               cuvs_cpu_hnsw_fallback,
-                               &n_vecs, &reltuples);
+     * own OID (shard_count / cpu_hnsw from GUCs; 3R build params from reloptions). */
+    {
+        int      gd, igd;
+        uint32_t algo;
+        cuvs_resolve_build_params_rel(indexRel, &gd, &igd, &algo);  /* validates igd >= gd */
+        cuvs_build_cagra_from_heap(heapRel, indexRel, indexInfo,
+                                   (uint32_t) RelationGetRelid(indexRel),
+                                   (uint32_t) cuvs_shard_count,
+                                   cuvs_cpu_hnsw_fallback,
+                                   gd, igd, algo,
+                                   &n_vecs, &reltuples);
+    }
 
     result->heap_tuples  = reltuples;
     result->index_tuples = (double) n_vecs;

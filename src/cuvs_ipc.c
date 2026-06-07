@@ -715,7 +715,10 @@ cuvs_ipc_build(
     uint32_t       table_oid,
     uint32_t       relfilenode,
     uint32_t       shard_count,
-    uint32_t       use_cpu_hnsw)
+    uint32_t       use_cpu_hnsw,
+    uint32_t       graph_degree,
+    uint32_t       intermediate_graph_degree,
+    uint32_t       build_algo)
 {
     char shm_key[64] = "";
     int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
@@ -767,6 +770,9 @@ cuvs_ipc_build(
     cmd.relfilenode  = relfilenode;
     cmd.shard_count  = shard_count;
     cmd.use_cpu_hnsw = use_cpu_hnsw;  /* Phase 3I-1: 1 = serialize .hnsw sidecar */
+    cmd.graph_degree              = graph_degree;              /* 3R; 0 = cuVS default */
+    cmd.intermediate_graph_degree = intermediate_graph_degree; /* 3R; 0 = cuVS default */
+    cmd.build_algo                = build_algo;                /* 3R; 0 = AUTO */
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);  /* "" for memfd tier */
 
     if (send_all(sock, &cmd, sizeof(cmd)) < 0)
@@ -820,7 +826,10 @@ cuvs_ipc_build_multi(
     uint32_t       table_oid,
     uint32_t       relfilenode,
     uint32_t       shard_count,
-    uint32_t       use_cpu_hnsw)
+    uint32_t       use_cpu_hnsw,
+    uint32_t       graph_degree,
+    uint32_t       intermediate_graph_degree,
+    uint32_t       build_algo)
 {
     int  sock = -1;
     int  rc   = CUVS_STATUS_ERROR;
@@ -853,6 +862,9 @@ cuvs_ipc_build_multi(
     cmd.shard_count  = shard_count;
     cmd.use_cpu_hnsw = use_cpu_hnsw;
     cmd.n_partials   = n_partials;   /* daemon takes the multi-partial path */
+    cmd.graph_degree              = graph_degree;              /* 3R */
+    cmd.intermediate_graph_degree = intermediate_graph_degree; /* 3R */
+    cmd.build_algo                = build_algo;                /* 3R */
     /* cmd.shm_key stays "" — no single corpus segment. */
 
     LOG_DEBUG("[cuvs_ipc_build_multi] n_partials=%u total=%lld dim=%d socket=%s\n",

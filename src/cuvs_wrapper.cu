@@ -481,7 +481,9 @@ cuvs_distance_type(uint32_t metric)
  * single offset-0 copy — byte-identical to the legacy single-corpus build. */
 extern "C" CuvsCagraIndex
 cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
-                       int64_t total, int dim, uint32_t metric, int device_id)
+                       int64_t total, int dim, uint32_t metric,
+                       int graph_degree, int intermediate_graph_degree,
+                       uint32_t build_algo, int device_id)
 {
     PooledRes _pr(device_id);
     try {
@@ -500,12 +502,26 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
         }
         res.sync_stream();
 
-        /* CAGRA build parameters (defaults are good for Phase 1). The metric is
-         * baked into the graph here; search inherits it. */
+        /* CAGRA build parameters. metric is baked into the graph; search inherits
+         * it. graph_degree / intermediate_graph_degree / build_algo come from the
+         * index's reloptions (3R) — <=0 / AUTO keep cuVS defaults. */
         cuvs::neighbors::cagra::index_params params;
         params.metric                = cuvs_distance_type(metric);
-        params.graph_degree          = 64;
-        params.intermediate_graph_degree = 128;
+        params.graph_degree              = (graph_degree > 0)
+                                         ? (size_t)graph_degree : 64;
+        params.intermediate_graph_degree = (intermediate_graph_degree > 0)
+                                         ? (size_t)intermediate_graph_degree : 128;
+
+        /* build_algo: graph-construction algorithm (cuVS 26.04 graph_build_params
+         * std::variant). AUTO leaves std::monostate so cuVS picks heuristically
+         * (ivf_pq for large, nn_descent for small). */
+        namespace gbp = cuvs::neighbors::cagra::graph_build_params;
+        if (build_algo == CUVS_CAGRA_BUILD_IVF_PQ)
+            params.graph_build_params = gbp::ivf_pq_params(d_corpus.extents());
+        else if (build_algo == CUVS_CAGRA_BUILD_NN_DESCENT)
+            params.graph_build_params =
+                gbp::nn_descent_params(params.intermediate_graph_degree);
+        /* else CUVS_CAGRA_BUILD_AUTO: leave monostate (heuristic). */
 
         auto idx = cuvs::neighbors::cagra::build(
             res,
@@ -531,12 +547,15 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
 
 extern "C" CuvsCagraIndex
 cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
-                 int device_id)
+                 int graph_degree, int intermediate_graph_degree,
+                 uint32_t build_algo, int device_id)
 {
     /* Single-partition special case of the multi-partition build. */
     const float  *parts[1]  = { vecs };
     const int64_t n_each[1] = { n_vecs };
-    return cuvs_cagra_build_multi(parts, n_each, 1, n_vecs, dim, metric, device_id);
+    return cuvs_cagra_build_multi(parts, n_each, 1, n_vecs, dim, metric,
+                                  graph_degree, intermediate_graph_degree,
+                                  build_algo, device_id);
 }
 
 /* ----------------------------------------------------------------
@@ -1052,7 +1071,7 @@ cuvs_warmup_device(int device_id)
          * real cagra query on a freshly booted daemon is not the one that
          * pays kernel load (~100 ms). */
         CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
-                                               device_id);
+                                               0, 0, CUVS_CAGRA_BUILD_AUTO, device_id);
         if (idx) {
             (void)cuvs_cagra_search(idx, query.data(), dim, k, out, device_id);
             cuvs_cagra_free(idx, device_id);

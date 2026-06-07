@@ -3217,7 +3217,10 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
         }
 
         CuvsCagraIndex h = cuvs_cagra_build(vecs + (size_t)off * dim, shard_n,
-                                            (int)dim, metric, dev);
+                                            (int)dim, metric,
+                                            (int)cmd->graph_degree,
+                                            (int)cmd->intermediate_graph_degree,
+                                            cmd->build_algo, dev);
         if (!h)
         {
             LOG_ERROR("[build_sharded] cuvs_cagra_build failed for shard %d\n", i);
@@ -3728,7 +3731,10 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
 
     LOG_DEBUG("[handle_build] calling cuvs_cagra_build n_vecs=%lld dim=%u gpu=%d...\n",
             (long long)cmd->n_vecs, cmd->dim, target_gpu);
-    CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric, target_gpu);
+    CuvsCagraIndex new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
+                                                 (int)cmd->graph_degree,
+                                                 (int)cmd->intermediate_graph_degree,
+                                                 cmd->build_algo, target_gpu);
     if (!new_handle)
     {
         LOG_ERROR("[handle_build] cuvs_cagra_build returned NULL\n");
@@ -4276,7 +4282,10 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         }
 
         new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
-                                            (int)cmd->dim, cmd->metric, target_gpu);
+                                            (int)cmd->dim, cmd->metric,
+                                            (int)cmd->graph_degree,
+                                            (int)cmd->intermediate_graph_degree,
+                                            cmd->build_algo, target_gpu);
         if (!new_handle)
         {
             pthread_mutex_unlock(&g_index_mutex);

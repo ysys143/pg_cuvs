@@ -52,4 +52,6 @@ void cuvs_build_cagra_from_heap(Relation heapRel, Relation indexRel,
                                 IndexInfo *indexInfo,
                                 uint32_t build_index_oid, uint32_t shard_count,
                                 bool use_cpu_hnsw,
+                                int graph_degree, int intermediate_graph_degree,
+                                uint32_t build_algo,
                                 int64_t *out_n_vecs, double *out_reltuples);

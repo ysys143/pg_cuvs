@@ -37,6 +37,12 @@
 #define CUVS_METRIC_COSINE  1
 #define CUVS_METRIC_IP      2
 
+/* 3R: CAGRA graph-construction algorithm (cuVS 26.04 graph_build_params variant).
+ * AUTO leaves cuVS's heuristic (ivf_pq for large datasets, nn_descent for small). */
+#define CUVS_CAGRA_BUILD_AUTO        0
+#define CUVS_CAGRA_BUILD_IVF_PQ      1
+#define CUVS_CAGRA_BUILD_NN_DESCENT  2
+
 /* ----------------------------------------------------------------
  * Reply status codes
  * ---------------------------------------------------------------- */
@@ -76,6 +82,9 @@ typedef struct CuvsCmdFrame {
     uint32_t n_partials;    /* BUILD: ADR-059; 0 = single corpus (shm_key/passed fd),
                              * >0 = N worker partials follow the index_dir frame as a
                              * CuvsPartialDesc list (daemon mmaps each → direct H2D). */
+    uint32_t graph_degree;             /* BUILD: 3R; 0 = cuVS default (64) */
+    uint32_t intermediate_graph_degree;/* BUILD: 3R; 0 = cuVS default (128) */
+    uint32_t build_algo;               /* BUILD: 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
 } CuvsCmdFrame;
 
 /*
@@ -260,7 +269,10 @@ int cuvs_ipc_build(
     uint32_t       table_oid,   /* heap relation OID */
     uint32_t       relfilenode, /* heap relfilenode (heap compat identity) */
     uint32_t       shard_count, /* Phase 3F: 0/1 = unsharded, >=2 = N shards */
-    uint32_t       use_cpu_hnsw /* Phase 3I-1: 1 = serialize .hnsw sidecar */
+    uint32_t       use_cpu_hnsw,/* Phase 3I-1: 1 = serialize .hnsw sidecar */
+    uint32_t       graph_degree,             /* 3R; 0 = cuVS default (64) */
+    uint32_t       intermediate_graph_degree,/* 3R; 0 = cuVS default (128) */
+    uint32_t       build_algo                /* 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
 );
 
 /*
@@ -287,7 +299,10 @@ int cuvs_ipc_build_multi(
     uint32_t       table_oid,
     uint32_t       relfilenode,
     uint32_t       shard_count,
-    uint32_t       use_cpu_hnsw
+    uint32_t       use_cpu_hnsw,
+    uint32_t       graph_degree,             /* 3R; 0 = cuVS default (64) */
+    uint32_t       intermediate_graph_degree,/* 3R; 0 = cuVS default (128) */
+    uint32_t       build_algo                /* 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
 );
 
 /*
