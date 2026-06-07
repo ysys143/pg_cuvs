@@ -23,13 +23,12 @@
 | 4-preflight | 연산 지역성 프로파일링 완료 (A100/PG16, N=1M dim=1024). 검색 GPU:IPC≈2:1(GPU-bound), 빌드 GPU 82%/backend 18%, export buffer-mgr 39%, TOAST vs PLAIN 8%. 측정 근거로 4A 하향. `docs/profiling-results.md` (ADR-044) |
 | Release-hardening | 빌드-time 권고 emit 3종 — TOAST NOTICE(고차원 toastable→PLAIN 권고), index_dir이 $PGDATA 하위면 WARNING(basebackup 비대), pgvector 0.5–0.8 밖이면 WARNING(HNSW 포맷 drift). `docs/best-practices.md`. installcheck GREEN(release_hardening) + 수동 e2e (ADR-043/ADR-013/ADR-038) |
 | 3A | Pending delta / delta exact search — INSERT/UPDATE `.delta` append(false stale 없음) + CPU/GPU 병합, snapshot-aware `.tombstone`, tri-mode `cuvs.delta_search`(enum auto|cpu|gpu), delta cap fail-closed, tombstone-aware over-fetch로 delete-drift recall 보존. installcheck 15/15 + isolation 2/2 GREEN + restart e2e PASS (ADR-047). **비고**: 메커니즘은 3F/3G·phase3a WIP(2026-05)로 구현됐으나 완료 기준(회귀/격리 검증) 미충족으로 미완 표기됐던 것을 본 세션에서 검증·certify(false-done 역방향 해소) |
+| 4A | 빌드 오버헤드(raw cuVS 대비) 최소화 — **ADR-057** memfd+SCM_RIGHTS corpus(누수-안전·무복사, peak RSS −32%), **ADR-058** parallel maintenance workers(분산스캔), **ADR-059** 데몬 multi-partial direct H2D(리더 merge 복사 제거). backend 오버헤드 ~6.3s(단일)→~3.7s(병렬); wall-clock은 GPU floor(~33s) 지배라 marginal — 가치는 north-star(backend 제거율). PLAIN 권고도 ADR-044 실측 ~8%로 보정. self-NN 단일==병렬(multi-partial) 5/5 + installcheck 15/15 + iso 2/2 GREEN, /dev/shm 고아 0. `docs/profiling-results.md` §7/8/9 (#20, ADR-057/058/059) |
 
 ### 미완료
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 4A-1 | CAGRA 빌드 double memcpy 제거 (**quick win**: ~2-5s, 난이도 낮음, 4A-2 enabler) | 릴리스 후 기능 |
-| 4A-2 | parallel maintenance workers — heap scan/detoast 병렬화 (~8-12s/~10-14%, 난이도 중간) | 릴리스 후 기능 |
 | 3R | CAGRA 빌드 파라미터 reloption — `graph_degree`, `intermediate_graph_degree`, `build_algo` 사용자 제어 (recall↔speed 튜닝) | 릴리스 후 기능 |
 | 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상 | 릴리스 후 기능 |
 | 3S | statement_timeout / 취소 전파 — UDS recv timeout + CHECK_FOR_INTERRUPTS + CUVS_OP_CANCEL, 연결 고갈 방지 | 릴리스 후 기능 |
