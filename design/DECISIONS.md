@@ -515,7 +515,11 @@ MVP:
 **결과**:
 - 새 IPC op `CUVS_OP_DROP_INDEX`(7) + `cuvs_ipc_drop`(mark_stale mirror). backend `object_access_hook` + `XACT_EVENT_COMMIT` 콜백. 데몬 `handle_drop`.
 - 검증: DROP 후 `pg_stat_gpu_shards` 0 rows + VRAM 회수 + restart 후 zombie 없음 + 데몬-down DROP도 성공(WARNING). **(주의: "restart 후 zombie 없음"은 데몬-up DROP 한정 — artifact가 unlink됐기 때문. 데몬-down DROP은 아래 한계 참조.)**
-- 알려진 한계: rolled-back SAVEPOINT 내 DROP은 여전히 기록되어 commit 시 통지될 수 있음(REINDEX로 복구; 데몬-down과 동일 등급). `DROP EXTENSION CASCADE`가 AM을 먼저 drop하면 `get_am_oid`가 Invalid → 해당 통지 누락(restart/playbook).
+- 알려진 한계:
+  - **미커밋 DROP (안전)**: `BEGIN; DROP INDEX;` 후 커밋하지 않으면 daemon에 아무것도 전송되지 않는다. `cuvs_ipc_drop`은 `XACT_EVENT_COMMIT`에서만 발사되므로 ROLLBACK 시 artifact는 그대로 보존된다.
+  - **rolled-back SAVEPOINT 내 DROP (잠재적 오삭제)**: `SAVEPOINT s; DROP INDEX; ROLLBACK TO s; COMMIT;` 패턴에서 `object_access_hook`이 OAT_DROP을 `cuvs_pending_drops`에 수집할 때 어느 subtransaction에서 발생했는지 기록하지 않는다. 따라서 SAVEPOINT가 롤백돼도 OID가 리스트에 남아 상위 트랜잭션 commit 시 통지가 나간다 — 살아있는 인덱스의 GPU artifact가 조기 삭제될 수 있다. 복구는 REINDEX. 데몬-down과 동일 등급(드물고, 정합성이 아닌 artifact만 손실).
+  - **완전 자동 극복 방법 (의도적 보류)**: `RegisterSubXactCallback`으로 `SUBXACT_EVENT_ABORT_SUB`를 받아 롤백된 subxact에서 수집된 OID를 `cuvs_pending_drops`에서 제거하는 것이 정공법이다. 단, 각 pending 엔트리에 subxact nesting level을 태깅해야 하고, 현재 commit-only 단순화(ADR-023의 핵심 선택)를 되돌리는 셈이라 복잡도가 올라간다. 이 케이스 자체가 흔치 않아 의도적으로 보류한다.
+  - `DROP EXTENSION CASCADE`가 AM을 먼저 drop하면 `get_am_oid`가 Invalid → 해당 통지 누락(restart/playbook).
 - **알려진 한계 (orphan artifact 누수, 2026-06-05 4-preflight 세션에서 실측 확인 — ADR-046에서 해결 설계)**:
   - **데몬-down 중 DROP INDEX/TABLE**: `cuvs_ipc_drop`이 `status 4`(UNAVAILABLE)로 실패, PG DROP은 commit되지만 artifact 잔존. HINT는 "재시작 시까지 잔존"이라 하나 **재시작이 정리하지 않고 오히려 좀비로 재로드**한다(ADR-009 정정 참조).
   - **DROP DATABASE (데몬-up이어도)**: `object_access_hook`은 DROP을 실행하는 백엔드에서만 발화하는데, DROP DATABASE는 다른 DB에서 실행되어 대상 DB 내부 cagra 인덱스의 OAT_DROP을 보지 못한다 → per-index 통지 없음, 전부 orphan. (세션 시작 시 발견된 `<dropped_db_oid>_*` artifact의 정체.)
