@@ -1850,6 +1850,20 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
+#ifdef CUVS_TEST_HOOKS
+    /* 3S test seam: delay the reply (before taking the index lock so other
+     * searches are unaffected) to exercise backend cancel + daemon disconnect. */
+    {
+        const char *d = getenv("CUVS_FAULT_SEARCH_DELAY_MS");
+        long ms = (d && d[0]) ? atol(d) : 0;
+        if (ms > 0)
+        {
+            LOG_INFO("[handle_search] fault: delaying reply %ld ms\n", ms);
+            usleep((useconds_t) ms * 1000);
+        }
+    }
+#endif
+
     pthread_mutex_lock(&g_index_mutex);
 
     IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
@@ -5253,6 +5267,12 @@ main(int argc, char **argv)
     sa.sa_flags = 0;  /* no SA_RESTART */
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
+
+    /* 3S: ignore SIGPIPE so a client that disconnects mid-request (e.g. a backend
+     * aborting a search on statement_timeout / query cancel) makes the reply
+     * write() fail with EPIPE — the per-connection thread cleans up — instead of
+     * killing the whole daemon (and every backend's GPU index). */
+    signal(SIGPIPE, SIG_IGN);
 
     /* Phase 3C: initialize libcurl once for the process lifetime. Must be called
      * before any curl_easy_* or download/upload operations. */

@@ -355,6 +355,16 @@ cuvs_cagra_amoptions(Datum reloptions, bool validate)
                                       tab, lengthof(tab));
 }
 
+/* 3S: polled by cuvs_ipc_search's reply wait. Reports a pending query cancel /
+ * statement_timeout / backend termination WITHOUT servicing it (no longjmp — the
+ * IPC layer must still close its socket and free shm). The caller raises the
+ * interrupt via CHECK_FOR_INTERRUPTS once cuvs_ipc_search returns CANCELED. */
+static int
+cuvs_search_wait_should_abort(void)
+{
+    return (QueryCancelPending || ProcDiePending) ? 1 : 0;
+}
+
 void
 _PG_init(void)
 {
@@ -613,6 +623,7 @@ _PG_init(void)
     object_access_hook = cuvs_object_access;
     RegisterXactCallback(cuvs_xact_callback, NULL);
     RegisterSubXactCallback(cuvs_subxact_callback, NULL);  /* ADR-060 */
+    cuvs_ipc_set_wait_callback(cuvs_search_wait_should_abort);  /* 3S: cancelable search */
 
     /* ADR-057: test seam — CUVS_FORCE_CORPUS=memfd|shm|heap pins the build tier
      * for every backend (inherited from the postmaster env). Unset => auto. Used
@@ -2312,6 +2323,15 @@ cuvs_gettuple(IndexScanDesc scan, ScanDirection dir)
             &ss->n_results,
             &latency_us,
             &delta_merged);
+
+        /* 3S: the reply wait was aborted by a pending cancel / statement_timeout.
+         * Not a GPU failure — don't touch the circuit breaker; raise the actual
+         * interrupt now that the IPC socket/shm are cleaned up. */
+        if (rc == CUVS_STATUS_CANCELED)
+        {
+            CHECK_FOR_INTERRUPTS();   /* normally longjmps out here */
+            return false;             /* fallback if the interrupt was cleared */
+        }
 
         if (rc != CUVS_STATUS_OK)
         {

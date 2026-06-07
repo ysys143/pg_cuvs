@@ -25,13 +25,13 @@
 | 3A | Pending delta / delta exact search — INSERT/UPDATE `.delta` append(false stale 없음) + CPU/GPU 병합, snapshot-aware `.tombstone`, tri-mode `cuvs.delta_search`(enum auto|cpu|gpu), delta cap fail-closed, tombstone-aware over-fetch로 delete-drift recall 보존. installcheck 15/15 + isolation 2/2 GREEN + restart e2e PASS (ADR-047). **비고**: 메커니즘은 3F/3G·phase3a WIP(2026-05)로 구현됐으나 완료 기준(회귀/격리 검증) 미충족으로 미완 표기됐던 것을 본 세션에서 검증·certify(false-done 역방향 해소) |
 | 4A | 빌드 오버헤드(raw cuVS 대비) 최소화 — **ADR-057** memfd+SCM_RIGHTS corpus(누수-안전·무복사, peak RSS −32%), **ADR-058** parallel maintenance workers(분산스캔), **ADR-059** 데몬 multi-partial direct H2D(리더 merge 복사 제거). backend 오버헤드 ~6.3s(단일)→~3.7s(병렬); wall-clock은 GPU floor(~33s) 지배라 marginal — 가치는 north-star(backend 제거율). PLAIN 권고도 ADR-044 실측 ~8%로 보정. self-NN 단일==병렬(multi-partial) 5/5 + installcheck 15/15 + iso 2/2 GREEN, /dev/shm 고아 0. `docs/profiling-results.md` §7/8/9 (#20, ADR-057/058/059) |
 | 3R | CAGRA 빌드 파라미터 reloption — `graph_degree`/`intermediate_graph_degree`/`build_algo`(auto\|ivf_pq\|nn_descent) per-index reloption으로 노출, recall↔speed↔VRAM 튜닝. cuVS 26.04 `graph_build_params` variant 매핑. DDL validator + `intermediate >= graph_degree` fail-closed. 파라미터 실적용 실증(`.cagra` adjacency Δ = n×Δgd×4 정확) + installcheck 16/16(`build_params`) + iso 2/2 GREEN (ADR-052) |
+| 3S | statement_timeout / 취소 전파 — backend reply 대기를 `recv_all_interruptible`(poll + wait 콜백)로 인터럽트 가능하게: `statement_timeout`/cancel이 걸린 GPU 검색을 ~544ms에 끊음(이전 무기한). 데몬 `SIGPIPE` 무시로 client mid-reply disconnect에서 생존(기존 잠재 크래시 버그도 해소). `CUVS_OP_CANCEL` 미도입(소켓 close로 충분). integration sc24 + installcheck 17/17 GREEN (ADR-053) |
 
 ### 미완료
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
 | 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상. **보류(2026-06-07, 접근 미정)**: PG AM이 비-인덱스-컬럼 qual을 안 넘겨 원안(bitvector)은 custom-scan+멀티세션·고위험; 저비용 대안=iterative over-fetch(접근 A). 실수요 시 A부터 (ADR-048) | 릴리스 후 기능(보류) |
-| 3S | statement_timeout / 취소 전파 — UDS recv timeout + CHECK_FOR_INTERRUPTS + CUVS_OP_CANCEL, 연결 고갈 방지 | 릴리스 후 기능 |
 | 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량) | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
@@ -50,25 +50,12 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052) — **3O(Pre-filter ANN)는 보류**(접근 미정, ADR-048) — 순차 경로는 3S부터다.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052) — **3O(Pre-filter ANN)는 보류**(접근 미정, ADR-048), **3S(취소 전파)는 완료**(ADR-053) — 순차 경로는 3P부터다.
 
 > **3O 보류 (2026-06-07)**: 착수 직전 코드 확인에서 PG 인덱스 AM이 비-인덱스-컬럼 WHERE qual을 AM에 안 넘긴다는 핵심 장벽 발견. 원안(WHERE→bitvector→daemon, 접근 B)은 custom scan/planner hook + cuVS bitset API 필요 → 멀티세션·고위험. 저비용 대안 접근 A(iterative over-fetch)가 사용자 문제를 ~1세션에 해결. 실수요 미확인이라 보류, 재개 시 접근 A 우선. 분석·결정은 ADR-048, [design/PLAN.md — Phase 3O](design/PLAN.md).
 
-#### 3S — statement_timeout / 취소 전파
-**왜**: 다음 순차(3O 보류). PG cancel이 daemon IPC로 전파되지 않아 GPU 검색이 걸리면 statement_timeout 이후에도 backend가 대기. 연결 고갈 방지 필수.
-
-구현 항목:
-- UDS recv에 `poll(fd, ipc_timeout_ms)` 루프 + `CHECK_FOR_INTERRUPTS()` 감지
-- 취소 시 daemon에 `CUVS_OP_CANCEL` 전송 후 오류 반환
-- GUC `cuvs.ipc_timeout_ms` (기본 5000ms)
-- daemon: cancel op 수신 시 진행 중 검색 중단 후 연결 상태 초기화
-
-완료 기준: `statement_timeout = '1s'` 설정 후 느린 GPU 검색에서 timeout 확인, 연결 정상 반환 확인, 기존 test suite PASS
-
-스펙: [design/PLAN.md — Phase 3S](design/PLAN.md) | ADR-053
-
 #### 3P — IVF-PQ (추가 cuVS 알고리즘)
-**왜**: 3O 완료 후. CAGRA는 VRAM에 float32 전체 보유 필요 — 대용량(100M+) 환경에서 비실용적. IVF-PQ로 VRAM 10–100× 절감.
+**왜**: 다음 순차(3S 완료, 3O 보류). CAGRA는 VRAM에 float32 전체 보유 필요 — 대용량(100M+) 환경에서 비실용적. IVF-PQ로 VRAM 10–100× 절감.
 
 구현 항목:
 - 새 AM handler `pg_cuvs_ivfpq_handler` 등록 (`CREATE INDEX USING ivfpq`)
