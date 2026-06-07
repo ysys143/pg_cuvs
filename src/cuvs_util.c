@@ -260,6 +260,7 @@ cuvs_vectors_write(FILE *f, int64_t n_vecs, uint32_t dim, uint32_t metric,
     CuvsVectorsHeader hdr;
     size_t body_n = (size_t)n_vecs * (size_t)dim;
 
+    memset(&hdr, 0, sizeof(hdr));   /* zero struct padding -> deterministic header */
     hdr.magic           = CUVS_VECTORS_MAGIC;
     hdr.version         = CUVS_VECTORS_VERSION;
     hdr.n_vecs          = n_vecs;
@@ -290,6 +291,8 @@ cuvs_vectors_write_multi(FILE *f, const int64_t *n_each, int n_parts, uint32_t d
     int64_t  total = 0;
     uint32_t crc = cuvs_crc32_stream_begin();
     int      i;
+
+    memset(&hdr, 0, sizeof(hdr));   /* zero struct padding -> deterministic header */
 
     for (i = 0; i < n_parts; i++)
     {
