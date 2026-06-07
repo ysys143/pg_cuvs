@@ -1030,7 +1030,7 @@ PG custom scan node의 `ExplainCustomScan` 콜백에서 GPU kernel time / IPC la
 
 완료 기준: SAVEPOINT 롤백 후 인덱스 artifact 보존 확인, 기존 test suite PASS.
 
-스펙: ADR-057
+스펙: ADR-060
 
 ---
 
