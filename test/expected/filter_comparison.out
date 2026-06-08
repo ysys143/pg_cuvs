@@ -63,9 +63,9 @@ FROM (
     ) f
     JOIN fc ON fc.ctid = f.ctid
 ) s;
- n | wrong_tenant 
----+--------------
- 8 |            0
+ n  | wrong_tenant 
+----+--------------
+ 10 |            0
 (1 row)
 
 -- NULL filter_tids → unfiltered, expect 10 rows.
@@ -78,7 +78,7 @@ FROM cuvs_filtered_knn(
 ) f;
  n_unfiltered 
 --------------
-            0
+           10
 (1 row)
 
 -- ----------------------------------------------------------------

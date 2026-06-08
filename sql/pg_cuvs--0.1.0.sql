@@ -380,7 +380,7 @@ CREATE FUNCTION cuvs_filtered_knn(
 )
 RETURNS TABLE (ctid tid, distance float4)
 AS '$libdir/pg_cuvs', 'cuvs_filtered_knn'
-LANGUAGE C STABLE STRICT;
+LANGUAGE C STABLE;
 
 COMMENT ON FUNCTION cuvs_filtered_knn(regclass, vector, bigint[], integer) IS
   'ADR-063 D-wedge spike (Option B): GPU BF kNN restricted to filter_tids. '
