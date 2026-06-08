@@ -29,12 +29,12 @@
 
 ### 미완료
 
-> **전략 재평가 (2026-06-07, ADR-061 / [design/STRATEGY_NOTES.md](design/STRATEGY_NOTES.md))**: 경쟁 데이터(VectorChord가 32억 벡터를 CPU+NVMe 월 $12k로 서빙)가 "규모=GPU" 전제를 깸. pg_cuvs 표적 = **쿼리당-비용 지배 세그먼트**(온라인 RAG, 멀티테넌트). 신규 1순위 후보 = **exact filtered brute-force**(D) — cuVS `cuvsBruteForceSearch` + BITSET prefilter 네이티브 지원 확인됨. 3O를 흡수, 3P(아래)는 "규모 핵심" → "VRAM working-set 천장"으로 격하. 아래 표는 미반영(전략 확정 후 재정렬 예정).
+> **전략 재평가 (2026-06-07, ADR-061 / [design/STRATEGY_NOTES.md](design/STRATEGY_NOTES.md))**: 경쟁 데이터(VectorChord가 32억 벡터를 CPU+NVMe 월 $12k로 서빙)가 "규모=GPU" 전제를 깸. pg_cuvs 표적 = **쿼리당-비용 지배 세그먼트**(온라인 RAG, 멀티테넌트). 신규 1순위 후보 = **exact filtered brute-force**(D) — cuVS `cuvsBruteForceSearch` + BITSET prefilter 네이티브 지원 확인됨. 3O는 D의 post-filter를 BITSET pre-filter로 확장하는 순차 작업으로 재정의(대체 아님). 3P(아래)는 "규모 핵심" → "VRAM working-set 천장"으로 격하.
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| **D** | **exact filtered brute-force — 스파이크 완료, PR #35 (ADR-063)** — Option B(`cuvs_filtered_knn` SRF, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook, `cuvs.filtered_knn_hook` GUC) 구현·테스트 통과. IPC `CuvsCmdFrame` filter_shm_key 확장, 데몬 binary-search post-filter, 전체 19+2 테스트 GREEN. **잔여**: 타입-안전 wrapper, 선택성 임계값 GUC, delta 통합, `EXPLAIN ANALYZE` GPU 타이밍 | 전략 wedge |
-| 3O | Pre-filter ANN — WHERE 조건을 cuVS bitvector mask로 daemon에 전달, 고선택성 필터 GPU 품질 향상. **D로 흡수(2026-06-07, ADR-061)**; 기존 분석 ADR-048(보류) | D로 대체 |
+| **D** | **exact filtered brute-force — 스파이크 완료, PR #35 (ADR-063)** — Option B(`cuvs_filtered_knn` SRF, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook, `cuvs.filtered_knn_hook` GUC) 구현·테스트 통과. IPC `CuvsCmdFrame` filter_shm_key 확장, 데몬 binary-search post-filter, 전체 19+2 테스트 GREEN. **잔여**: 타입-안전 wrapper, 선택성 임계값 GUC(단일 스칼라 불충분 — selectivity × correlation 2축 실험으로 임계값 근거 실측 필요, 아래 참조), delta 통합, `EXPLAIN ANALYZE` GPU 타이밍(IPC / GPU kernel / PG heap fetch 분해 — 논문 Figure 생성 선결, 트리거 항목에서 승격) | 전략 wedge |
+| 3O | Pre-filter ANN — cuVS BITSET prefilter로 필터 집합만 탐색(BF 또는 CAGRA). D의 post-filter와 상호보완: 테넌트당 데이터셋이 BF 한계를 넘는 규모에서 recall 보장. D IPC 인프라(`CuvsCmdFrame` filter 필드, daemon filter 경로) 재활용. 분석 ADR-048 | 순차 |
 | 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량). **격하(ADR-061)**: "규모"가 아니라 "VRAM working-set 천장 올리기"; 압축 품질은 RaBitQ에 짐 | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
@@ -43,7 +43,6 @@
 | MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload | 다중 테넌트 파티션 온라인-스케일 선결 — 현 `MAX_INDEXES=64`가 하드월(>64 파티션 축출 시 ERROR+REINDEX, auto-reload 미배선). 측정·근거 ADR-061 / STRATEGY_NOTES §G | 트리거 (수백+ 테넌트 수요) |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
 | fp16 입력 | float16 벡터 입력으로 VRAM ~50% 절감 — `WITH (precision=fp16)` reloption, cuVS C API 지원 확인 필요 | 트리거 (cuVS fp16 지원 확인) |
-| EXPLAIN GPU 타이밍 | `EXPLAIN ANALYZE`에 GPU kernel time / IPC latency 노출, 쿼리별 병목 진단 | 트리거 (명시 진단 수요) |
 | VACUUM tombstone 연동 | autovacuum 시 `CUVS_OP_COMPACT` 자동 트리거 — 별도 bgworker 없이 PG 스케줄 재활용 (3Q 의존) | 트리거 (3Q 완료) |
 
 ---
@@ -54,12 +53,25 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052) — **3O(Pre-filter ANN)는 보류**(접근 미정, ADR-048), **3S(취소 전파)는 완료**(ADR-053) — 순차 경로는 3P부터다.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053) — 순차 경로는 D 잔여 → 3O → 3P 순이다.
 
-> **3O 보류 (2026-06-07)**: 착수 직전 코드 확인에서 PG 인덱스 AM이 비-인덱스-컬럼 WHERE qual을 AM에 안 넘긴다는 핵심 장벽 발견. 원안(WHERE→bitvector→daemon, 접근 B)은 custom scan/planner hook + cuVS bitset API 필요 → 멀티세션·고위험. 저비용 대안 접근 A(iterative over-fetch)가 사용자 문제를 ~1세션에 해결. 실수요 미확인이라 보류, 재개 시 접근 A 우선. 분석·결정은 ADR-048, [design/PLAN.md — Phase 3O](design/PLAN.md).
+#### 3O — Pre-filter ANN (filtered BF/CAGRA 확장)
+**왜**: D(exact filtered BF, PR #35)가 post-filter 방식으로 스파이크 완료됐으나, 테넌트당 데이터셋이 수십만+ 규모로 커지면 k×4 overfetch만으로 recall 보장이 어려움. cuVS BITSET prefilter를 사용해 필터 집합만 탐색하면 대규모에서도 recall=1.0 유지.
+
+구현 항목:
+- daemon: 빌드 타임에 `heapTID → item_id` 역방향 해시맵 구성 및 메모리 상주 (현재 `e->tids[]`는 `item_id → heapTID` 단방향만 존재; 역방향 없이 BITSET 생성 시 O(n_vecs) 선형 스캔 불가피)
+- backend: filter heapTID 집합 → item_id 배열 변환 후 BITSET 생성 (역방향 맵 활용)
+- daemon: `cuvs_bf_search_filtered()` — BITSET mask를 cuVS `cuvsBruteForceSearch`에 전달(pre-filter)
+- IPC: `CuvsCmdFrame`의 기존 filter 필드 재활용, `use_prefilter` 플래그 추가
+- 선택성 임계값 GUC(`cuvs.filter_prefilter_threshold`): 필터 통과율 낮을 때 pre-filter, 높을 때 기존 post-filter 자동 전환. **단일 스칼라 threshold 한계**: selectivity만으로 전략 우열이 결정되지 않고 correlation(필터 통과 벡터가 쿼리 근방에 밀집하는 정도)이 두 번째 축으로 작동함 — selectivity × correlation 2D 실험으로 crossover 지점 실측 후 GUC 설계 확정
+- Option A(Custom Scan hook): `cuvs.filtered_knn_hook` 경로에서 pre-filter 모드 활성화
+
+완료 기준: 테넌트당 N=100k 이상 환경에서 recall@10=1.0, 기존 filter_comparison 테스트 PASS, installcheck GREEN, selectivity × correlation sweep으로 threshold 근거 실측
+
+스펙: [design/PLAN.md — Phase 3O](design/PLAN.md) | ADR-048
 
 #### 3P — IVF-PQ (추가 cuVS 알고리즘)
-**왜**: 다음 순차(3S 완료, 3O 보류). CAGRA는 VRAM에 float32 전체 보유 필요 — 대용량(100M+) 환경에서 비실용적. IVF-PQ로 VRAM 10–100× 절감.
+**왜**: 3O 완료 후. CAGRA는 VRAM에 float32 전체 보유 필요 — 대용량(100M+) 환경에서 비실용적. IVF-PQ로 VRAM 10–100× 절감.
 
 구현 항목:
 - 새 AM handler `pg_cuvs_ivfpq_handler` 등록 (`CREATE INDEX USING ivfpq`)
@@ -140,12 +152,8 @@
 
 스펙: [design/PLAN.md — fp16 입력 벡터](design/PLAN.md) | ADR-054
 
-#### EXPLAIN ANALYZE GPU 타이밍 (트리거: 명시 진단 수요)
-**효과**: `EXPLAIN ANALYZE`에 GPU kernel time / IPC latency 노출. 쿼리별 병목 진단 가능.
-**구현**: daemon 응답 프레임에 `gpu_kernel_us`/`ipc_roundtrip_us` 추가, custom scan `ExplainCustomScan` 콜백에서 주입.
-**트리거**: 프로덕션 배포 후 쿼리별 GPU latency 분해 수요 명시.
-
-스펙: [design/PLAN.md — EXPLAIN GPU 타이밍](design/PLAN.md) | ADR-055
+#### EXPLAIN ANALYZE GPU 타이밍 (D 잔여로 승격)
+**상태**: D 잔여로 이동. 스펙: [design/PLAN.md — EXPLAIN GPU 타이밍](design/PLAN.md) | ADR-055
 
 #### VACUUM 연동 tombstone 정리 (트리거: 3Q 완료)
 **효과**: autovacuum 시 `CUVS_OP_COMPACT` 자동 트리거 — 별도 bgworker 없이 PG 스케줄 재활용. 4C와 동일 COMPACT op 공유.
@@ -174,7 +182,7 @@
 | 항목 | 필요 작업 |
 |------|-----------|
 | GitHub repo 공개 | public release + 라이선스 확인 |
-| 재현 가능한 벤치마크 공개 | `BENCHMARK.md` (pgvector vs pg_cuvs 핵심 수치) |
+| 재현 가능한 벤치마크 공개 | `BENCHMARK.md` (pgvector vs pg_cuvs 핵심 수치). **논문화 시 수준 상향**: selectivity × correlation 2축 체계적 sweep(논문 수준 = 복수 dataset × 다단계 selectivity × correlation 유형별) — filter_comparison.sql 확장 형태로 구축, D 잔여 또는 3O 완료 기준에 포함 |
 | 외부 사용자용 설치 가이드 | README 정비 (설치, quick start) |
 | 기본 CI | GitHub Actions 최소 구성 |
 
