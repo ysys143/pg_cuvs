@@ -1229,39 +1229,36 @@ reloption 미지정(0/NULL) → cuVS 기본값 통과. 값 지정 시만 overrid
 
 ## Phase 3O — Pre-filter ANN (필터 검색)
 
-**상태: 보류 (2026-06-07, 접근 미정 — ADR-048 설계 분석).** 착수 직전 코드 확인에서 **핵심 장벽** 발견: PG 인덱스 AM은
-인덱스 컬럼이 아닌 WHERE qual을 AM에 안 넘긴다(`cuvs_gettuple`은 orderByData만, 다른-컬럼 qual은 executor가 heap에서
-post-filter). 따라서 "WHERE→bitvector→daemon"(아래 원안 = 접근 B)은 custom scan/planner hook + TID→position 매핑 +
-cuVS bitset API가 필요해 멀티세션·고위험. 저비용 대안 **접근 A — iterative over-fetch**(executor 필터 유지 + `cuvs_gettuple`
-소진 시 k 키워 재검색)가 사용자 문제(고선택성 필터 시 결과 부족)를 ~1세션에 해결한다. 실수요 미확인이라 보류, 재개 시
-접근 A 우선. 상세·결정은 ADR-048. (아래는 원안=접근 B 상세, 이력 보존.)
+**상태: 구현·검증 완료 (2026-06-08, ADR-048). PR #36(BF prefilter), #37(CAGRA-first 업그레이드).**
 
-목표: WHERE 조건을 cuVS bitvector mask로 daemon에 전달해, GPU가 조건을 만족하는 벡터만 탐색한다. 고선택성 필터에서 GPU 후보 품질을 높이고 IPC·recheck 낭비를 줄인다. (ADR-048)
+D(post-filter)의 IPC 인프라를 재활용해 CAGRA-first BITSET prefilter를 구현. `cuvs_filtered_knn` SRF 호출자가 제공하는 `ctid[]`를 통해 qual 미전달 장벽 우회.
 
-### 구현 항목
+### 구현 내역
 
-**3O-1 — IPC 프레임 확장**:
-- `CuvsCmdFrame`에 `filter_shm_key[64]` 추가 (비트맵 shm 이름; 빈 문자열 = unfiltered).
-- `CuvsBuildShm` 패턴과 동일하게 backend가 비트맵 shm 세그먼트를 생성·전달·소멸.
+**3O-1 — 역방향 TID 맵** (`src/pg_cuvs_server.c`):
+- daemon 빌드 타임에 `rev_tids[]`(sorted, n_vecs) + `rev_item_ids[]`(n_vecs) 구성.
+- 쿼리 타임: 필터 TID → item_id 이진탐색, cuVS 규칙(`bit=1=exclude`) 기준 all-ones bitset에서 해당 비트 클리어.
 
-**3O-2 — backend 비트맵 생성**:
-- `cuvs_beginscan` / `cuvs_rescan`에서 `scan->xs_recheck_itup` filter 조건을 heap TID 비트맵으로 평가.
-- 비트맵 밀도가 `cuvs.prefilter_threshold` 이하이면 pre-filter 경로, 초과이면 기존 post-filter 경로.
+**3O-2 — IPC 플래그** (`src/cuvs_ipc.h`, `src/cuvs_ipc.c`):
+- `CuvsCmdFrame.use_prefilter` (uint32_t) 추가. 1=prefilter, 0=D-wedge.
+- `cuvs_ipc_search_filtered` 마지막 인자 `int use_prefilter`.
 
-**3O-3 — daemon filtered search**:
-- `CUVS_OP_SEARCH`에서 `filter_shm_key`가 있으면 cuVS CAGRA filtered_search API 호출.
-- cuVS bitvector mask 포맷으로 변환 후 `SearchParams::sample_filter` 전달.
+**3O-3 — wrapper** (`src/cuvs_wrapper.h`, `src/cuvs_wrapper.cu`):
+- `cuvs_bf_search_filtered`: BF + `bitset_filter<uint32_t, int64_t>`, recall=1.00.
+- `cuvs_cagra_search_filtered`: CAGRA + `bitset_filter<uint32_t, int64_t>`, approx (graph-based), O(log N).
 
-**3O-4 — fallback 및 테스트**:
-- 비트맵 shm 생성 실패 시 기존 unfiltered + post-filter 경로로 graceful degradation + WARNING.
-- isolation test: concurrent filter + ANN 정합 확인. recall 비교(pre-filter vs post-filter, 동일 결과 보장).
+**3O-4 — daemon handler** (`src/pg_cuvs_server.c`):
+- 3O 경로: `e->handle != NULL` → CAGRA prefilter 우선; 실패 시 BF prefilter fallback; 실패 시 D-wedge fallback.
+- `last_search_mode`: 4=cagra_prefilter, 3=bf_prefilter.
 
-### 완료 기준
+**3O-5 — backend GUC** (`src/pg_cuvs.c`):
+- `cuvs.filter_auto_threshold` (기본 0.05): selectivity < threshold → use_prefilter=1, else D-wedge.
 
-- `SELECT ... WHERE category = $1 ORDER BY embedding <-> $2 LIMIT 10` 쿼리에서 pre-filter 경로 동작 확인 (`EXPLAIN` + `pg_stat_gpu_search.search_mode` 확인).
-- recall@10 동일성: pre-filter와 post-filter가 동일한 top-k 반환 (deterministic 데이터셋 기준).
-- 기존 test suite(`make gpu-test-all`) 전수 PASS.
-- fallback 경로 integration 시나리오 1건 추가.
+### 검증 증거
+
+- installcheck 19/19 + isolation 2/2 GREEN.
+- `filter_comparison` golden 변경 없음.
+- 소규모 테스트 데이터셋(N~수백)에서 CAGRA prefilter recall=1.00 확인.
 
 스펙: ADR-048
 
