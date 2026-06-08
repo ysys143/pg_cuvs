@@ -86,6 +86,12 @@ typedef struct CuvsCmdFrame {
     uint32_t graph_degree;             /* BUILD: 3R; 0 = cuVS default (64) */
     uint32_t intermediate_graph_degree;/* BUILD: 3R; 0 = cuVS default (128) */
     uint32_t build_algo;               /* BUILD: 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
+    /* D-wedge filter (spike: Option A Custom Scan / Option B Function API).
+     * 0 = no filter; >0 = sorted uint64_t TID array in filter_shm_key shm.
+     * Daemon post-filters BF results to only those TIDs.
+     * TODO: convert to cuVS BITSET position-indexed prefilter for GPU speedup. */
+    uint32_t n_filter_tids;            /* SEARCH: filter set size; 0=no filter */
+    char     filter_shm_key[64];       /* SEARCH: shm_open name for sorted uint64_t TIDs */
 } CuvsCmdFrame;
 
 /*
@@ -202,6 +208,34 @@ typedef struct CuvsIndexStats {
  * caller raises the interrupt after cuvs_ipc_search returns. NULL = no cancel
  * checking (blocking wait, legacy behavior). */
 void cuvs_ipc_set_wait_callback(int (*cb)(void));
+
+/*
+ * cuvs_ipc_search_filtered — D-wedge spike: filtered BF search.
+ *
+ * filter_tids: sorted uint64_t array of heap TIDs to include; NULL = no filter.
+ * n_filter:    length of filter_tids (0 = no filter, ignored if filter_tids NULL).
+ *
+ * The daemon post-filters BF results to only the provided TID set.
+ * Works for both unsharded and sharded (per-shard post-filter).
+ * Returns same status codes as cuvs_ipc_search.
+ */
+int cuvs_ipc_search_filtered(
+    const char   *socket_path,
+    uint32_t      db_oid,
+    uint32_t      index_oid,
+    const float  *query_vec,
+    int           dim,
+    int           k,
+    uint32_t      metric,
+    uint32_t      search_mode,
+    uint32_t      bf_precision,
+    const uint64_t *filter_tids,   /* sorted; NULL = no filter */
+    uint32_t      n_filter,
+    uint64_t     *tids_out,
+    float        *dist_out,
+    int          *n_out,
+    uint32_t     *latency_us_out
+);
 
 int cuvs_ipc_search(
     const char   *socket_path,

@@ -1131,3 +1131,155 @@ cleanup:
     if (sock >= 0) close(sock);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_search_filtered (D-wedge spike)
+ *
+ * Thin wrapper around cuvs_ipc_search that adds a second shm segment
+ * carrying the filter TID array.  The daemon post-filters BF results
+ * to only TIDs present in the set.
+ *
+ * When filter_tids is NULL or n_filter == 0 this degrades to the
+ * standard unfiltered BF path (n_filter_tids=0 in the frame).
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_search_filtered(
+    const char    *socket_path,
+    uint32_t       db_oid,
+    uint32_t       index_oid,
+    const float   *query_vec,
+    int            dim,
+    int            k,
+    uint32_t       metric,
+    uint32_t       search_mode,
+    uint32_t       bf_precision,
+    const uint64_t *filter_tids,
+    uint32_t       n_filter,
+    uint64_t      *tids_out,
+    float         *dist_out,
+    int           *n_out,
+    uint32_t      *latency_us_out)
+{
+    char shm_key[64];
+    char filter_shm_key[64];
+    int  shm_fd        = -1;
+    int  filter_shm_fd = -1;
+    int  sock          = -1;
+    int  rc            = CUVS_STATUS_ERROR;
+    int  has_filter    = (filter_tids != NULL && n_filter > 0);
+
+    if (latency_us_out) *latency_us_out = 0;
+    if (n_out)          *n_out = 0;
+
+    /* --- query shm --- */
+    make_shm_key(shm_key, sizeof(shm_key));
+    shm_fd = shm_write_query(shm_key, query_vec, dim);
+    if (shm_fd < 0)
+        goto cleanup;
+
+    /* --- filter shm (flat uint64_t[n_filter]) --- */
+    if (has_filter)
+    {
+        make_shm_key(filter_shm_key, sizeof(filter_shm_key));
+        size_t filter_bytes = (size_t)n_filter * sizeof(uint64_t);
+
+        filter_shm_fd = shm_open(filter_shm_key, O_CREAT | O_RDWR, 0666);
+        if (filter_shm_fd < 0)
+            goto cleanup;
+        fchmod(filter_shm_fd, 0666);
+        if (ftruncate(filter_shm_fd, (off_t)filter_bytes) < 0)
+        {
+            shm_unlink(filter_shm_key);
+            goto cleanup;
+        }
+        void *fmem = mmap(NULL, filter_bytes, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, filter_shm_fd, 0);
+        if (fmem == MAP_FAILED)
+        {
+            shm_unlink(filter_shm_key);
+            goto cleanup;
+        }
+        memcpy(fmem, filter_tids, filter_bytes);
+        munmap(fmem, filter_bytes);
+    }
+    else
+    {
+        filter_shm_key[0] = '\0';
+    }
+
+    sock = uds_connect(socket_path);
+    if (sock < 0)
+    {
+        rc = CUVS_STATUS_UNAVAILABLE;
+        goto cleanup;
+    }
+
+    CuvsCmdFrame cmd = {
+        .op           = CUVS_OP_SEARCH,
+        .db_oid       = db_oid,
+        .index_oid    = index_oid,
+        .k            = (uint32_t)k,
+        .metric       = metric,
+        .dim          = (uint32_t)dim,
+        .n_vecs       = 0,
+        .search_mode  = search_mode,
+        .bf_precision = bf_precision,
+        .n_filter_tids = has_filter ? n_filter : 0,
+    };
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
+    if (has_filter)
+        strncpy(cmd.filter_shm_key, filter_shm_key,
+                sizeof(cmd.filter_shm_key) - 1);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    {
+        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
+
+    rc = (int)hdr.status;
+    if (latency_us_out)
+        *latency_us_out = hdr.latency_us;
+
+    if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
+    {
+        int n       = (int)hdr.n_results;
+        int n_write = (n > k) ? k : n;
+        CuvsResult *results = malloc(n * sizeof(CuvsResult));
+        if (!results)
+        {
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+        if (recv_all(sock, results, n * sizeof(CuvsResult)) < 0)
+        {
+            free(results);
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+        for (int i = 0; i < n_write; i++)
+        {
+            tids_out[i] = results[i].tid;
+            dist_out[i] = results[i].distance;
+        }
+        *n_out = n_write;
+        free(results);
+    }
+    else
+    {
+        *n_out = 0;
+    }
+
+cleanup:
+    if (sock >= 0)        close(sock);
+    if (shm_fd >= 0)      close(shm_fd);
+    if (filter_shm_fd >= 0) close(filter_shm_fd);
+    shm_unlink(shm_key);
+    if (has_filter)
+        shm_unlink(filter_shm_key);
+    return rc;
+}

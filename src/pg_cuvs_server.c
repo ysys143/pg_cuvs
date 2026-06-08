@@ -2102,9 +2102,13 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
-        int bk = (int) ((int64_t) k < e->main_bf_n ? (int64_t) k : e->main_bf_n);
+        /* D-wedge spike: overfetch 4x when post-filtering so top-k survive. */
+        int64_t bk_target = (cmd->n_filter_tids > 0)
+            ? (int64_t)k * 4
+            : (int64_t)k;
+        int bk = (int)(bk_target < e->main_bf_n ? bk_target : e->main_bf_n);
         CuvsSearchResult *raw     = malloc((size_t)(bk > 0 ? bk : 1) * sizeof(CuvsSearchResult));
-        CuvsResult       *results = malloc((size_t)(bk > 0 ? bk : 1) * sizeof(CuvsResult));
+        CuvsResult       *results = malloc((size_t)(k  > 0 ? k  : 1) * sizeof(CuvsResult));
         if (!raw || !results)
         {
             free(raw); free(results);
@@ -2132,16 +2136,50 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
+        /* D-wedge spike: open filter shm and mmap the sorted TID array. */
+        uint64_t *filter_tids = NULL;
+        void     *filter_mem  = MAP_FAILED;
+        size_t    filter_bytes = 0;
+        if (cmd->n_filter_tids > 0 && cmd->filter_shm_key[0] != '\0')
+        {
+            filter_bytes = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
+            int ffd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
+            if (ffd >= 0)
+            {
+                filter_mem = mmap(NULL, filter_bytes, PROT_READ, MAP_SHARED, ffd, 0);
+                close(ffd);
+                if (filter_mem != MAP_FAILED)
+                    filter_tids = (uint64_t *)filter_mem;
+            }
+            /* On shm failure: fall through to unfiltered (spike graceful degrade). */
+        }
+
         int n_valid = 0;
-        for (int i = 0; i < bk; i++)
+        for (int i = 0; i < bk && n_valid < k; i++)
         {
             int64_t id = raw[i].item_id;
             if (id < 0 || id >= e->n_vecs) continue;
-            results[n_valid].tid      = e->tids[id];
+            uint64_t tid = e->tids[id];
+            if (filter_tids)
+            {
+                uint32_t lo = 0, hi = cmd->n_filter_tids;
+                int found = 0;
+                while (lo < hi)
+                {
+                    uint32_t mid = lo + (hi - lo) / 2;
+                    if (filter_tids[mid] == tid) { found = 1; break; }
+                    if (filter_tids[mid] < tid)  lo = mid + 1;
+                    else                          hi = mid;
+                }
+                if (!found) continue;
+            }
+            results[n_valid].tid      = tid;
             results[n_valid].distance = raw[i].distance;
             n_valid++;
         }
         free(raw);
+        if (filter_mem != MAP_FAILED)
+            munmap(filter_mem, filter_bytes);
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
         uint32_t latency_us = (uint32_t)(
