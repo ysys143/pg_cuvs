@@ -26,6 +26,7 @@
 | 4A | 빌드 오버헤드(raw cuVS 대비) 최소화 — **ADR-057** memfd+SCM_RIGHTS corpus(누수-안전·무복사, peak RSS −32%), **ADR-058** parallel maintenance workers(분산스캔), **ADR-059** 데몬 multi-partial direct H2D(리더 merge 복사 제거). backend 오버헤드 ~6.3s(단일)→~3.7s(병렬); wall-clock은 GPU floor(~33s) 지배라 marginal — 가치는 north-star(backend 제거율). PLAIN 권고도 ADR-044 실측 ~8%로 보정. self-NN 단일==병렬(multi-partial) 5/5 + installcheck 15/15 + iso 2/2 GREEN, /dev/shm 고아 0. `docs/profiling-results.md` §7/8/9 (#20, ADR-057/058/059) |
 | 3R | CAGRA 빌드 파라미터 reloption — `graph_degree`/`intermediate_graph_degree`/`build_algo`(auto\|ivf_pq\|nn_descent) per-index reloption으로 노출, recall↔speed↔VRAM 튜닝. cuVS 26.04 `graph_build_params` variant 매핑. DDL validator + `intermediate >= graph_degree` fail-closed. 파라미터 실적용 실증(`.cagra` adjacency Δ = n×Δgd×4 정확) + installcheck 16/16(`build_params`) + iso 2/2 GREEN (ADR-052) |
 | 3S | statement_timeout / 취소 전파 — backend reply 대기를 `recv_all_interruptible`(poll + wait 콜백)로 인터럽트 가능하게: `statement_timeout`/cancel이 걸린 GPU 검색을 ~544ms에 끊음(이전 무기한). 데몬 `SIGPIPE` 무시로 client mid-reply disconnect에서 생존(기존 잠재 크래시 버그도 해소). `CUVS_OP_CANCEL` 미도입(소켓 close로 충분). integration sc24 + installcheck 17/17 GREEN (ADR-053) |
+| D | Exact filtered BF (D-wedge) — **전체 완료** (ADR-063). Option B(`cuvs_filtered_knn` SRF bigint[]+tid[] 오버로드, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook `cuvs.filtered_knn_hook`). IPC `CuvsCmdFrame` filter_shm_key 확장, daemon binary-search post-filter. 잔여 4항목 완료: (1) `tid[]` 타입-안전 wrapper SQL 오버로드, (2) `ExplainCustomScan` 콜백으로 EXPLAIN ANALYZE GPU IPC latency 노출, (3) `.delta` + tombstone 통합(`cuvs_merge_delta_filtered` / `cuvs_apply_tombstones_filtered`), (4) selectivity×correlation 2D 실험으로 `cuvs.filter_auto_threshold=0.05` 근거 실측(`docs/filter-threshold-experiment.md`). installcheck 19/19 + isolation 2/2 GREEN |
 
 ### 미완료
 
@@ -33,8 +34,7 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| **D** | **exact filtered brute-force — 스파이크 완료, PR #35 (ADR-063)** — Option B(`cuvs_filtered_knn` SRF, 4x overfetch, NULL→unfiltered fallback) + Option A(Custom Scan hook, `cuvs.filtered_knn_hook` GUC) 구현·테스트 통과. IPC `CuvsCmdFrame` filter_shm_key 확장, 데몬 binary-search post-filter, 전체 19+2 테스트 GREEN. **잔여**: 타입-안전 wrapper, 선택성 임계값 GUC(단일 스칼라 불충분 — selectivity × correlation 2축 실험으로 임계값 근거 실측 필요, 아래 참조), delta 통합, `EXPLAIN ANALYZE` GPU 타이밍(IPC / GPU kernel / PG heap fetch 분해 — 논문 Figure 생성 선결, 트리거 항목에서 승격) | 전략 wedge |
-| 3O | Pre-filter ANN — cuVS BITSET prefilter로 필터 집합만 탐색(BF 또는 CAGRA). D의 post-filter와 상호보완: 테넌트당 데이터셋이 BF 한계를 넘는 규모에서 recall 보장. D IPC 인프라(`CuvsCmdFrame` filter 필드, daemon filter 경로) 재활용. 분석 ADR-048 | 순차 |
+| 3O | Pre-filter ANN — cuVS BITSET prefilter로 필터 집합만 탐색(BF 또는 CAGRA). D의 post-filter와 상호보완: 테넌트당 데이터셋이 BF 한계를 넘는 규모에서 recall 보장. D IPC 인프라(`CuvsCmdFrame` filter 필드, daemon filter 경로) 재활용. `cuvs.filter_auto_threshold` 기본값=0.05 근거: `docs/filter-threshold-experiment.md`. 분석 ADR-048 | 순차 |
 | 3P | IVF-PQ — 새 AM `USING ivfpq` (product quantization, VRAM 10–100× 절감, 100M+ 대용량). **격하(ADR-061)**: "규모"가 아니라 "VRAM working-set 천장 올리기"; 압축 품질은 RaBitQ에 짐 | 릴리스 후 기능 |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체 | 릴리스 후 기능 |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
@@ -53,7 +53,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053) — 순차 경로는 D 잔여 → 3O → 3P 순이다.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함) — 순차 경로는 3O → 3P 순이다.
 
 #### 3O — Pre-filter ANN (filtered BF/CAGRA 확장)
 **왜**: D(exact filtered BF, PR #35)가 post-filter 방식으로 스파이크 완료됐으나, 테넌트당 데이터셋이 수십만+ 규모로 커지면 k×4 overfetch만으로 recall 보장이 어려움. cuVS BITSET prefilter를 사용해 필터 집합만 탐색하면 대규모에서도 recall=1.0 유지.
@@ -63,7 +63,7 @@
 - backend: filter heapTID 집합 → item_id 배열 변환 후 BITSET 생성 (역방향 맵 활용)
 - daemon: `cuvs_bf_search_filtered()` — BITSET mask를 cuVS `cuvsBruteForceSearch`에 전달(pre-filter)
 - IPC: `CuvsCmdFrame`의 기존 filter 필드 재활용, `use_prefilter` 플래그 추가
-- 선택성 임계값 GUC(`cuvs.filter_prefilter_threshold`): 필터 통과율 낮을 때 pre-filter, 높을 때 기존 post-filter 자동 전환. **단일 스칼라 threshold 한계**: selectivity만으로 전략 우열이 결정되지 않고 correlation(필터 통과 벡터가 쿼리 근방에 밀집하는 정도)이 두 번째 축으로 작동함 — selectivity × correlation 2D 실험으로 crossover 지점 실측 후 GUC 설계 확정
+- 선택성 임계값 GUC(`cuvs.filter_auto_threshold`): 필터 통과율 낮을 때 pre-filter, 높을 때 기존 post-filter 자동 전환. **실측 완료**: N=200k dim=128 selectivity×correlation 2D sweep에서 recall=1.00 임계점 = sel≥10%(모든 correlation), sel<5%에서 random correlation 시 recall 하락 — 기본값 `0.05` 확정. 근거: `docs/filter-threshold-experiment.md`
 - Option A(Custom Scan hook): `cuvs.filtered_knn_hook` 경로에서 pre-filter 모드 활성화
 
 완료 기준: 테넌트당 N=100k 이상 환경에서 recall@10=1.0, 기존 filter_comparison 테스트 PASS, installcheck GREEN, selectivity × correlation sweep으로 threshold 근거 실측
