@@ -29,6 +29,8 @@
 #define CUVS_OP_EXPORT_ADJACENCY 8 /* Phase 3J: export CAGRA adjacency+vecs via shm */
 #define CUVS_OP_EXPORT_HNSW_SHM  9 /* Phase 3J: run from_cagra() → /dev/shm, return path */
 #define CUVS_OP_SEARCH_BATCH    10 /* Phase 3M: Q queries in one request, Q×K reply via shm */
+#define CUVS_OP_BUILD_IVFPQ    11 /* 3P: build an IVF-PQ index */
+#define CUVS_OP_SEARCH_IVFPQ   12 /* 3P: search an IVF-PQ index */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -93,6 +95,11 @@ typedef struct CuvsCmdFrame {
     uint32_t n_filter_tids;            /* SEARCH: filter set size; 0=no filter */
     char     filter_shm_key[64];       /* SEARCH: shm_open name for sorted uint64_t TIDs */
     uint32_t use_prefilter;            /* SEARCH: 3O: 1=GPU BITSET prefilter, 0=D-wedge */
+    /* 3P: IVF-PQ params (appended at end to preserve ABI for existing ops) */
+    uint32_t n_lists;   /* BUILD_IVFPQ: IVF cluster count (0 = auto -> 1024) */
+    uint32_t pq_bits;   /* BUILD_IVFPQ: bits per PQ code (0 = auto -> 8) */
+    uint32_t pq_dim;    /* BUILD_IVFPQ: PQ subspace count (0 = auto -> ceil(dim/2)) */
+    uint32_t n_probes;  /* SEARCH_IVFPQ: IVF clusters to probe at query time */
 } CuvsCmdFrame;
 
 /*
@@ -483,6 +490,40 @@ int cuvs_ipc_drop(
     const char *socket_path,
     uint32_t    db_oid,
     uint32_t    index_oid
+);
+
+/* 3P: IVF-PQ build — heap-tier corpus (vecs+tids direct pointers). */
+int cuvs_ipc_build_ivfpq(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    uint32_t        index_oid,
+    const float    *vecs,
+    const uint64_t *tids,
+    int64_t         n_vecs,
+    int             dim,
+    uint32_t        metric,
+    const char     *index_dir,
+    uint32_t        table_oid,
+    uint32_t        relfilenode,
+    uint32_t        n_lists,
+    uint32_t        pq_bits,
+    uint32_t        pq_dim
+);
+
+/* 3P: IVF-PQ search. */
+int cuvs_ipc_search_ivfpq(
+    const char   *socket_path,
+    uint32_t      db_oid,
+    uint32_t      index_oid,
+    const float  *query_vec,
+    int           dim,
+    int           k,
+    uint32_t      metric,
+    uint32_t      n_probes,
+    uint64_t     *tids_out,
+    float        *dist_out,
+    int          *n_out,
+    uint32_t     *latency_us_out
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */

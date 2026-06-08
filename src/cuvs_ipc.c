@@ -1287,3 +1287,185 @@ cleanup:
         shm_unlink(filter_shm_key);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_build_ivfpq (3P)
+ *
+ * Sends a BUILD_IVFPQ request. Corpus is written to a named shm segment
+ * (heap tier only — memfd/parallel corpus not needed for initial release).
+ * n_lists/pq_bits/pq_dim: 0 lets the daemon apply defaults (1024/8/ceil(dim/2)).
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_build_ivfpq(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    uint32_t        index_oid,
+    const float    *vecs,
+    const uint64_t *tids,
+    int64_t         n_vecs,
+    int             dim,
+    uint32_t        metric,
+    const char     *index_dir,
+    uint32_t        table_oid,
+    uint32_t        relfilenode,
+    uint32_t        n_lists,
+    uint32_t        pq_bits,
+    uint32_t        pq_dim)
+{
+    char shm_key[64] = "";
+    int  shm_fd  = -1;
+    int  sock    = -1;
+    int  rc      = CUVS_STATUS_ERROR;
+    CuvsCmdFrame    cmd;
+    char            dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
+
+    make_shm_key(shm_key, sizeof(shm_key));
+    shm_fd = shm_write_build_payload(shm_key, vecs, tids, n_vecs, dim);
+    if (shm_fd < 0) {
+        LOG_ERROR("[cuvs_ipc_build_ivfpq] shm_write FAILED errno=%d (%s)\n",
+                  errno, strerror(errno));
+        goto cleanup;
+    }
+
+    sock = uds_connect_ex(socket_path, 600);  /* IVF-PQ build can take minutes */
+    if (sock < 0) {
+        LOG_ERROR("[cuvs_ipc_build_ivfpq] uds_connect FAILED errno=%d (%s)\n",
+                  errno, strerror(errno));
+        rc = CUVS_STATUS_UNAVAILABLE;
+        goto cleanup;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op          = CUVS_OP_BUILD_IVFPQ;
+    cmd.db_oid      = db_oid;
+    cmd.index_oid   = index_oid;
+    cmd.metric      = metric;
+    cmd.dim         = (uint32_t)dim;
+    cmd.n_vecs      = n_vecs;
+    cmd.table_oid   = table_oid;
+    cmd.relfilenode = relfilenode;
+    cmd.n_lists     = n_lists;
+    cmd.pq_bits     = pq_bits;
+    cmd.pq_dim      = pq_dim;
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    if (index_dir)
+        strncpy(dir_buf, index_dir, sizeof(dir_buf) - 1);
+    if (cuvs_fd_send(sock, -1, dir_buf, sizeof(dir_buf)) < 0)
+        goto cleanup;
+
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+
+cleanup:
+    if (sock >= 0) close(sock);
+    if (shm_fd >= 0) {
+        close(shm_fd);
+        shm_unlink(shm_key);
+    }
+    return rc;
+}
+
+/* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_search_ivfpq (3P)
+ *
+ * Sends a SEARCH_IVFPQ request. Query is written to shm; results arrive
+ * inline in the reply (same CuvsResult array as regular SEARCH).
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_search_ivfpq(
+    const char   *socket_path,
+    uint32_t      db_oid,
+    uint32_t      index_oid,
+    const float  *query_vec,
+    int           dim,
+    int           k,
+    uint32_t      metric,
+    uint32_t      n_probes,
+    uint64_t     *tids_out,
+    float        *dist_out,
+    int          *n_out,
+    uint32_t     *latency_us_out)
+{
+    char shm_key[64];
+    int  shm_fd = -1;
+    int  sock   = -1;
+    int  rc     = CUVS_STATUS_ERROR;
+
+    if (latency_us_out) *latency_us_out = 0;
+    if (n_out)          *n_out = 0;
+
+    make_shm_key(shm_key, sizeof(shm_key));
+    shm_fd = shm_write_query(shm_key, query_vec, dim);
+    if (shm_fd < 0)
+        goto cleanup;
+
+    sock = uds_connect(socket_path);
+    if (sock < 0) {
+        rc = CUVS_STATUS_UNAVAILABLE;
+        goto cleanup;
+    }
+
+    CuvsCmdFrame cmd = {
+        .op        = CUVS_OP_SEARCH_IVFPQ,
+        .db_oid    = db_oid,
+        .index_oid = index_oid,
+        .k         = (uint32_t)k,
+        .metric    = metric,
+        .dim       = (uint32_t)dim,
+        .n_probes  = n_probes,
+    };
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    CuvsReplyHeader hdr;
+    {
+        int wr = recv_all_interruptible(sock, &hdr, sizeof(hdr), 30);
+        if (wr == 1) { rc = CUVS_STATUS_CANCELED; goto cleanup; }
+        if (wr < 0)  goto cleanup;
+    }
+
+    rc = (int)hdr.status;
+    if (latency_us_out)
+        *latency_us_out = hdr.latency_us;
+
+    if (hdr.status == CUVS_STATUS_OK && hdr.n_results > 0)
+    {
+        int n = (int)hdr.n_results;
+        int n_write = (n > k) ? k : n;
+        CuvsResult *results = malloc(n * sizeof(CuvsResult));
+        if (!results) { rc = CUVS_STATUS_ERROR; goto cleanup; }
+
+        if (recv_all(sock, results, n * sizeof(CuvsResult)) < 0)
+        {
+            free(results);
+            rc = CUVS_STATUS_ERROR;
+            goto cleanup;
+        }
+        for (int i = 0; i < n_write; i++)
+        {
+            tids_out[i] = results[i].tid;
+            dist_out[i] = results[i].distance;
+        }
+        *n_out = n_write;
+        free(results);
+    }
+    else
+    {
+        *n_out = 0;
+    }
+
+cleanup:
+    if (sock >= 0)   close(sock);
+    if (shm_fd >= 0) close(shm_fd);
+    shm_unlink(shm_key);
+    return rc;
+}
