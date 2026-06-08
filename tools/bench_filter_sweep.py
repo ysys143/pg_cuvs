@@ -136,7 +136,7 @@ def make_filter_bigints(sel, corr):
         pool  = np.setdiff1d(all_rids, sp)
         rd    = rng.choice(pool, n_rnd, replace=False)
         chosen = np.concatenate([sp, rd])
-    return all_bigints[chosen]
+    return np.sort(all_bigints[chosen])
 
 def fmt_bigint_array(bints):
     return "ARRAY[%s]::bigint[]" % ",".join(str(b) for b in bints)
