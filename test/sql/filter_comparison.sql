@@ -144,6 +144,46 @@ ORDER BY v <-> '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8)
 LIMIT 10;
 
 -- ----------------------------------------------------------------
+-- Test 4: 3O pre-filter path (GPU BITSET) — forced via GUC
+--
+-- threshold=1.0 means selectivity < 1.0 is always true, so every
+-- filtered call takes the 3O path regardless of filter size.
+-- Correctness criterion: same as D-wedge — all results in tenant 1.
+-- ----------------------------------------------------------------
+
+SET cuvs.filtered_knn_hook = off;
+SET cuvs.filter_auto_threshold = 1.0;
+
+SELECT count(*) AS n, count(*) FILTER (WHERE tenant_id <> 1) AS wrong_tenant
+FROM (
+    SELECT fc.tenant_id
+    FROM cuvs_filtered_knn(
+        'fc_cagra'::regclass,
+        '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+        ARRAY(SELECT ctid FROM fc WHERE tenant_id = 1),
+        10
+    ) f
+    JOIN fc ON fc.ctid = f.ctid
+) s;
+
+-- Force D-wedge by setting threshold=0.0; same correctness expected.
+SET cuvs.filter_auto_threshold = 0.0;
+
+SELECT count(*) AS n, count(*) FILTER (WHERE tenant_id <> 1) AS wrong_tenant
+FROM (
+    SELECT fc.tenant_id
+    FROM cuvs_filtered_knn(
+        'fc_cagra'::regclass,
+        '[0.5,0.3,0.7,0.2,0.8,0.4,0.6,0.1]'::vector(8),
+        ARRAY(SELECT ctid FROM fc WHERE tenant_id = 1),
+        10
+    ) f
+    JOIN fc ON fc.ctid = f.ctid
+) s;
+
+RESET cuvs.filter_auto_threshold;
+
+-- ----------------------------------------------------------------
 -- Cleanup
 -- ----------------------------------------------------------------
 

@@ -117,6 +117,7 @@ int   cuvs_bf_precision            = 0;    /* 0=float32 (default), 1=float16 (Ph
 int   cuvs_bf_batch_wait_us        = 0;    /* daemon BF micro-batch window μs; 0=off (Phase 3L) */
 int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 3M) */
 bool  cuvs_filtered_knn_hook_enabled = false; /* ADR-063 Option A custom scan hook */
+double cuvs_filter_auto_threshold = 0.05;    /* 3O: selectivity below which pre-filter is used */
 
 /* Enum option tables for the Phase 3L GUCs (string in SQL, mapped to int in C). */
 static const struct config_enum_entry cuvs_search_mode_options[] = {
@@ -471,6 +472,18 @@ _PG_init(void)
         "Compared at plan time against the .tids build count. 1.0 disables the gate.",
         &cuvs_max_stale_fraction,
         0.10, 0.0, 1.0,
+        PGC_USERSET,
+        0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable(
+        "cuvs.filter_auto_threshold",
+        "Selectivity below which filtered BF uses GPU BITSET prefilter (3O) instead of D-wedge.",
+        "Selectivity = |filter| / N. Below this value, the daemon searches only within the "
+        "filter set via a GPU BITSET mask (3O), giving recall=1.00 at any selectivity. "
+        "Above this value, the D-wedge post-filter (k*4 overfetch) is used. "
+        "0.0 = always D-wedge, 1.0 = always 3O. Default 0.05 (confirmed by benchmark).",
+        &cuvs_filter_auto_threshold,
+        0.05, 0.0, 1.0,
         PGC_USERSET,
         0, NULL, NULL, NULL);
 
@@ -3957,12 +3970,31 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
 
     /* --- IPC call. --- */
     /*
-     * use_filter: caller provided a non-empty TID whitelist.
-     * k_fetch:    overfetch 4x so post-filter has enough candidates to fill k.
+     * use_filter:    caller provided a non-empty TID whitelist.
+     * use_prefilter: 3O GPU BITSET path when selectivity < filter_auto_threshold.
+     * k_fetch:       D-wedge overfetches 4x; 3O pre-filter fetches exactly k.
      */
     {
-        bool      use_filter = (filter_arr != NULL && n_filter > 0);
-        int       k_fetch    = use_filter ? Min(k * 4, 4000) : k;
+        bool      use_filter    = (filter_arr != NULL && n_filter > 0);
+        bool      use_prefilter = false;
+
+        if (use_filter && cuvs_filter_auto_threshold > 0.0)
+        {
+            Oid heap_oid = IndexGetRelation((Oid) index_oid, true);
+            if (OidIsValid(heap_oid))
+            {
+                Relation hr = try_relation_open(heap_oid, AccessShareLock);
+                if (hr)
+                {
+                    double N = (double) hr->rd_rel->reltuples;
+                    if (N > 0.0 && (double) n_filter / N < cuvs_filter_auto_threshold)
+                        use_prefilter = true;
+                    relation_close(hr, AccessShareLock);
+                }
+            }
+        }
+
+        int       k_fetch    = (use_filter && !use_prefilter) ? Min(k * 4, 4000) : k;
         int       emit_limit;
         int       rc;
         int       n_results  = 0;
@@ -3982,7 +4014,8 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 1,   /* search_mode = brute_force */
                 (uint32_t) cuvs_bf_precision,
                 filter_arr, n_filter,
-                tids_out, dists_out, &n_results, &latency_us, &delta_merged);
+                tids_out, dists_out, &n_results, &latency_us, &delta_merged,
+                (int) use_prefilter);
 
             /* Merge .delta pending-insert rows (filtered) and apply tombstones. */
             if (rc == CUVS_STATUS_OK && cuvs_max_delta_rows > 0)
@@ -4261,10 +4294,20 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     if (ntids > 1)
         qsort(tids, (size_t)ntids, sizeof(uint64_t), compare_tid_enc);
 
-    /* --- Step 2: GPU BF search with post-filter. --- */
+    /* --- Step 2: GPU BF search — 3O pre-filter or D-wedge based on selectivity. --- */
     PgVector *qvec = DatumGetPgVector(state->query_datum);
     int       dim  = qvec->dim;
     int       k    = (int) cuvs_k;
+
+    bool use_prefilter = false;
+    if (ntids > 0 && cuvs_filter_auto_threshold > 0.0
+        && state->heap_rel->rd_rel->reltuples > 0.0)
+    {
+        double N = (double) state->heap_rel->rd_rel->reltuples;
+        if ((double) ntids / N < cuvs_filter_auto_threshold)
+            use_prefilter = true;
+    }
+    int k_cs = use_prefilter ? k : (int) Min((int64_t) k * 4, 4000);
 
     state->result_tids  = palloc((size_t)k * sizeof(uint64_t));
     state->result_dists = palloc((size_t)k * sizeof(float));
@@ -4275,12 +4318,12 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
         cuvs_socket_path,
         (uint32_t) MyDatabaseId,
         (uint32_t) state->index_oid,
-        qvec->x, dim, k, state->metric,
+        qvec->x, dim, k_cs, state->metric,
         1,   /* brute_force */
         (uint32_t) cuvs_bf_precision,
         tids, (uint32_t) ntids,
         state->result_tids, state->result_dists, &state->n_results,
-        &latency_us, &delta_merged);
+        &latency_us, &delta_merged, (int) use_prefilter);
 
     state->last_latency_us = latency_us;
 

@@ -1159,7 +1159,8 @@ cuvs_ipc_search_filtered(
     float         *dist_out,
     int           *n_out,
     uint32_t      *latency_us_out,
-    int           *delta_merged_out)
+    int           *delta_merged_out,
+    int            use_prefilter)
 {
     char shm_key[64];
     char filter_shm_key[64];
@@ -1217,16 +1218,17 @@ cuvs_ipc_search_filtered(
     }
 
     CuvsCmdFrame cmd = {
-        .op           = CUVS_OP_SEARCH,
-        .db_oid       = db_oid,
-        .index_oid    = index_oid,
-        .k            = (uint32_t)k,
-        .metric       = metric,
-        .dim          = (uint32_t)dim,
-        .n_vecs       = 0,
-        .search_mode  = search_mode,
-        .bf_precision = bf_precision,
+        .op            = CUVS_OP_SEARCH,
+        .db_oid        = db_oid,
+        .index_oid     = index_oid,
+        .k             = (uint32_t)k,
+        .metric        = metric,
+        .dim           = (uint32_t)dim,
+        .n_vecs        = 0,
+        .search_mode   = search_mode,
+        .bf_precision  = bf_precision,
         .n_filter_tids = has_filter ? n_filter : 0,
+        .use_prefilter = has_filter ? (uint32_t)use_prefilter : 0,
     };
     strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);
     if (has_filter)

@@ -86,12 +86,13 @@ typedef struct CuvsCmdFrame {
     uint32_t graph_degree;             /* BUILD: 3R; 0 = cuVS default (64) */
     uint32_t intermediate_graph_degree;/* BUILD: 3R; 0 = cuVS default (128) */
     uint32_t build_algo;               /* BUILD: 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
-    /* D-wedge filter (spike: Option A Custom Scan / Option B Function API).
+    /* D-wedge filter (Option A Custom Scan / Option B Function API).
      * 0 = no filter; >0 = sorted uint64_t TID array in filter_shm_key shm.
-     * Daemon post-filters BF results to only those TIDs.
-     * TODO: convert to cuVS BITSET position-indexed prefilter for GPU speedup. */
+     * use_prefilter=0: daemon post-filters BF results to only those TIDs (D-wedge).
+     * use_prefilter=1: daemon converts TIDs to GPU BITSET and calls cuVS prefilter (3O). */
     uint32_t n_filter_tids;            /* SEARCH: filter set size; 0=no filter */
     char     filter_shm_key[64];       /* SEARCH: shm_open name for sorted uint64_t TIDs */
+    uint32_t use_prefilter;            /* SEARCH: 3O: 1=GPU BITSET prefilter, 0=D-wedge */
 } CuvsCmdFrame;
 
 /*
@@ -235,7 +236,8 @@ int cuvs_ipc_search_filtered(
     float        *dist_out,
     int          *n_out,
     uint32_t     *latency_us_out,
-    int          *delta_merged_out  /* OUT: 1 if daemon merged .delta; may be NULL */
+    int          *delta_merged_out, /* OUT: 1 if daemon merged .delta; may be NULL */
+    int           use_prefilter     /* 3O: 1=GPU BITSET prefilter, 0=D-wedge post-filter */
 );
 
 int cuvs_ipc_search(

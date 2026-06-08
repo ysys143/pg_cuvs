@@ -16,9 +16,11 @@
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
 #include <cuvs/neighbors/hnsw.hpp>   /* Phase 3I-1: CPU HNSW fallback */
+#include <cuvs/core/bitset.hpp>      /* 3O: cuvs::core::bitset_view */
 #include <raft/core/device_resources.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
+#include <raft/core/bitset.cuh>      /* 3O: raft::core::bitset device ops */
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>   /* Phase 3L: half precision for brute-force (cuvs.bf_precision) */
@@ -451,6 +453,83 @@ cuvs_bf_free(CuvsBfIndex index, int device_id)
         if (cudaSetDevice(device_id) != cudaSuccess)
             fprintf(stderr, "[cuvs_bf_free] cudaSetDevice(%d) failed\n", device_id);
         delete static_cast<CuvsBfIndexImpl *>(index);
+    }
+}
+
+/* ----------------------------------------------------------------
+ * 3O: GPU BF search with BITSET prefilter
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_bf_search_filtered(
+    CuvsBfIndex       index,
+    const float      *query_vec,
+    int               dim,
+    int               top_k,
+    const uint32_t   *bitset_words,
+    int64_t           bitset_bits,
+    CuvsSearchResult *results,
+    int               device_id)
+{
+    if (!index)
+        return 1;
+
+    CuvsBfIndexImpl *impl = static_cast<CuvsBfIndexImpl *>(index);
+    if (dim != impl->dim)
+        return 2;
+    if ((int64_t)top_k > impl->n)
+        top_k = (int)impl->n;
+    if (top_k <= 0)
+        return 0;
+
+    PooledRes _pr(device_id);
+    try {
+        raft::device_resources &res = _pr.get();
+
+        /* Upload query */
+        auto d_queries   = raft::make_device_matrix<float,   int64_t>(res, (int64_t)1, (int64_t)dim);
+        auto d_indices   = raft::make_device_matrix<int64_t, int64_t>(res, 1, top_k);
+        auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
+        raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
+
+        /* Upload bitset (cuVS convention: bit=1 = excluded) */
+        int64_t n_words = (bitset_bits + 31) / 32;
+        auto d_bs_data = raft::make_device_vector<uint32_t, int64_t>(res, n_words);
+        raft::copy(d_bs_data.data_handle(), bitset_words, (size_t)n_words, res.get_stream());
+
+        auto bv        = cuvs::core::bitset_view<uint32_t, int64_t>(
+                             d_bs_data.data_handle(), bitset_bits);
+        auto prefilter = cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t>(bv);
+
+        /* Filtered search */
+        cuvs::neighbors::brute_force::search_params params;
+        cuvs::neighbors::brute_force::search(
+            res, params, *impl->idx_f32,
+            raft::make_const_mdspan(d_queries.view()),
+            d_indices.view(),
+            d_distances.view(),
+            prefilter);
+
+        res.sync_stream();
+
+        std::vector<int64_t> h_indices(top_k);
+        std::vector<float>   h_distances(top_k);
+        raft::copy(h_indices.data(),   d_indices.data_handle(),   top_k, res.get_stream());
+        raft::copy(h_distances.data(), d_distances.data_handle(), top_k, res.get_stream());
+        res.sync_stream();
+
+        for (int i = 0; i < top_k; i++) {
+            results[i].item_id  = h_indices[i];
+            results[i].distance = h_distances[i];
+        }
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[cuvs_bf_search_filtered] exception: %s\n", e.what());
+        _pr.poison();
+        return 1;
+    } catch (...) {
+        fprintf(stderr, "[cuvs_bf_search_filtered] unknown exception\n");
+        _pr.poison();
+        return 1;
     }
 }
 

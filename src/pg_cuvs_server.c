@@ -137,6 +137,12 @@ typedef struct IndexEntry {
     uint32_t        bf_precision;       /* precision of the resident BF index(es):
                                          * 0=float32, 1=float16 (cuvs.bf_precision) */
 
+    /* 3O pre-filter: TID-sorted reverse map for query-time BITSET construction.
+     * rev_tids[i] is sorted ascending; rev_item_ids[i] is the corresponding item_id.
+     * Built once at load time (O(n log n)); NULL until built or on malloc failure. */
+    uint64_t       *rev_tids;           /* sorted TID values [n_vecs] */
+    int32_t        *rev_item_ids;       /* item_id for rev_tids[i] [n_vecs] */
+
     /* Search stats (pg_stat_gpu_search). Reset on (re)build/load — they
      * describe the currently resident index instance, not a persisted total. */
     uint64_t        search_count;     /* CUVS_STATUS_OK searches */
@@ -368,7 +374,8 @@ warmup_dequeue(WarmupJob *out)
 }
 
 /* Forward declarations for warmup worker. */
-static int load_index(uint32_t db_oid, uint32_t index_oid);
+static int  load_index(uint32_t db_oid, uint32_t index_oid);
+static void build_rev_tid_map(IndexEntry *e);  /* 3O: TID→item_id reverse map */
 
 static void *
 warmup_worker_thread(void *arg)
@@ -1330,6 +1337,7 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
     e->n_vecs        = thdr->n_vecs;
     e->handle        = NULL;
     e->tids          = tids;          /* take ownership */
+    build_rev_tid_map(e);             /* 3O: TID → item_id reverse map */
     e->vram_bytes    = 0;
     e->last_search   = time(NULL);
     e->valid         = 1;
@@ -1354,6 +1362,53 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
         LOG_INFO("  shard %d -> GPU %u (%lld vecs)\n",
                  j, e->shards[j].gpu_device_id, (long long)e->shards[j].n_vecs);
     return 0;
+}
+
+/* ----------------------------------------------------------------
+ * 3O: Build sorted (TID → item_id) reverse map for BITSET prefilter.
+ * Called after e->tids is populated; safe to call with n_vecs==0.
+ * ---------------------------------------------------------------- */
+typedef struct { uint64_t tid; int32_t item_id; } RevTidPair;
+static int
+cmp_rev_tid(const void *a, const void *b)
+{
+    uint64_t ta = ((const RevTidPair *)a)->tid;
+    uint64_t tb = ((const RevTidPair *)b)->tid;
+    return (ta > tb) - (ta < tb);
+}
+
+static void
+build_rev_tid_map(IndexEntry *e)
+{
+    if (!e->tids || e->n_vecs <= 0)
+        return;
+
+    RevTidPair *pairs   = malloc((size_t)e->n_vecs * sizeof(RevTidPair));
+    uint64_t   *rt      = malloc((size_t)e->n_vecs * sizeof(uint64_t));
+    int32_t    *ri      = malloc((size_t)e->n_vecs * sizeof(int32_t));
+
+    if (!pairs || !rt || !ri) {
+        free(pairs); free(rt); free(ri);
+        e->rev_tids     = NULL;
+        e->rev_item_ids = NULL;
+        LOG_WARN("[3O] build_rev_tid_map: malloc failed for index %u/%u\n",
+                 e->db_oid, e->index_oid);
+        return;
+    }
+
+    for (int64_t i = 0; i < e->n_vecs; i++) {
+        pairs[i].tid     = e->tids[i];
+        pairs[i].item_id = (int32_t)i;
+    }
+    qsort(pairs, (size_t)e->n_vecs, sizeof(RevTidPair), cmp_rev_tid);
+    for (int64_t i = 0; i < e->n_vecs; i++) {
+        rt[i] = pairs[i].tid;
+        ri[i] = pairs[i].item_id;
+    }
+    free(pairs);
+
+    e->rev_tids     = rt;
+    e->rev_item_ids = ri;
 }
 
 static int
@@ -1458,6 +1513,7 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     e->n_vecs      = n_vecs;
     e->handle      = handle;
     e->tids        = tids;
+    build_rev_tid_map(e);   /* 3O: TID → item_id reverse map */
     e->vram_bytes  = needed;
     e->last_search = time(NULL);
     e->valid       = 1;
@@ -1664,6 +1720,8 @@ evict_lru(int device_id)
         free_main_bf_cache(e);
         free_index_shards(e);
         free(e->tids);
+        free(e->rev_tids);     e->rev_tids     = NULL;
+        free(e->rev_item_ids); e->rev_item_ids = NULL;
     }
     else
     {
@@ -1678,6 +1736,8 @@ evict_lru(int device_id)
         free_main_bf_cache(e);
         cuvs_cagra_free(e->handle, e->gpu_device_id);
         free(e->tids);
+        free(e->rev_tids);     e->rev_tids     = NULL;
+        free(e->rev_item_ids); e->rev_item_ids = NULL;
         freed = e->vram_bytes;
     }
 
@@ -2102,7 +2162,103 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
             return;
         }
 
-        /* D-wedge spike: overfetch 4x when post-filtering so top-k survive. */
+        /* 3O: GPU BITSET prefilter path.
+         * Converts filter TIDs → bitset via rev map, then calls cuVS filtered BF.
+         * Falls through to D-wedge below on any allocation or search failure. */
+        if (cmd->use_prefilter && cmd->n_filter_tids > 0 && e->rev_tids != NULL)
+        {
+            size_t    flt_bytes  = (size_t)cmd->n_filter_tids * sizeof(uint64_t);
+            void     *flt_mem    = MAP_FAILED;
+            uint64_t *flt_tids   = NULL;
+            uint32_t *bitset     = NULL;
+            CuvsSearchResult *praw     = NULL;
+            CuvsResult       *presults = NULL;
+            int pn = 0, did_prefilter = 0;
+
+            if (cmd->filter_shm_key[0] != '\0')
+            {
+                int ffd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
+                if (ffd >= 0) {
+                    flt_mem = mmap(NULL, flt_bytes, PROT_READ, MAP_SHARED, ffd, 0);
+                    close(ffd);
+                    if (flt_mem != MAP_FAILED)
+                        flt_tids = (uint64_t *) flt_mem;
+                }
+            }
+
+            if (flt_tids) {
+                int64_t  nv      = e->main_bf_n;
+                uint32_t nwords  = (uint32_t)((nv + 31) / 32);
+                bitset   = malloc((size_t)nwords * sizeof(uint32_t));
+                praw     = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsSearchResult));
+                presults = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsResult));
+
+                if (bitset && praw && presults) {
+                    /* bit=1 = exclude (cuVS convention): start all excluded */
+                    memset(bitset, 0xFF, (size_t)nwords * sizeof(uint32_t));
+                    /* clear bits for filter items (include them) */
+                    for (uint32_t fi = 0; fi < cmd->n_filter_tids; fi++) {
+                        uint64_t want = flt_tids[fi];
+                        int64_t lo = 0, hi = nv - 1;
+                        while (lo <= hi) {
+                            int64_t mid = lo + (hi - lo) / 2;
+                            if (e->rev_tids[mid] == want) {
+                                int32_t iid = e->rev_item_ids[mid];
+                                if (iid >= 0 && (int64_t)iid < nv)
+                                    bitset[iid >> 5] &= ~(1u << (iid & 31));
+                                break;
+                            }
+                            if (e->rev_tids[mid] < want) lo = mid + 1;
+                            else                          hi = mid - 1;
+                        }
+                    }
+
+                    int pret = cuvs_bf_search_filtered(
+                        e->main_bf_idx, query, (int)cmd->dim, k,
+                        bitset, nv, praw, delta_gpu_of(e));
+                    if (pret == 0) {
+                        did_prefilter = 1;
+                        munmap(query, vec_bytes);  /* unmap before D-wedge path runs */
+                        for (int i = 0; i < k; i++) {
+                            int64_t id = praw[i].item_id;
+                            if (id < 0 || id >= e->n_vecs) break;
+                            presults[pn].tid      = e->tids[id];
+                            presults[pn].distance = praw[i].distance;
+                            pn++;
+                        }
+                    }
+                }
+            }
+
+            free(bitset);
+            free(praw);
+            if (flt_mem != MAP_FAILED) munmap(flt_mem, flt_bytes);
+
+            if (did_prefilter) {
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                uint32_t lat3o = (uint32_t)(
+                    (t1.tv_sec - t0.tv_sec) * 1000000 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1000);
+                record_search_stat(e, CUVS_STATUS_OK, lat3o, NULL);
+                e->last_requested_k = cmd->k;
+                e->last_returned_k  = (uint32_t) pn;
+                e->last_search_mode = 3; /* gpu_bf */
+                pthread_mutex_unlock(&g_index_mutex);
+                CuvsReplyHeader hdr3o = {0};
+                hdr3o.status     = CUVS_STATUS_OK;
+                hdr3o.n_results  = (uint32_t) pn;
+                hdr3o.latency_us = lat3o;
+                send_all(client_fd, &hdr3o, sizeof(hdr3o));
+                if (pn > 0)
+                    send_all(client_fd, presults, (size_t) pn * sizeof(CuvsResult));
+                free(presults);
+                return;
+            }
+            free(presults);
+            /* 3O failed (search error or malloc); fall through to D-wedge. */
+        }
+
+        /* D-wedge: overfetch 4x when post-filtering so top-k survive. */
         int64_t bk_target = (cmd->n_filter_tids > 0)
             ? (int64_t)k * 4
             : (int64_t)k;
