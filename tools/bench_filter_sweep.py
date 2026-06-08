@@ -25,7 +25,7 @@ K          = 10
 OVERFETCH  = 4        # D's current cuvs.k = K * OVERFETCH
 REPS       = 5        # median over this many queries per cell
 DB         = "contrib_regression"
-SELS       = [0.01, 0.05, 0.10, 0.25, 0.50]
+SELS       = [0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.50]
 CORRS      = [0.0, 0.5, 1.0]
 RNG_SEED   = 42
 
@@ -41,7 +41,7 @@ SET cuvs.k = %d;
 def psql(sql, check=True, with_preamble=False):
     full = (PREAMBLE + sql) if with_preamble else sql
     r = subprocess.run(
-        ["sudo", "-u", "postgres", "psql", "-d", DB, "-t", "-A", "-F", "\t"],
+        ["sudo", "-u", "postgres", "psql", "-d", DB, "-t", "-A", "-q", "-F", "\t"],
         input=full, capture_output=True, text=True
     )
     if check and r.returncode != 0:
@@ -144,20 +144,16 @@ def fmt_bigint_array(bints):
 query_lit = "[%s]" % ",".join("%.4f" % x for x in QUERY_VEC)
 
 # ── Benchmark sweep ───────────────────────────────────────────────────────────
-print("\nsel\tcorr\tn_filter\tn_results\tmed_ms\tmin_ms\tmax_ms", file=sys.stderr)
+HDR = "selectivity\tcorrelation\tn_filter\tn_results\trecall\tmed_ms\tmin_ms\tmax_ms"
+print("\n" + HDR, file=sys.stderr)
+print(HDR)
 
-# header for stdout (TSV)
-print("selectivity\tcorrelation\tn_filter\tn_results\tmed_ms\tmin_ms\tmax_ms")
-
-for sel in SELS:
-    for corr in CORRS:
-        bigints = make_filter_bigints(sel, corr)
-        arr_sql = fmt_bigint_array(bigints)
-
-        latencies  = []
-        last_n     = 0
-        for _ in range(REPS):
-            sql = """
+def run_query(arr_sql):
+    """Run filtered kNN REPS times; return (last_n, latencies_list)."""
+    latencies = []
+    last_n    = 0
+    for _ in range(REPS):
+        sql = """
 WITH t0 AS (SELECT clock_timestamp() AS ts)
 SELECT (SELECT count(*) FROM cuvs_filtered_knn(
          '_bench_sweep_idx'::regclass,
@@ -167,20 +163,39 @@ SELECT (SELECT count(*) FROM cuvs_filtered_knn(
      )) AS n,
      extract(epoch from clock_timestamp() - t0.ts)*1000 AS ms
 FROM t0""" % (query_lit, DIM, arr_sql, K)
-            out = psql(sql, with_preamble=True)
-            if "\t" in out:
-                n_s, ms_s = out.split("\t")
-                last_n    = int(n_s)
-                latencies.append(float(ms_s))
+        out = psql(sql, with_preamble=True)
+        # last non-empty line that contains a tab is the result row
+        lines = [l for l in out.splitlines() if "\t" in l]
+        if lines:
+            n_s, ms_s = lines[-1].split("\t", 1)
+            last_n = int(n_s)
+            latencies.append(float(ms_s))
+    return last_n, latencies
 
-        med = float(np.median(latencies))
-        mn  = float(np.min(latencies))
-        mx  = float(np.max(latencies))
+def emit(sel_label, corr_label, n_filter, last_n, latencies):
+    if not latencies:
+        return
+    med = float(np.median(latencies))
+    mn  = float(np.min(latencies))
+    mx  = float(np.max(latencies))
+    recall = last_n / K
+    line = "%s\t%s\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.2f" % (
+        sel_label, corr_label, n_filter, last_n, recall, med, mn, mx)
+    print(line)
+    print(line, file=sys.stderr)
 
-        line = "%.2f\t%.1f\t%d\t%d\t%.2f\t%.2f\t%.2f" % (
-            sel, corr, len(bigints), last_n, med, mn, mx)
-        print(line)           # TSV to stdout
-        print(line, file=sys.stderr)   # progress to stderr
+# Unfiltered BF baseline (NULL filter)
+print("measuring unfiltered BF baseline...", file=sys.stderr)
+last_n, lats = run_query("NULL::bigint[]")
+emit("unfiltered", "n/a", 0, last_n, lats)
+
+# Selectivity × correlation sweep
+for sel in SELS:
+    for corr in CORRS:
+        bigints = make_filter_bigints(sel, corr)
+        arr_sql = fmt_bigint_array(bigints)
+        last_n, lats = run_query(arr_sql)
+        emit("%.2f" % sel, "%.1f" % corr, len(bigints), last_n, lats)
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 psql("DROP TABLE _bench_sweep CASCADE")
