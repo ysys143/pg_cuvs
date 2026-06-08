@@ -2222,6 +2222,190 @@ cuvs_merge_delta(CuvsScanState *ss, Oid index_oid, const float *query,
     pfree(cands);
 }
 
+/* Binary search: return true if enc_tid is in sorted filter_arr[0..n_filter). */
+static bool
+cuvs_tid_in_filter(uint64_t enc_tid, const uint64_t *filter_arr, uint32_t n_filter)
+{
+    uint32_t lo = 0, hi = n_filter;
+    while (lo < hi)
+    {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (filter_arr[mid] == enc_tid) return true;
+        if (filter_arr[mid] <  enc_tid) lo = mid + 1;
+        else                            hi = mid;
+    }
+    return false;
+}
+
+/* Filtered variant of cuvs_merge_delta: only delta rows whose TID is in
+ * filter_arr (sorted, length n_filter) are merged. Operates directly on
+ * caller-supplied tids_out/dists_out/*n_results arrays (no CuvsScanState). */
+static void
+cuvs_merge_delta_filtered(Oid index_oid, const float *query,
+                          int dim, int k, uint32_t metric,
+                          const uint64_t *filter_arr, uint32_t n_filter,
+                          uint64_t *tids_out, float *dists_out, int *n_results)
+{
+    char            path[MAXPGPATH];
+    int             fd;
+    CuvsDeltaHeader hdr;
+    off_t           fsize;
+    size_t          rec_bytes = cuvs_delta_record_bytes((uint32_t) dim);
+    uint32_t        base_crc;
+    CuvsCand       *cands;
+    char           *recbuf;
+    int             n_base, n_cands, out;
+
+    cuvs_delta_path(index_oid, path, sizeof(path));
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+        return;
+
+    fsize = lseek(fd, 0, SEEK_END);
+    if (cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
+        || hdr.magic != CUVS_DELTA_MAGIC || hdr.version != CUVS_DELTA_VERSION
+        || hdr.dim != (uint32_t) dim
+        || fsize < 0
+        || cuvs_delta_validate(&hdr, (int64_t) fsize - (int64_t) sizeof(hdr)) != 0
+        || hdr.n_rows > (int64_t) cuvs_max_delta_rows
+        || !cuvs_read_tids_crc(index_oid, &base_crc)
+        || base_crc != hdr.base_tids_crc32)
+    {
+        CloseTransientFile(fd);
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_cuvs: delta sidecar unusable mid-scan; "
+                        "retry will replan to CPU")));
+    }
+    if (hdr.n_rows == 0)
+    {
+        CloseTransientFile(fd);
+        return;
+    }
+
+    n_base  = *n_results;
+    n_cands = n_base;
+    cands   = (CuvsCand *) palloc((Size)(n_base + (int) hdr.n_rows) * sizeof(CuvsCand));
+
+    for (int i = 0; i < n_base; i++)
+    {
+        cands[i].tid  = tids_out[i];
+        cands[i].dist = dists_out[i];
+    }
+
+    recbuf = (char *) palloc(rec_bytes);
+    for (int64_t i = 0; i < hdr.n_rows; i++)
+    {
+        off_t    off = (off_t) sizeof(hdr) + (off_t) i * (off_t) rec_bytes;
+        uint64_t tid;
+
+        if (cuvs_pread_all(fd, off, recbuf, rec_bytes) != 0)
+        {
+            CloseTransientFile(fd);
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("pg_cuvs: delta record read failed mid-scan; "
+                            "retry will replan to CPU")));
+        }
+        memcpy(&tid, recbuf, sizeof(tid));
+        /* Skip delta rows not in the caller's filter set. */
+        if (n_filter > 0 && !cuvs_tid_in_filter(tid, filter_arr, n_filter))
+            continue;
+        cands[n_cands].tid  = tid;
+        cands[n_cands].dist = cuvs_cpu_distance(metric, query,
+                                                (const float *) (recbuf + sizeof(tid)),
+                                                dim);
+        n_cands++;
+    }
+    pfree(recbuf);
+    CloseTransientFile(fd);
+
+    qsort_arg(cands, (size_t) n_cands, sizeof(CuvsCand), cuvs_cand_cmp, &metric);
+
+    out = (n_cands < k) ? n_cands : k;
+    for (int i = 0; i < out; i++)
+    {
+        tids_out[i]  = cands[i].tid;
+        dists_out[i] = cands[i].dist;
+    }
+    *n_results = out;
+    pfree(cands);
+}
+
+/* Filtered variant of cuvs_apply_tombstones: operates on caller arrays. */
+static void
+cuvs_apply_tombstones_filtered(Oid index_oid,
+                               uint64_t *tids_out, float *dists_out,
+                               int *n_results)
+{
+    char                 path[MAXPGPATH];
+    int                  fd;
+    CuvsTombstoneHeader  hdr;
+    off_t                fsize;
+    uint32_t             base_crc;
+    CuvsTombstoneRecord *recs;
+    int                  out = 0;
+
+    cuvs_tombstone_path(index_oid, path, sizeof(path));
+    fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+    if (fd < 0)
+        return;
+
+    fsize = lseek(fd, 0, SEEK_END);
+    if (fsize < (off_t) sizeof(hdr)
+        || cuvs_pread_all(fd, 0, &hdr, sizeof(hdr)) != 0
+        || hdr.magic != CUVS_TOMBSTONE_MAGIC
+        || hdr.version != CUVS_TOMBSTONE_VERSION
+        || cuvs_tombstone_validate(&hdr, (int64_t) fsize - (int64_t) sizeof(hdr)) != 0
+        || !cuvs_read_tids_crc(index_oid, &base_crc)
+        || base_crc != hdr.base_tids_crc32
+        || hdr.n_entries == 0)
+    {
+        CloseTransientFile(fd);
+        return;
+    }
+
+    {
+        size_t recs_bytes = (size_t) hdr.n_entries * sizeof(CuvsTombstoneRecord);
+        Snapshot snap = GetActiveSnapshot();
+
+        recs = (CuvsTombstoneRecord *) palloc(recs_bytes);
+        if (cuvs_pread_all(fd, (off_t) sizeof(hdr), recs, recs_bytes) != 0)
+        {
+            CloseTransientFile(fd);
+            pfree(recs);
+            return;
+        }
+        CloseTransientFile(fd);
+
+        for (int i = 0; i < *n_results; i++)
+        {
+            bool dead = false;
+            for (int64_t t = 0; t < hdr.n_entries; t++)
+            {
+                if (recs[t].tid == tids_out[i])
+                {
+                    TransactionId xid = (TransactionId) recs[t].delete_xid;
+                    if (TransactionIdDidCommit(xid)
+                        && !XidInMVCCSnapshot(xid, snap))
+                    {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            if (!dead)
+            {
+                tids_out[out]  = tids_out[i];
+                dists_out[out] = dists_out[i];
+                out++;
+            }
+        }
+        *n_results = out;
+        pfree(recs);
+    }
+}
+
 static IndexScanDesc
 cuvs_beginscan(Relation rel, int nkeys, int norderbys)
 {
@@ -3788,6 +3972,7 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
 
         if (use_filter)
         {
+            int delta_merged = 0;
             rc = cuvs_ipc_search_filtered(
                 cuvs_socket_path,
                 (uint32_t) MyDatabaseId,
@@ -3797,7 +3982,21 @@ cuvs_filtered_knn(PG_FUNCTION_ARGS)
                 1,   /* search_mode = brute_force */
                 (uint32_t) cuvs_bf_precision,
                 filter_arr, n_filter,
-                tids_out, dists_out, &n_results, &latency_us);
+                tids_out, dists_out, &n_results, &latency_us, &delta_merged);
+
+            /* Merge .delta pending-insert rows (filtered) and apply tombstones. */
+            if (rc == CUVS_STATUS_OK && cuvs_max_delta_rows > 0)
+            {
+                int do_cpu = (cuvs_delta_search_mode == 1)
+                          || (cuvs_delta_search_mode == 0 && !delta_merged);
+                if (do_cpu)
+                    cuvs_merge_delta_filtered(
+                        (Oid) index_oid, qvec->x, dim, k, metric,
+                        filter_arr, n_filter,
+                        tids_out, dists_out, &n_results);
+                cuvs_apply_tombstones_filtered(
+                    (Oid) index_oid, tids_out, dists_out, &n_results);
+            }
         }
         else
         {
@@ -3896,6 +4095,8 @@ typedef struct CuvsFilteredScanState {
     Relation    heap_rel;
     /* heap-AM compatible slot for table_tuple_fetch_row_version */
     TupleTableSlot *heap_fetch_slot;
+    /* timing: daemon-reported wall-clock latency of last GPU search (us) */
+    uint32_t        last_latency_us;
 } CuvsFilteredScanState;
 
 /* ---- forward declarations ---- */
@@ -3907,6 +4108,7 @@ static void  cuvs_cs_begin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *cuvs_cs_exec(CustomScanState *node);
 static void  cuvs_cs_end(CustomScanState *node);
 static void  cuvs_cs_rescan(CustomScanState *node);
+static void  cuvs_cs_explain(CustomScanState *node, List *ancestors, ExplainState *es);
 
 static CustomPathMethods cuvs_filtered_path_methods = {
     .CustomName    = "CuvsFilteredScan",
@@ -3917,11 +4119,12 @@ static CustomScanMethods cuvs_filtered_scan_methods = {
     .CreateCustomScanState = cuvs_cs_create_state,
 };
 static CustomExecMethods cuvs_filtered_exec_methods = {
-    .CustomName      = "CuvsFilteredScan",
-    .BeginCustomScan = cuvs_cs_begin,
-    .ExecCustomScan  = cuvs_cs_exec,
-    .EndCustomScan   = cuvs_cs_end,
-    .ReScanCustomScan = cuvs_cs_rescan,
+    .CustomName        = "CuvsFilteredScan",
+    .BeginCustomScan   = cuvs_cs_begin,
+    .ExecCustomScan    = cuvs_cs_exec,
+    .EndCustomScan     = cuvs_cs_end,
+    .ReScanCustomScan  = cuvs_cs_rescan,
+    .ExplainCustomScan = cuvs_cs_explain,
 };
 
 /* ---- planner path → plan ---- */
@@ -4067,6 +4270,7 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
     state->result_dists = palloc((size_t)k * sizeof(float));
     uint32_t latency_us = 0;
 
+    int delta_merged = 0;
     int rc = cuvs_ipc_search_filtered(
         cuvs_socket_path,
         (uint32_t) MyDatabaseId,
@@ -4076,7 +4280,23 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
         (uint32_t) cuvs_bf_precision,
         tids, (uint32_t) ntids,
         state->result_tids, state->result_dists, &state->n_results,
-        &latency_us);
+        &latency_us, &delta_merged);
+
+    state->last_latency_us = latency_us;
+
+    if (rc == CUVS_STATUS_OK && cuvs_max_delta_rows > 0)
+    {
+        int do_cpu = (cuvs_delta_search_mode == 1)
+                  || (cuvs_delta_search_mode == 0 && !delta_merged);
+        if (do_cpu)
+            cuvs_merge_delta_filtered(
+                state->index_oid, qvec->x, dim, k, state->metric,
+                tids, (uint32_t) ntids,
+                state->result_tids, state->result_dists, &state->n_results);
+        cuvs_apply_tombstones_filtered(
+            state->index_oid,
+            state->result_tids, state->result_dists, &state->n_results);
+    }
 
     pfree(tids);
 
@@ -4176,6 +4396,16 @@ cuvs_cs_rescan(CustomScanState *node)
     state->n_results = 0;
     if (state->result_tids)  { pfree(state->result_tids);  state->result_tids  = NULL; }
     if (state->result_dists) { pfree(state->result_dists); state->result_dists = NULL; }
+}
+
+/* ---- ExplainCustomScan ---- */
+static void
+cuvs_cs_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+    CuvsFilteredScanState *state = (CuvsFilteredScanState *) node;
+    if (es->analyze && state->last_latency_us > 0)
+        ExplainPropertyInteger("GPU IPC latency", "us",
+                               (int64) state->last_latency_us, es);
 }
 
 /* ---- set_rel_pathlist_hook ---- */
