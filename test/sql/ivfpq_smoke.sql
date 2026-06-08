@@ -1,0 +1,63 @@
+-- ivfpq_smoke.sql — Phase 3P IVF-PQ access method smoke test.
+-- Verifies: AM/opcls registration, GUC, CREATE INDEX (daemon required),
+-- a deterministic nearest-neighbor search, and pg_stat_gpu_search mode.
+
+\set ON_ERROR_STOP on
+SET client_min_messages = WARNING;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- ivfpq AM registered?
+SELECT amname FROM pg_am WHERE amname = 'ivfpq';
+
+-- Operator classes registered for ivfpq?
+SELECT opcname FROM pg_opclass o
+JOIN pg_am a ON a.oid = o.opcmethod
+WHERE a.amname = 'ivfpq'
+ORDER BY opcname;
+
+-- cuvs.ivfpq_n_probes GUC registered with default 64?
+SHOW cuvs.ivfpq_n_probes;
+
+-- Build a small table and IVF-PQ index.
+-- 20 rows, dim=4, n_lists=4 → ~5 vectors/cluster.
+-- pq_dim=2 divides dim=4 evenly; pq_bits=8 is the default.
+CREATE TABLE ivfpq_items (id int, embedding vector(4));
+INSERT INTO ivfpq_items VALUES
+    (1,  '[1,0,0,0]'), (2,  '[0,1,0,0]'),
+    (3,  '[0,0,1,0]'), (4,  '[0,0,0,1]'),
+    (5,  '[1,1,0,0]'), (6,  '[0,1,1,0]'),
+    (7,  '[0,0,1,1]'), (8,  '[1,0,0,1]'),
+    (9,  '[2,0,0,0]'), (10, '[0,2,0,0]'),
+    (11, '[0,0,2,0]'), (12, '[0,0,0,2]'),
+    (13, '[3,0,0,0]'), (14, '[0,3,0,0]'),
+    (15, '[0,0,3,0]'), (16, '[0,0,0,3]'),
+    (17, '[1,1,1,0]'), (18, '[0,1,1,1]'),
+    (19, '[1,0,1,1]'), (20, '[1,1,0,1]');
+
+CREATE INDEX ivfpq_idx ON ivfpq_items
+    USING ivfpq (embedding vector_l2_ops)
+    WITH (n_lists = 4, pq_bits = 8, pq_dim = 2);
+
+-- Index exists in catalog?
+SELECT indexrelid::regclass FROM pg_index
+WHERE indrelid = 'ivfpq_items'::regclass
+  AND indexrelid::regclass::text = 'ivfpq_idx';
+
+-- Probe all 4 clusters → recall = 1.00 for this tiny dataset.
+-- [1,0,0,0] is the exact match for id=1 (distance = 0).
+SET cuvs.ivfpq_n_probes = 4;
+SET cuvs.k = 4;
+SELECT id FROM ivfpq_items
+ORDER BY embedding <-> '[1,0,0,0]'::vector LIMIT 1;
+
+-- Daemon stats should report search_mode = 'ivfpq' for this index.
+SELECT search_mode FROM pg_stat_gpu_search
+WHERE index_name = 'ivfpq_idx';
+
+-- Cleanup
+DROP TABLE ivfpq_items;
+DROP EXTENSION pg_cuvs;
