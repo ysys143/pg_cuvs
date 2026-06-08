@@ -4307,7 +4307,8 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
         if ((double) ntids / N < cuvs_filter_auto_threshold)
             use_prefilter = true;
     }
-    int k_cs = use_prefilter ? k : (int) Min((int64_t) k * 4, 4000);
+    /* Always send k to daemon: daemon handles 4x D-wedge overfetch internally.
+     * Result buffers are sized k; sending k*4 would overflow them. */
 
     state->result_tids  = palloc((size_t)k * sizeof(uint64_t));
     state->result_dists = palloc((size_t)k * sizeof(float));
@@ -4318,7 +4319,7 @@ cuvs_cs_build(CuvsFilteredScanState *state, EState *estate)
         cuvs_socket_path,
         (uint32_t) MyDatabaseId,
         (uint32_t) state->index_oid,
-        qvec->x, dim, k_cs, state->metric,
+        qvec->x, dim, k, state->metric,
         1,   /* brute_force */
         (uint32_t) cuvs_bf_precision,
         tids, (uint32_t) ntids,
