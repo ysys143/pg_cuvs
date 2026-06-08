@@ -160,7 +160,12 @@ typedef struct IndexEntry {
 
     /* Phase 3I-1: CPU HNSW fallback. Loaded lazily when use_cpu_hnsw=1. */
     CuvsHnswIndex   hnsw_idx;        /* NULL until first cpu_hnsw search request */
-    uint32_t        last_search_mode; /* 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback, 3=gpu_bf, 4=cagra_prefilter */
+    uint32_t        last_search_mode; /* 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback, 3=gpu_bf, 4=cagra_prefilter, 5=ivfpq */
+
+    /* 3P: IVF-PQ sidecar (mutually exclusive with CAGRA handle for same entry) */
+    CuvsIvfPqIndex  ivfpq_handle;       /* NULL if not loaded */
+    int64_t         ivfpq_n_vecs;       /* corpus size (mirrors n_vecs) */
+    size_t          ivfpq_vram_bytes;   /* estimated VRAM for IVF-PQ PQ codes */
 } IndexEntry;
 
 /* Zero just the stat counters of a (re)initialized entry. The slot may carry
@@ -624,6 +629,14 @@ hnsw_file_path(char *out, size_t outlen,
                const char *dir, uint32_t db_oid, uint32_t index_oid)
 {
     snprintf(out, outlen, "%s/%u_%u.hnsw", dir, db_oid, index_oid);
+}
+
+/* 3P: IVF-PQ serialized index. */
+static void
+ivfpq_file_path(char *out, size_t outlen,
+                const char *dir, uint32_t db_oid, uint32_t index_oid)
+{
+    snprintf(out, outlen, "%s/%u_%u.ivfpq", dir, db_oid, index_oid);
 }
 
 /* Sidecar marking an index stale; persists staleness across daemon restarts. */
@@ -1491,28 +1504,40 @@ load_index(uint32_t db_oid, uint32_t index_oid)
         return -2;  /* VRAM: exhausted after eviction */
     }
 
-    CuvsCagraIndex handle = cuvs_cagra_deserialize(idx_path, (int)dim, target_gpu);
+    CuvsCagraIndex handle       = cuvs_cagra_deserialize(idx_path, (int)dim, target_gpu);
+    CuvsIvfPqIndex ivfpq_handle = NULL;
     if (!handle)
     {
-        free(tids);
-        return -1;
+        /* No .cagra sidecar — try .ivfpq (3P IVF-PQ index). */
+        char ivfpq_path[512];
+        ivfpq_file_path(ivfpq_path, sizeof(ivfpq_path), g_index_dir, db_oid, index_oid);
+        if (access(ivfpq_path, F_OK) == 0)
+            ivfpq_handle = cuvs_ivfpq_deserialize(ivfpq_path, target_gpu);
+        if (!ivfpq_handle)
+        {
+            free(tids);
+            return -1;
+        }
     }
 
     if (g_n_indexes >= MAX_INDEXES)
     {
-        cuvs_cagra_free(handle, target_gpu);
+        if (handle)       cuvs_cagra_free(handle, target_gpu);
+        if (ivfpq_handle) cuvs_ivfpq_free(ivfpq_handle, target_gpu);
         free(tids);
         return -1;
     }
 
     IndexEntry *e = &g_indexes[g_n_indexes++];
-    e->db_oid      = db_oid;
-    e->index_oid   = index_oid;
-    e->dim         = dim;
-    e->metric      = metric;
-    e->n_vecs      = n_vecs;
-    e->handle      = handle;
-    e->tids        = tids;
+    e->db_oid       = db_oid;
+    e->index_oid    = index_oid;
+    e->dim          = dim;
+    e->metric       = metric;
+    e->n_vecs       = n_vecs;
+    e->handle       = handle;
+    e->ivfpq_handle = ivfpq_handle;
+    e->ivfpq_n_vecs = ivfpq_handle ? n_vecs : 0;
+    e->tids         = tids;
     build_rev_tid_map(e);   /* 3O: TID → item_id reverse map */
     e->vram_bytes  = needed;
     e->last_search = time(NULL);
@@ -1528,6 +1553,8 @@ load_index(uint32_t db_oid, uint32_t index_oid)
     /* Phase 3L: main BF cache starts empty; lazily built on a BF search. */
     e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
     e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
+    /* 3P: ivfpq_vram_bytes already set above; ensure it's 0 for CAGRA entries */
+    if (!e->ivfpq_handle) e->ivfpq_vram_bytes = 0;
     e->warmup_state = WARMUP_HOT;
     reset_entry_stats(e);
 
@@ -1743,6 +1770,8 @@ evict_lru(int device_id)
 
     /* Phase 3I-1: free CPU HNSW sidecar (RAM-only; no VRAM). */
     if (e->hnsw_idx) { cuvs_hnsw_free(e->hnsw_idx); e->hnsw_idx = NULL; }
+    /* 3P: free IVF-PQ GPU index. */
+    if (e->ivfpq_handle) { cuvs_ivfpq_free(e->ivfpq_handle, e->gpu_device_id); e->ivfpq_handle = NULL; }
 
     int idx = (int)(e - g_indexes);
     for (int i = idx; i < g_n_indexes - 1; i++)
@@ -4181,6 +4210,8 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         free_delta_cache(existing);
         /* Phase 3I-1: drop cached CPU HNSW (new sidecar was just written). */
         if (existing->hnsw_idx) { cuvs_hnsw_free(existing->hnsw_idx); existing->hnsw_idx = NULL; }
+        /* 3P: CAGRA rebuild clears any prior IVF-PQ handle on the same slot. */
+        if (existing->ivfpq_handle) { cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id); existing->ivfpq_handle = NULL; }
         existing->last_search_mode = 0;
         reset_entry_stats(existing);   /* fresh index instance */
     } else {
@@ -4220,7 +4251,10 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         e->gpu_device_id = (uint32_t)target_gpu;
         e->shard_count = 0;     /* unsharded; slot may be reused post-eviction */
         e->shards      = NULL;
-        e->hnsw_idx    = NULL;  /* Phase 3I-1: loaded lazily on first cpu_hnsw request */
+        e->hnsw_idx     = NULL;  /* Phase 3I-1: loaded lazily on first cpu_hnsw request */
+        e->ivfpq_handle = NULL;  /* 3P: CAGRA build never sets an IVF-PQ handle */
+        e->ivfpq_n_vecs = 0;
+        e->ivfpq_vram_bytes = 0;
         e->last_search_mode = 0;
         reset_entry_stats(e);
     }
@@ -5083,6 +5117,384 @@ handle_shard_stats(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * 3P: handle_build_ivfpq — build an IVF-PQ index from the corpus in shm.
+ *
+ * Follows the same mmap-corpus / write_tids_atomic / serialize / registry
+ * pattern as handle_build's unsharded path, but produces .tids + .ivfpq
+ * instead of .tids + .cagra. No shard/hnsw/delta support in initial release.
+ * ---------------------------------------------------------------- */
+static void
+handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
+{
+    char index_dir[256] = {0};
+    int  passed_fd = -1;
+    if (cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &passed_fd) < 0)
+    {
+        send_error(client_fd, "recv index_dir failed");
+        return;
+    }
+    if (passed_fd >= 0) close(passed_fd);   /* IVF-PQ always uses shm tier */
+
+    if (cmd->n_vecs < 1 || cmd->dim == 0)
+    {
+        send_error(client_fd, "IVF-PQ build needs at least 1 vector");
+        return;
+    }
+
+    size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
+    size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
+    size_t total     = vec_bytes + tid_bytes;
+
+    int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
+    if (shm_fd < 0)
+    {
+        send_error(client_fd, "shm_open failed");
+        return;
+    }
+    void *mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (mem == MAP_FAILED)
+    {
+        send_error(client_fd, "mmap failed");
+        return;
+    }
+
+    const float    *vecs    = (const float *)mem;
+    const uint64_t *tids_in = (const uint64_t *)((const char *)mem + vec_bytes);
+
+    uint32_t pq_dim  = cmd->pq_dim  ? cmd->pq_dim  : (uint32_t)((cmd->dim + 1) / 2);
+    uint32_t pq_bits = cmd->pq_bits ? cmd->pq_bits : 8;
+    /* IVF-PQ VRAM ~ n_vecs * pq_dim * pq_bits/8 (PQ codes only, no raw vecs) */
+    size_t needed = (size_t)cmd->n_vecs * pq_dim * (pq_bits / 8 + 1);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    int target_gpu = pick_gpu_for_index(needed);
+    if (target_gpu < 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_OOM_FALLBACK;
+        strncpy(hdr.error, "IVF-PQ index too large for any GPU VRAM budget", sizeof(hdr.error) - 1);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+    if (ensure_vram(needed, target_gpu) < 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_OOM_FALLBACK;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "VRAM exhausted on GPU %d after eviction", target_gpu);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    LOG_DEBUG("[handle_build_ivfpq] building n_vecs=%lld dim=%u n_lists=%u pq_bits=%u pq_dim=%u gpu=%d\n",
+              (long long)cmd->n_vecs, cmd->dim, cmd->n_lists, pq_bits, pq_dim, target_gpu);
+
+    CuvsIvfPqIndex new_handle = NULL;
+    int build_rc = cuvs_ivfpq_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
+                                    cmd->n_lists, pq_bits, pq_dim,
+                                    target_gpu, &new_handle);
+    if (build_rc != 0 || !new_handle)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "cuvs_ivfpq_build failed");
+        return;
+    }
+
+    uint64_t *new_tids = malloc(tid_bytes);
+    if (!new_tids)
+    {
+        cuvs_ivfpq_free(new_handle, target_gpu);
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "malloc tids failed");
+        return;
+    }
+    memcpy(new_tids, tids_in, tid_bytes);
+    munmap(mem, total);
+
+    const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
+    mkdir(save_dir, 0700);
+
+    char tids_final[512], tids_tmp[576];
+    char ivfpq_final[512], ivfpq_tmp[576];
+    tids_file_path(tids_final, sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
+    ivfpq_file_path(ivfpq_final, sizeof(ivfpq_final), save_dir, cmd->db_oid, cmd->index_oid);
+    snprintf(tids_tmp,  sizeof(tids_tmp),  "%s.tmp", tids_final);
+    snprintf(ivfpq_tmp, sizeof(ivfpq_tmp), "%s.tmp", ivfpq_final);
+
+    if (write_tids_atomic(tids_tmp, cmd->n_vecs, cmd->dim, cmd->metric, new_tids) != 0)
+        goto persist_fail;
+
+    if (cuvs_ivfpq_serialize(new_handle, ivfpq_tmp, target_gpu) != 0)
+    {
+        LOG_ERROR("[handle_build_ivfpq] cuvs_ivfpq_serialize FAILED\n");
+        goto persist_fail;
+    }
+
+    if (rename(tids_tmp, tids_final) != 0)
+        goto persist_fail;
+    if (rename(ivfpq_tmp, ivfpq_final) != 0)
+    {
+        unlink(tids_final);
+        goto persist_fail;
+    }
+
+    {
+        int dir_fd = open(save_dir, O_RDONLY);
+        if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    }
+
+    /* Remove any stale CAGRA artifacts for this OID so load_index takes the IVF-PQ path. */
+    {
+        char cagra_path[512];
+        index_file_path(cagra_path, sizeof(cagra_path), save_dir, cmd->db_oid, cmd->index_oid);
+        unlink(cagra_path);
+        char stale_path[512];
+        stale_file_path(stale_path, sizeof(stale_path), save_dir, cmd->db_oid, cmd->index_oid);
+        unlink(stale_path);
+    }
+
+    /* Register (or replace) in the hot index registry. */
+    {
+        IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
+        if (existing)
+        {
+            if (existing->handle)       cuvs_cagra_free(existing->handle, existing->gpu_device_id);
+            if (existing->ivfpq_handle) cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id);
+            free(existing->tids);
+            free_delta_cache(existing);
+            free_main_bf_cache(existing);
+            if (existing->hnsw_idx) { cuvs_hnsw_free(existing->hnsw_idx); existing->hnsw_idx = NULL; }
+            existing->handle         = NULL;
+            existing->ivfpq_handle   = new_handle;
+            existing->ivfpq_n_vecs   = cmd->n_vecs;
+            existing->ivfpq_vram_bytes = needed;
+            existing->tids           = new_tids;
+            existing->dim            = cmd->dim;
+            existing->metric         = cmd->metric;
+            existing->n_vecs         = cmd->n_vecs;
+            existing->vram_bytes     = needed;
+            existing->gpu_device_id  = (uint32_t)target_gpu;
+            existing->last_search    = time(NULL);
+            existing->valid          = 1;
+            existing->stale          = 0;
+            existing->stale_since    = 0;
+            existing->last_search_mode = 5; /* ivfpq */
+            reset_entry_stats(existing);
+            build_rev_tid_map(existing);
+        }
+        else
+        {
+            if (g_n_indexes >= MAX_INDEXES)
+                evict_lru(target_gpu);
+            if (g_n_indexes >= MAX_INDEXES)
+            {
+                cuvs_ivfpq_free(new_handle, target_gpu);
+                free(new_tids);
+                unlink(ivfpq_final);
+                unlink(tids_final);
+                pthread_mutex_unlock(&g_index_mutex);
+                send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "index registry full");
+                return;
+            }
+            IndexEntry *e = &g_indexes[g_n_indexes++];
+            e->db_oid          = cmd->db_oid;
+            e->index_oid       = cmd->index_oid;
+            e->dim             = cmd->dim;
+            e->metric          = cmd->metric;
+            e->n_vecs          = cmd->n_vecs;
+            e->handle          = NULL;
+            e->ivfpq_handle    = new_handle;
+            e->ivfpq_n_vecs    = cmd->n_vecs;
+            e->ivfpq_vram_bytes = needed;
+            e->tids            = new_tids;
+            e->vram_bytes      = needed;
+            e->last_search     = time(NULL);
+            e->valid           = 1;
+            e->stale           = 0;
+            e->stale_since     = 0;
+            e->shard_count     = 0;
+            e->shards          = NULL;
+            e->gpu_device_id   = (uint32_t)target_gpu;
+            e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
+            e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+            e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+            e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
+            e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
+            e->hnsw_idx        = NULL;
+            e->warmup_state    = WARMUP_HOT;
+            e->last_search_mode = 5; /* ivfpq */
+            reset_entry_stats(e);
+            build_rev_tid_map(e);
+        }
+    }
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    LOG_INFO("pg_cuvs_server: built IVF-PQ index %u/%u (%lld vecs, %zu MB VRAM)\n",
+             cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, needed / (1024*1024));
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
+    return;
+
+persist_fail:
+    cuvs_ivfpq_free(new_handle, target_gpu);
+    free(new_tids);
+    unlink(tids_tmp);
+    unlink(ivfpq_tmp);
+    pthread_mutex_unlock(&g_index_mutex);
+    send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "IVF-PQ disk persist failed");
+}
+
+/* ----------------------------------------------------------------
+ * 3P: handle_search_ivfpq — search an IVF-PQ index.
+ * ---------------------------------------------------------------- */
+static void
+handle_search_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    pthread_mutex_lock(&g_index_mutex);
+
+    IndexEntry *e = find_index(cmd->db_oid, cmd->index_oid);
+    if (!e)
+    {
+        int load_rc = load_index(cmd->db_oid, cmd->index_oid);
+        if (load_rc == 0)
+            e = find_index(cmd->db_oid, cmd->index_oid);
+    }
+
+    if (!e || !e->ivfpq_handle)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = e ? CUVS_STATUS_NOT_FOUND : CUVS_STATUS_NOT_FOUND;
+        snprintf(hdr.error, sizeof(hdr.error), "IVF-PQ index %u/%u not found",
+                 cmd->db_oid, cmd->index_oid);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    if (cmd->metric != e->metric)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_METRIC_MISMATCH;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "index built with metric %u but queried with metric %u; REINDEX required",
+                 e->metric, cmd->metric);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    size_t vec_bytes = (size_t)cmd->dim * sizeof(float);
+    int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
+    if (shm_fd < 0)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "shm_open failed");
+        return;
+    }
+    float *query = mmap(NULL, vec_bytes, PROT_READ, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (query == MAP_FAILED)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "mmap failed");
+        return;
+    }
+
+    if (cmd->dim != e->dim)
+    {
+        munmap(query, vec_bytes);
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_DIM_MISMATCH;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "query dim %u does not match index dim %u", cmd->dim, e->dim);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    int k = (int)cmd->k;
+    if (k <= 0) k = 1;
+
+    CuvsSearchResult *raw = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsSearchResult));
+    CuvsResult       *results = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsResult));
+    if (!raw || !results)
+    {
+        free(raw); free(results);
+        munmap(query, vec_bytes);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_error(client_fd, "malloc failed");
+        return;
+    }
+
+    uint32_t n_probes = cmd->n_probes ? cmd->n_probes : 64;
+    int sret = cuvs_ivfpq_search(e->ivfpq_handle, query, (int)cmd->dim, k,
+                                  n_probes, raw, (int)e->gpu_device_id);
+    munmap(query, vec_bytes);
+
+    int n_valid = 0;
+    if (sret == 0)
+    {
+        for (int i = 0; i < k; i++)
+        {
+            int64_t item_id = raw[i].item_id;
+            if (item_id < 0 || item_id >= e->n_vecs)
+                continue;
+            results[n_valid].tid      = e->tids[item_id];
+            results[n_valid].distance = raw[i].distance;
+            n_valid++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t latency_us = (uint32_t)(
+        (t1.tv_sec - t0.tv_sec) * 1000000 +
+        (t1.tv_nsec - t0.tv_nsec) / 1000);
+
+    e->last_search      = time(NULL);
+    e->last_search_mode = 5; /* ivfpq */
+    record_search_stat(e, sret == 0 ? CUVS_STATUS_OK : CUVS_STATUS_ERROR, latency_us, NULL);
+    e->last_requested_k = cmd->k;
+    e->last_returned_k  = (uint32_t)n_valid;
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    free(raw);
+
+    if (sret != 0)
+    {
+        free(results);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_ERROR;
+        strncpy(hdr.error, "IVF-PQ search failed", sizeof(hdr.error) - 1);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status     = CUVS_STATUS_OK;
+    hdr.n_results  = (uint32_t)n_valid;
+    hdr.latency_us = latency_us;
+    send_all(client_fd, &hdr, sizeof(hdr));
+    if (n_valid > 0)
+        send_all(client_fd, results, (size_t)n_valid * sizeof(CuvsResult));
+    free(results);
+}
+
+/* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
 static void *
@@ -5138,6 +5550,12 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_EXPORT_HNSW_SHM:
             handle_export_hnsw_shm(client_fd, &cmd);
+            break;
+        case CUVS_OP_BUILD_IVFPQ:
+            handle_build_ivfpq(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_IVFPQ:
+            handle_search_ivfpq(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");
