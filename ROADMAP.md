@@ -30,6 +30,7 @@
 | 3O | Pre-filter ANN — CAGRA-first BITSET prefilter (ADR-048). daemon 빌드 타임에 `rev_tids[]`(sorted)+`rev_item_ids[]` 역방향 맵 구성. 쿼리 타임에 필터 TID → item_id 이진탐색 → GPU BITSET. `handle_search` 3O 경로: CAGRA prefilter 우선(`cuvs_cagra_search_filtered`, approx/graph-based), 실패 시 BF prefilter fallback(`cuvs_bf_search_filtered`, exact). `use_prefilter` IPC 플래그. `cuvs.filter_auto_threshold` GUC(기본 0.05). `last_search_mode=4`(cagra_prefilter)/3(bf_prefilter). PR #36(BF prefilter), #37(CAGRA-first). installcheck 19/19 + isolation 2/2 GREEN |
 | 3P | IVF-PQ AM — `CREATE INDEX USING ivfpq`, reloptions(`n_lists`/`pq_bits`/`pq_dim`), `cuvs.ivfpq_n_probes` GUC(default 64). PQ codes 내부 저장으로 VRAM 10–100× 절감. `.tids`+`.ivfpq` 사이드카. `default_version` 0.2.0으로 상향. installcheck 20/20 + isolation 2/2 GREEN (ADR-049) |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체. VACUUM tombstone 연동(`cuvs_amvacuumcleanup`) 포함. INSERT/DELETE/UPDATE e2e · .delta 미생성 · vram_bytes 갱신 Scenario 6-8 PASS. installcheck 21/21 + isolation 2/2 GREEN (ADR-051) |
+| 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + 4 GUC(`cuvs.auto_compact` 외 3종) + `pg_stat_gpu_search`에 `extend_count`/`compact_count`/`last_compact_at` 관측성 컬럼 추가. REINDEX CONCURRENTLY+DELETE isolation 테스트(3/3 GREEN). extend_count→compact_count 갱신 e2e(auto_compact.sql). installcheck 22/22 + isolation 3/3 GREEN (ADR-050) |
 
 ### 미완료
 
@@ -37,7 +38,6 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + DELETE 정합 검증 | 릴리스 후 기능 |
 | 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | 트리거 (multi-node 수요) |
 | fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
 | MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload | 다중 테넌트 파티션 온라인-스케일 선결 — 현 `MAX_INDEXES=64`가 하드월(>64 파티션 축출 시 ERROR+REINDEX, auto-reload 미배선). 측정·근거 ADR-061 / STRATEGY_NOTES §G | 트리거 (수백+ 테넌트 수요) |
@@ -52,20 +52,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21) — 순차 경로는 4C 순이다.
-
-#### 4C — Background Compaction + CREATE INDEX CONCURRENTLY 정합성
-**왜**: 3P 완료 후. delta 수동 REINDEX 운용 부담 제거. CONCURRENTLY DELETE 정합성 검증은 4C 착수 전 선행 필수.
-
-구현 항목:
-- 4C-0 선행: REINDEX CONCURRENTLY 동작 검증 + DELETE concurrent build isolation 테스트
-- `cuvs_compaction_worker` bgworker 등록
-- GUC: `cuvs.auto_compact`, `cuvs.auto_compact_check_interval`, `cuvs.auto_compact_threshold`
-- `pg_stat_gpu_search`에 `last_compact_at`, `compact_count` 컬럼 추가
-
-완료 기준: auto_compact=on에서 delta 초과 인덱스 자동 REINDEX e2e 검증, CONCURRENTLY DELETE isolation GREEN, 기존 test suite PASS
-
-스펙: [design/PLAN.md — Phase 4C](design/PLAN.md) | ADR-050
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3) — 릴리스 후 기능 순차 경로 완료. 다음 순차 작업은 트리거 기반 백로그 참조.
 
 ---
 
