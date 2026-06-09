@@ -5881,6 +5881,39 @@ handle_set_vram_budget(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * handle_eat_vram / handle_free_vram — test helpers.
+ *
+ * EAT:  cmd->n_vecs = leave_bytes, cmd->dim = device_id
+ * FREE: cmd->dim = device_id
+ * ---------------------------------------------------------------- */
+static void
+handle_eat_vram(int client_fd, const CuvsCmdFrame *cmd)
+{
+    int64_t leave_bytes = cmd->n_vecs;
+    int     dev         = ((int)cmd->dim >= 0 && (int)cmd->dim < CUVS_MAX_GPUS)
+                          ? (int)cmd->dim : 0;
+
+    int rc = cuvs_eat_vram(leave_bytes, dev);
+
+    CuvsReplyHeader ok = {0};
+    ok.status = (rc == 0) ? CUVS_STATUS_OK : CUVS_STATUS_ERROR;
+    send_all(client_fd, &ok, sizeof(ok));
+}
+
+static void
+handle_free_vram(int client_fd, const CuvsCmdFrame *cmd)
+{
+    int dev = ((int)cmd->dim >= 0 && (int)cmd->dim < CUVS_MAX_GPUS)
+              ? (int)cmd->dim : 0;
+
+    cuvs_free_vram(dev);
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
+}
+
+/* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
 static void *
@@ -5951,6 +5984,12 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SET_VRAM_BUDGET:
             handle_set_vram_budget(client_fd, &cmd);
+            break;
+        case CUVS_OP_EAT_VRAM:
+            handle_eat_vram(client_fd, &cmd);
+            break;
+        case CUVS_OP_FREE_VRAM:
+            handle_free_vram(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

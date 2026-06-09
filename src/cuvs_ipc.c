@@ -1621,3 +1621,62 @@ cuvs_ipc_set_vram_budget(const char *socket_path, int64_t budget_bytes)
     close(sock);
     return rc;
 }
+
+/* ----------------------------------------------------------------
+ * cuvs_ipc_eat_vram / cuvs_ipc_free_vram — test helpers.
+ *
+ * EAT: tell the daemon to cudaMalloc (free_vram - leave_bytes) on
+ * device_id, leaving only leave_bytes of VRAM free.  Subsequent GPU
+ * operations that need more than that hit physical CUDA OOM instead
+ * of the budget-check path.  FREE: release that allocation.
+ *
+ * leave_bytes in n_vecs; device_id in dim.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_eat_vram(const char *socket_path, int64_t leave_bytes, int device_id)
+{
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame    cmd;
+    CuvsReplyHeader hdr;
+
+    sock = uds_connect_ex(socket_path, 10);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op     = CUVS_OP_EAT_VRAM;
+    cmd.n_vecs = leave_bytes;
+    cmd.dim    = (uint32_t)device_id;
+
+    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        rc = (int)hdr.status;
+
+    close(sock);
+    return rc;
+}
+
+int
+cuvs_ipc_free_vram(const char *socket_path, int device_id)
+{
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame    cmd;
+    CuvsReplyHeader hdr;
+
+    sock = uds_connect_ex(socket_path, 10);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op  = CUVS_OP_FREE_VRAM;
+    cmd.dim = (uint32_t)device_id;
+
+    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        rc = (int)hdr.status;
+
+    close(sock);
+    return rc;
+}

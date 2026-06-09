@@ -322,6 +322,10 @@ void cuvs_warmup_device(int device_id);
 /* Legacy: warm-up device 0 (used by unit test binary). */
 void cuvs_warmup(void);
 
+/* test/admin: eat/free raw VRAM to trigger physical CUDA OOM */
+int cuvs_eat_vram(int64_t leave_bytes, int device_id);
+int cuvs_free_vram(int device_id);
+
 #ifdef __cplusplus
 }
 #endif

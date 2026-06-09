@@ -34,6 +34,8 @@
 #define CUVS_OP_EXTEND         13 /* 3Q: cagra::extend CAGRA index in-place */
 #define CUVS_OP_COMPACT        14 /* 3Q: cagra::merge with tombstone filter */
 #define CUVS_OP_SET_VRAM_BUDGET 15 /* admin/test: set per-GPU VRAM budget (bytes); 0=unlimited */
+#define CUVS_OP_EAT_VRAM        16 /* test: cudaMalloc to leave only n_vecs bytes free on GPU dim */
+#define CUVS_OP_FREE_VRAM       17 /* test: release the g_vram_eaten allocation on GPU dim */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -568,6 +570,17 @@ int cuvs_ipc_compact(
 int cuvs_ipc_set_vram_budget(
     const char *socket_path,
     int64_t     budget_bytes    /* bytes; 0 = unlimited */
+);
+
+int cuvs_ipc_eat_vram(
+    const char *socket_path,
+    int64_t     leave_bytes,    /* bytes to leave free; 0 = eat everything */
+    int         device_id
+);
+
+int cuvs_ipc_free_vram(
+    const char *socket_path,
+    int         device_id
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */

@@ -1498,6 +1498,64 @@ cuvs_cagra_extract_adjacency(
 }
 
 /* ----------------------------------------------------------------
+ * Debug/test helpers: eat and free raw VRAM to simulate physical CUDA OOM.
+ *
+ * cuvs_eat_vram(leave_bytes, device_id): allocate enough VRAM to leave only
+ * `leave_bytes` free on the device.  Subsequent GPU operations that need more
+ * than that hit cudaMalloc / RMM OOM instead of the budget-check path.
+ *
+ * cuvs_free_vram(device_id): release the held allocation.
+ *
+ * The static array is indexed by device_id (max CUVS_MAX_GPUS = 16).
+ * ---------------------------------------------------------------- */
+
+static void *g_vram_eaten[16] = {NULL};
+
+extern "C" int
+cuvs_eat_vram(int64_t leave_bytes, int device_id)
+{
+    if (device_id < 0 || device_id >= 16)
+        return 1;
+
+    if (g_vram_eaten[device_id]) {
+        cudaSetDevice(device_id);
+        cudaFree(g_vram_eaten[device_id]);
+        g_vram_eaten[device_id] = NULL;
+    }
+
+    if (leave_bytes < 0) leave_bytes = 0;
+
+    cudaSetDevice(device_id);
+    size_t free_mem = 0, total_mem = 0;
+    if (cudaMemGetInfo(&free_mem, &total_mem) != cudaSuccess)
+        return 1;
+
+    if ((size_t)leave_bytes >= free_mem)
+        return 0;  /* already at or below the target free headroom */
+
+    size_t eat = free_mem - (size_t)leave_bytes;
+    cudaError_t err = cudaMalloc(&g_vram_eaten[device_id], eat);
+    if (err != cudaSuccess) {
+        g_vram_eaten[device_id] = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int
+cuvs_free_vram(int device_id)
+{
+    if (device_id < 0 || device_id >= 16)
+        return 1;
+    if (g_vram_eaten[device_id]) {
+        cudaSetDevice(device_id);
+        cudaFree(g_vram_eaten[device_id]);
+        g_vram_eaten[device_id] = NULL;
+    }
+    return 0;
+}
+
+/* ----------------------------------------------------------------
  * Warm-up: pay the one-time GPU init cost (CUDA primary context, RMM pool,
  * cuBLAS/cuSOLVER handles, kernel JIT) at daemon startup instead of on the
  * first client query. Runs a tiny brute-force search; also primes one entry

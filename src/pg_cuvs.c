@@ -4241,6 +4241,39 @@ pg_cuvs_set_vram_budget(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+/* pg_cuvs_eat_vram(leave_bytes bigint) — pre-allocate VRAM leaving only
+ * leave_bytes free.  Forces physical CUDA OOM on the next large GPU op,
+ * bypassing the budget-check path.  Test-only.  Device 0. */
+PG_FUNCTION_INFO_V1(pg_cuvs_eat_vram);
+Datum
+pg_cuvs_eat_vram(PG_FUNCTION_ARGS)
+{
+    int64 leave_bytes = PG_GETARG_INT64(0);
+    int   rc;
+
+    rc = cuvs_ipc_eat_vram(cuvs_socket_path, (int64_t)leave_bytes, 0);
+    if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs_eat_vram: daemon returned status %d", rc)));
+    PG_RETURN_VOID();
+}
+
+/* pg_cuvs_free_vram() — release the allocation from pg_cuvs_eat_vram. */
+PG_FUNCTION_INFO_V1(pg_cuvs_free_vram);
+Datum
+pg_cuvs_free_vram(PG_FUNCTION_ARGS)
+{
+    int rc;
+
+    rc = cuvs_ipc_free_vram(cuvs_socket_path, 0);
+    if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs_free_vram: daemon returned status %d", rc)));
+    PG_RETURN_VOID();
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_gc_orphans);
 Datum
 pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)

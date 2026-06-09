@@ -485,3 +485,22 @@ COMMENT ON FUNCTION pg_cuvs_set_vram_budget(bigint) IS
   'Override the per-GPU VRAM budget (bytes) for the running daemon. '
   '0 = unlimited. Intended for testing and capacity management; '
   'does not persist across daemon restarts.';
+
+CREATE FUNCTION pg_cuvs_eat_vram(leave_bytes bigint)
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_eat_vram'
+LANGUAGE C VOLATILE STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_eat_vram(bigint) IS
+  'Test helper: pre-allocate GPU VRAM via cudaMalloc so that only '
+  'leave_bytes remain free.  Forces physical CUDA OOM on the next '
+  'large GPU operation, bypassing the VRAM budget-check path. '
+  'Device 0. Release with pg_cuvs_free_vram().';
+
+CREATE FUNCTION pg_cuvs_free_vram()
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_free_vram'
+LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION pg_cuvs_free_vram() IS
+  'Release the VRAM held by pg_cuvs_eat_vram(). Device 0.';
