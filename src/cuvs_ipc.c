@@ -1680,3 +1680,27 @@ cuvs_ipc_free_vram(const char *socket_path, int device_id)
     close(sock);
     return rc;
 }
+
+int
+cuvs_ipc_inject_extend_oom(const char *socket_path, int enable)
+{
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame    cmd;
+    CuvsReplyHeader hdr;
+
+    sock = uds_connect_ex(socket_path, 10);
+    if (sock < 0)
+        return CUVS_STATUS_UNAVAILABLE;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op  = CUVS_OP_INJECT_EXTEND_OOM;
+    cmd.dim = (uint32_t)(enable ? 1 : 0);
+
+    if (send_all(sock, &cmd, sizeof(cmd)) >= 0 &&
+        recv_all(sock, &hdr, sizeof(hdr)) >= 0)
+        rc = (int)hdr.status;
+
+    close(sock);
+    return rc;
+}

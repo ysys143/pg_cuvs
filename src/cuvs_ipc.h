@@ -36,6 +36,7 @@
 #define CUVS_OP_SET_VRAM_BUDGET 15 /* admin/test: set per-GPU VRAM budget (bytes); 0=unlimited */
 #define CUVS_OP_EAT_VRAM        16 /* test: cudaMalloc to leave only n_vecs bytes free on GPU dim */
 #define CUVS_OP_FREE_VRAM       17 /* test: release the g_vram_eaten allocation on GPU dim */
+#define CUVS_OP_INJECT_EXTEND_OOM 18 /* test: make next cuvs_cagra_extend throw bad_alloc (0=off,1=on) */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -581,6 +582,13 @@ int cuvs_ipc_eat_vram(
 int cuvs_ipc_free_vram(
     const char *socket_path,
     int         device_id
+);
+
+/* test: enable (enable=1) or clear (enable=0) the inject_extend_oom flag in the daemon.
+ * When set, the next cuvs_cagra_extend call throws bad_alloc → exercises _pr.poison() path. */
+int cuvs_ipc_inject_extend_oom(
+    const char *socket_path,
+    int         enable          /* 1 = inject OOM on next extend, 0 = clear */
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */

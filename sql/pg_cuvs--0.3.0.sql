@@ -504,3 +504,13 @@ LANGUAGE C VOLATILE;
 
 COMMENT ON FUNCTION pg_cuvs_free_vram() IS
   'Release the VRAM held by pg_cuvs_eat_vram(). Device 0.';
+
+CREATE FUNCTION pg_cuvs_inject_extend_oom(enable integer)
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_inject_extend_oom'
+LANGUAGE C VOLATILE STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_inject_extend_oom(integer) IS
+  'Test-only: arm (1) or disarm (0) synthetic OOM injection in cuvs_cagra_extend. '
+  'When armed, the next extend throws bad_alloc, exercising _pr.poison() → '
+  'BUILD_FAILED → delta fallback. The flag self-clears on fire.';

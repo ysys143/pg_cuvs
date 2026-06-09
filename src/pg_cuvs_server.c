@@ -5913,6 +5913,18 @@ handle_free_vram(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &ok, sizeof(ok));
 }
 
+/* handle_inject_extend_oom — test helper: arm/disarm synthetic OOM in cuvs_cagra_extend.
+ * cmd->dim == 1 arms; == 0 disarms. */
+static void
+handle_inject_extend_oom(int client_fd, const CuvsCmdFrame *cmd)
+{
+    cuvs_set_inject_extend_oom((int)cmd->dim);
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
+}
+
 /* ----------------------------------------------------------------
  * Per-connection thread
  * ---------------------------------------------------------------- */
@@ -5990,6 +6002,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_FREE_VRAM:
             handle_free_vram(client_fd, &cmd);
+            break;
+        case CUVS_OP_INJECT_EXTEND_OOM:
+            handle_inject_extend_oom(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");

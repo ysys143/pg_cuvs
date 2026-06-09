@@ -31,6 +31,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <mutex>
+#include <atomic>
 
 /* ----------------------------------------------------------------
  * Per-device device_resources pool (Phase 3E)
@@ -59,6 +60,9 @@ struct DevicePool {
 };
 
 static DevicePool g_device_pools[CUVS_MAX_GPUS];
+
+/* test-only: armed by cuvs_set_inject_extend_oom(); self-clears in cuvs_cagra_extend */
+static std::atomic<int> g_inject_extend_oom{0};
 
 std::unique_ptr<raft::device_resources> acquire_res(int device_id)
 {
@@ -1050,6 +1054,10 @@ cuvs_cagra_extend(CuvsCagraIndex index,
 
     PooledRes _pr(device_id);
     try {
+        /* test-only: inject bad_alloc to exercise the _pr.poison() / BUILD_FAILED path */
+        if (g_inject_extend_oom.exchange(0) != 0)
+            throw std::bad_alloc();
+
         raft::device_resources &res = _pr.get();
 
         /* Upload new vectors to device */
@@ -1500,16 +1508,25 @@ cuvs_cagra_extract_adjacency(
 /* ----------------------------------------------------------------
  * Debug/test helpers: eat and free raw VRAM to simulate physical CUDA OOM.
  *
- * cuvs_eat_vram(leave_bytes, device_id): allocate enough VRAM to leave only
- * `leave_bytes` free on the device.  Subsequent GPU operations that need more
- * than that hit cudaMalloc / RMM OOM instead of the budget-check path.
+ * cuvs_eat_vram(leave_bytes, device_id): allocate enough VRAM (in 512 MB
+ * chunks) to leave only ~leave_bytes free on the device.  Chunked allocation
+ * is required because CUDA driver typically refuses a single cudaMalloc of
+ * nearly-full VRAM on large GPUs (A100 40 GB etc.) — individual 512 MB
+ * allocations stack up to 39+ GB without triggering the driver limit.
  *
- * cuvs_free_vram(device_id): release the held allocation.
+ * cuvs_free_vram(device_id): release all held chunks.
  *
- * The static array is indexed by device_id (max CUVS_MAX_GPUS = 16).
+ * Max 256 chunks per device (256 × 512 MB = 128 GB — enough for any GPU).
  * ---------------------------------------------------------------- */
 
-static void *g_vram_eaten[16] = {NULL};
+static void *g_vram_eaten_ptrs[16][256];
+static int   g_vram_eaten_cnt[16];
+
+extern "C" void
+cuvs_set_inject_extend_oom(int enable)
+{
+    g_inject_extend_oom.store(enable);
+}
 
 extern "C" int
 cuvs_eat_vram(int64_t leave_bytes, int device_id)
@@ -1517,29 +1534,64 @@ cuvs_eat_vram(int64_t leave_bytes, int device_id)
     if (device_id < 0 || device_id >= 16)
         return 1;
 
-    if (g_vram_eaten[device_id]) {
-        cudaSetDevice(device_id);
-        cudaFree(g_vram_eaten[device_id]);
-        g_vram_eaten[device_id] = NULL;
+    cudaSetDevice(device_id);
+
+    /* Release any previous allocation */
+    for (int i = 0; i < g_vram_eaten_cnt[device_id]; i++) {
+        cudaFree(g_vram_eaten_ptrs[device_id][i]);
+        g_vram_eaten_ptrs[device_id][i] = NULL;
     }
+    g_vram_eaten_cnt[device_id] = 0;
 
     if (leave_bytes < 0) leave_bytes = 0;
 
-    cudaSetDevice(device_id);
     size_t free_mem = 0, total_mem = 0;
     if (cudaMemGetInfo(&free_mem, &total_mem) != cudaSuccess)
         return 1;
 
-    if ((size_t)leave_bytes >= free_mem)
-        return 0;  /* already at or below the target free headroom */
+    fprintf(stderr, "[cuvs_eat_vram] device=%d free=%zu MB leave=%ld MB\n",
+            device_id, free_mem >> 20, (long)(leave_bytes >> 20));
 
-    size_t eat = free_mem - (size_t)leave_bytes;
-    cudaError_t err = cudaMalloc(&g_vram_eaten[device_id], eat);
-    if (err != cudaSuccess) {
-        g_vram_eaten[device_id] = NULL;
-        return 1;
+    if ((size_t)leave_bytes >= free_mem)
+        return 0;
+
+    /* Two-phase eating so we leave very little free:
+     *   Phase 1: 1 GB chunks — fast bulk consumption
+     *   Phase 2: 4 MB chunks — fine-grained mop-up to approach driver headroom
+     * CUDA driver reserves ~100-500 MB depending on GPU; we stop when it
+     * refuses the next chunk, leaving only that headroom free. */
+    const size_t LARGE = 1024UL * 1024 * 1024;   /* 1 GB */
+    const size_t SMALL = 4UL * 1024 * 1024;       /* 4 MB */
+    size_t remaining = free_mem - (size_t)leave_bytes;
+    int cnt = 0;
+
+    while (remaining >= LARGE && cnt < 256) {
+        void *ptr = NULL;
+        if (cudaMalloc(&ptr, LARGE) != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+        g_vram_eaten_ptrs[device_id][cnt++] = ptr;
+        remaining -= LARGE;
     }
-    return 0;
+
+    while (remaining >= SMALL && cnt < 256) {
+        void *ptr = NULL;
+        if (cudaMalloc(&ptr, SMALL) != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+        g_vram_eaten_ptrs[device_id][cnt++] = ptr;
+        remaining -= SMALL;
+    }
+    g_vram_eaten_cnt[device_id] = cnt;
+
+    size_t free_after = 0, dummy = 0;
+    cudaMemGetInfo(&free_after, &dummy);
+    fprintf(stderr, "[cuvs_eat_vram] ate %d chunks; free_after=%zu MB\n",
+            cnt, free_after >> 20);
+
+    return 0;  /* always success — we ate what we could */
 }
 
 extern "C" int
@@ -1547,10 +1599,13 @@ cuvs_free_vram(int device_id)
 {
     if (device_id < 0 || device_id >= 16)
         return 1;
-    if (g_vram_eaten[device_id]) {
+    if (g_vram_eaten_cnt[device_id] > 0) {
         cudaSetDevice(device_id);
-        cudaFree(g_vram_eaten[device_id]);
-        g_vram_eaten[device_id] = NULL;
+        for (int i = 0; i < g_vram_eaten_cnt[device_id]; i++) {
+            cudaFree(g_vram_eaten_ptrs[device_id][i]);
+            g_vram_eaten_ptrs[device_id][i] = NULL;
+        }
+        g_vram_eaten_cnt[device_id] = 0;
     }
     return 0;
 }

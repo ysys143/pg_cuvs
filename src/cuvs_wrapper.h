@@ -326,6 +326,10 @@ void cuvs_warmup(void);
 int cuvs_eat_vram(int64_t leave_bytes, int device_id);
 int cuvs_free_vram(int device_id);
 
+/* test: arm (enable=1) or disarm (enable=0) synthetic OOM injection in cuvs_cagra_extend.
+ * When armed, the next extend call throws bad_alloc and self-clears the flag. */
+void cuvs_set_inject_extend_oom(int enable);
+
 #ifdef __cplusplus
 }
 #endif

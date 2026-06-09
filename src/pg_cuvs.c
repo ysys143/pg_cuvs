@@ -4259,18 +4259,32 @@ pg_cuvs_eat_vram(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
-/* pg_cuvs_free_vram() — release the allocation from pg_cuvs_eat_vram. */
+/* pg_cuvs_free_vram() — release the allocation from pg_cuvs_eat_vram.
+ * Best-effort cleanup: never throws — failure to free is not a fatal error. */
 PG_FUNCTION_INFO_V1(pg_cuvs_free_vram);
 Datum
 pg_cuvs_free_vram(PG_FUNCTION_ARGS)
 {
-    int rc;
+    (void) cuvs_ipc_free_vram(cuvs_socket_path, 0);
+    PG_RETURN_VOID();
+}
 
-    rc = cuvs_ipc_free_vram(cuvs_socket_path, 0);
+/* pg_cuvs_inject_extend_oom(enable int) — arm (1) or disarm (0) synthetic OOM
+ * injection in cuvs_cagra_extend.  When armed, the next extend throws bad_alloc,
+ * exercises _pr.poison() → BUILD_FAILED → delta fallback.  Self-clears on fire.
+ * Test-only; no-op if daemon is unavailable. */
+PG_FUNCTION_INFO_V1(pg_cuvs_inject_extend_oom);
+Datum
+pg_cuvs_inject_extend_oom(PG_FUNCTION_ARGS)
+{
+    int32 enable = PG_GETARG_INT32(0);
+    int   rc;
+
+    rc = cuvs_ipc_inject_extend_oom(cuvs_socket_path, (int)enable);
     if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("pg_cuvs_free_vram: daemon returned status %d", rc)));
+                 errmsg("pg_cuvs_inject_extend_oom: daemon returned status %d", rc)));
     PG_RETURN_VOID();
 }
 
