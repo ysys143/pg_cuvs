@@ -5,6 +5,10 @@
 --   2. pg_cuvs_compact() on a clean index: no-op, returns without error.
 --   3. DELETE + VACUUM + pg_cuvs_compact(): dead vector removed from results.
 --   4. Compact with no tombstone file: idempotent, returns OK.
+--   5. VACUUM alone triggers compact (amvacuumcleanup path).
+--   6. INSERT via EXTEND: delta_rows stays 0 (no delta fallback).
+--   7. EXTEND updates vram_bytes to non-zero.
+--   8. UPDATE e2e: new vector findable, compact succeeds.
 --
 -- Determinism: base cluster sits near origin (dist ~0.01); the inserted vector
 -- sits at [10,0,0,0] — unambiguously the nearest neighbor to that query point.
@@ -86,6 +90,58 @@ FROM cs ORDER BY embedding <-> '[20,0,0,0]'::vector LIMIT 1;
  t
 (1 row)
 
+-- ----------------------------------------------------------------
+-- Scenario 6: INSERT -> EXTEND 성공 시 delta fallback 없음
+-- daemon이 정상일 때 EXTEND가 delta_append를 건너뛰므로
+-- pg_stat_gpu_search.delta_rows는 0을 유지해야 한다.
+-- ----------------------------------------------------------------
+INSERT INTO cs VALUES (3001, '[30,0,0,0]');
+SELECT delta_rows = 0 AS no_delta_fallback
+FROM pg_stat_gpu_search
+WHERE index_oid = 'cs_cagra'::regclass;
+ no_delta_fallback 
+-------------------
+ t
+(1 row)
+
+DELETE FROM cs WHERE id = 3001;
+-- ----------------------------------------------------------------
+-- Scenario 7: EXTEND 후 vram_bytes 갱신
+-- handle_extend는 e->vram_bytes = estimate_vram_bytes(n_vecs, dim)으로
+-- 갱신하므로 INSERT 후 vram_bytes > 0이어야 한다.
+-- ----------------------------------------------------------------
+INSERT INTO cs VALUES (4001, '[40,0,0,0]');
+SELECT vram_bytes > 0 AS vram_positive
+FROM pg_stat_gpu_search
+WHERE index_oid = 'cs_cagra'::regclass;
+ vram_positive 
+---------------
+ t
+(1 row)
+
+DELETE FROM cs WHERE id = 4001;
+-- ----------------------------------------------------------------
+-- Scenario 8: UPDATE e2e — 새 벡터 검색 가능, compact 정상
+-- UPDATE는 DELETE(tombstone) + INSERT(EXTEND)로 변환된다.
+-- compact 후 새 벡터([50,1,0,0])가 top-1으로 나와야 한다.
+-- ----------------------------------------------------------------
+INSERT INTO cs VALUES (5001, '[50,0,0,0]');
+UPDATE cs SET embedding = '[50,1,0,0]' WHERE id = 5001;
+VACUUM cs;
+SELECT pg_cuvs_compact('cs_cagra'::regclass);
+ pg_cuvs_compact 
+-----------------
+ 
+(1 row)
+
+SELECT id = 5001 AS updated_vec_found
+FROM cs ORDER BY embedding <-> '[50,1,0,0]'::vector LIMIT 1;
+ updated_vec_found 
+-------------------
+ t
+(1 row)
+
+DELETE FROM cs WHERE id = 5001;
 RESET enable_seqscan;
 DROP TABLE cs;
 DROP EXTENSION pg_cuvs;
