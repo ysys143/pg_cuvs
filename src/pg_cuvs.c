@@ -60,6 +60,7 @@
 #include "optimizer/pathnode.h"     /* add_path */
 #include "optimizer/tlist.h"        /* get_sortgroupclause_tle */
 #include "executor/executor.h"      /* ExecInitQual, ExecQual */
+#include "postmaster/bgworker.h"    /* BackgroundWorker, RegisterBackgroundWorker */
 
 #include <sys/stat.h>
 #include <sys/file.h>   /* flock */
@@ -117,6 +118,11 @@ int   cuvs_bf_precision            = 0;    /* 0=float32 (default), 1=float16 (Ph
 int   cuvs_bf_batch_wait_us        = 0;    /* daemon BF micro-batch window μs; 0=off (Phase 3L) */
 int   cuvs_max_batch_queries       = 1024; /* pg_cuvs_batch_search Q cap (Phase 3M) */
 bool  cuvs_filtered_knn_hook_enabled = false; /* ADR-063 Option A custom scan hook */
+/* Phase 4C: background auto-compaction */
+bool   cuvs_auto_compact                = false;
+int    cuvs_auto_compact_check_interval = 60;
+double cuvs_auto_compact_threshold      = 0.10;
+char  *cuvs_auto_compact_database       = NULL;
 double cuvs_filter_auto_threshold = 0.05;    /* 3O: selectivity below which pre-filter is used */
 int   cuvs_ivfpq_n_probes          = 64;     /* 3P: IVF clusters probed per search (ivfpq AM) */
 int   cuvs_extend_chunk_size       = 0;      /* 3Q: CAGRA extend max_chunk_size; 0 = auto */
@@ -754,6 +760,56 @@ _PG_init(void)
      * is unavailable (old kernel / seccomp) and named shm is used. flock-based:
      * only dead-owner segments are unlinked, never a live build's. */
     cuvs_corpus_reap_orphans(1);
+
+    /* Phase 4C: background auto-compaction GUCs */
+    DefineCustomBoolVariable(
+        "cuvs.auto_compact",
+        "Automatically REINDEX CAGRA indexes when extend_count exceeds threshold.",
+        NULL,
+        &cuvs_auto_compact,
+        false,
+        PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "cuvs.auto_compact_check_interval",
+        "Seconds between auto-compaction checks.",
+        NULL,
+        &cuvs_auto_compact_check_interval,
+        60, 10, 3600,
+        PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomRealVariable(
+        "cuvs.auto_compact_threshold",
+        "Trigger REINDEX when extend_count / n_vecs exceeds this ratio.",
+        "Default 0.10 triggers at 10% extended vectors.",
+        &cuvs_auto_compact_threshold,
+        0.10, 0.01, 1.0,
+        PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "cuvs.auto_compact_database",
+        "Database to monitor for auto-compaction (empty = disabled).",
+        NULL,
+        &cuvs_auto_compact_database,
+        "",
+        PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+    /* Phase 4C: register compaction bgworker */
+    {
+        extern PGDLLEXPORT void cuvs_compaction_worker_main(Datum);
+        BackgroundWorker worker;
+        memset(&worker, 0, sizeof(worker));
+        snprintf(worker.bgw_name, BGW_MAXLEN, "pg_cuvs compaction worker");
+        snprintf(worker.bgw_type, BGW_MAXLEN, "pg_cuvs compaction");
+        worker.bgw_flags      = BGWORKER_SHMEM_ACCESS |
+                                BGWORKER_BACKEND_DATABASE_CONNECTION;
+        worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+        worker.bgw_restart_time = 10;
+        snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_cuvs");
+        snprintf(worker.bgw_function_name, BGW_MAXLEN,
+                 "cuvs_compaction_worker_main");
+        RegisterBackgroundWorker(&worker);
+    }
 }
 
 /* Resolve cuvs.index_dir: if empty, default to DataDir/cuvs_indexes */
