@@ -22,6 +22,23 @@ The GPU acts as a **candidate generator** — returning the top-K TID candidates
 
 For on-prem or private RAG systems, this is useful even when search serving stays on CPU. These deployments often already run GPU servers for embedding models, rerankers, or batch embedding jobs. pg_cuvs can reuse that nearby GPU pool for slow index build/rebuild windows, while keeping the online serving path as ordinary PostgreSQL + pgvector HNSW.
 
+## CI / testing
+
+Two tiers (`design/CI_STRATEGY.md`, ADR-067):
+
+- **Tier 1 — CPU reference (every PR, hosted, free).** The single GPU boundary
+  (`src/cuvs_wrapper.h`) is replaced by an exact-kNN **CPU shim** (`make
+  PGCUVS_CPU_SHIM=1`, zero CUDA), and the full daemon + IPC + fail-closed +
+  correctness regression suite runs against it. This catches the bug class that
+  actually bites — IPC/struct drift, `search_mode` labeling, fail-closed rejects,
+  manifest contract, recall — without a GPU.
+- **Tier 2 — real A100 (on demand).** GPU-kernel correctness, **approximate-recall
+  regression**, and real VRAM/mempool behavior, run when explicitly triggered
+  (not every PR).
+
+> A green CI badge means the **CPU-reference** suite passed — it does **not** mean
+> GPU kernels or approximate recall were verified. Those are the on-demand Tier 2 run.
+
 ## Architecture
 
 pg_cuvs uses a **tightly coupled sidecar model** (PG-Strom style), not an in-process CUDA context per backend:
