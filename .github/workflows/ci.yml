@@ -51,6 +51,78 @@ jobs:
       - name: Unit tests (CPU-only, no PG/CUDA required)
         run: make test-unit
 
+# ── Job 1b: Tier 1 — CPU-reference shim (full build + installcheck) ────────
+# Builds the extension + daemon with the pure-C CPU shim (PGCUVS_CPU_SHIM=1, no
+# CUDA/cuVS), runs the real PostgreSQL regression suite against a shim daemon.
+# Catches the bug class that actually bit us this session (IPC drift, search_mode
+# labeling, fail-closed rejects, rev-map build, manifest contract, VRAM-budget
+# control flow) — all GPU-kernel-independent. Approximate-recall regression and
+# real VRAM behavior are Tier 2 only. See design/CI_STRATEGY.md (ADR-067).
+  tier1-shim:
+    name: Tier 1 — CPU shim (installcheck)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 16 + pgvector
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-16 postgresql-server-dev-16 \
+              postgresql-16-pgvector gcc make \
+              libcurl4-openssl-dev libssl-dev   # daemon objstore client (curl/ssl)
+
+      - name: Build + install (CPU shim, no CUDA)
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          make PGCUVS_CPU_SHIM=1
+          sudo env "PATH=$PATH" make PGCUVS_CPU_SHIM=1 install
+          make PGCUVS_CPU_SHIM=1 server
+          sudo env "PATH=$PATH" make install-server
+          # Prove the shim .so has no GPU runtime dependency.
+          ! ldd pg_cuvs.so | grep -qiE 'libcuvs|libcudart|librmm'
+
+      - name: Configure PostgreSQL + start shim daemon
+        run: |
+          # Free port 5432 + the default socket dir from any preinstalled cluster,
+          # then create a clean PG16 cluster (runners don't auto-create 16/main).
+          sudo systemctl stop postgresql 2>/dev/null || true
+          sudo pg_dropcluster 16 main --stop 2>/dev/null || true
+          sudo pg_createcluster 16 main -p 5432 -- --auth-local=trust --auth-host=trust
+          PGCONF=/etc/postgresql/16/main/postgresql.conf
+          echo "shared_preload_libraries = 'pg_cuvs'" | sudo tee -a "$PGCONF"
+          echo "cuvs.index_dir = '/tmp/cuvs_indexes'" | sudo tee -a "$PGCONF"
+          sudo mkdir -p /tmp/cuvs_indexes && sudo chmod 0777 /tmp/cuvs_indexes
+          sudo pg_ctlcluster 16 main start
+          sudo -u postgres createuser -s "$USER" || true
+          /usr/lib/postgresql/16/bin/pg_cuvs_server \
+            --socket /tmp/.s.pg_cuvs --index-dir /tmp/cuvs_indexes \
+            --max-vram-mb 38000 >/tmp/shim_daemon.log 2>&1 &
+          for _ in $(seq 1 30); do [ -S /tmp/.s.pg_cuvs ] && break; sleep 1; done
+          chmod 666 /tmp/.s.pg_cuvs
+          cat /tmp/shim_daemon.log || true
+
+      - name: Regression suite (Tier-1 subset + isolation)
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          # Tier-1 subset: REGRESS minus GPU-graph/known-GPU-bug tests (see Makefile
+          # REGRESS_TIER2_ONLY). filter_comparison is excluded only until the 3O
+          # bitset-polarity fix lands; the shim already gives its correct answer.
+          make installcheck-tier1 || { echo "===== regression.diffs ====="; cat test/regression.diffs; false; }
+          make installcheck-isolation || { echo "===== isolation diffs ====="; cat test/output_iso/regression.diffs 2>/dev/null; cat test/regression.diffs 2>/dev/null; false; }
+
+      - name: Upload diffs + daemon log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-regression-diffs
+          path: |
+            test/regression.diffs
+            test/*.diffs
+            /tmp/shim_daemon.log
+          retention-days: 7
+
 # ── Job 2: Full GPU regression (self-hosted A100 runner) ──────────────────
 # Requires a self-hosted runner with:
 #   - NVIDIA A100 (or compatible) + driver 525+

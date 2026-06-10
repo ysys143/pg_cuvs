@@ -21,6 +21,18 @@ MODULE_big     = pg_cuvs
 REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
+# Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
+# Excluded = tests the shim cannot/should not reproduce on CPU:
+#   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw — CAGRA->pgvector HNSW *graph export*
+#     (real graph structure; a Tier-2 / real-GPU concern).
+#   filter_comparison — TEMPORARY: it currently exposes a real GPU bug the shim
+#     does NOT share — the 3O CAGRA-prefilter inverts the BITSET (cuVS bitset is
+#     bit=1=INCLUDE, pg_cuvs builds bit=1=EXCLUDE) so the golden blessed a broken
+#     wrong_tenant=10. Returns to Tier 1 once the polarity fix lands and the
+#     golden is regenerated to wrong_tenant=0 (the shim's exact answer).
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge pg_cuvs_hnsw filter_comparison
+REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
+
 # Isolation tests (pg_isolation_regress) for concurrent-session correctness that
 # pg_regress cannot express: snapshot-aware tombstone filtering and write/query
 # interleaving. Specs live in test/specs/*.spec, expected in test/expected/*.out.
@@ -31,7 +43,7 @@ ISOLATION_OPTS = --inputdir=test --outputdir=test
 # C source files + the CUDA-compiled wrapper (built below by nvcc).
 # PGXS only knows how to build .c → .o; the .cu → .o rule is custom,
 # but the resulting object MUST be listed in OBJS to be linked into the .so.
-OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o src/cuvs_wrapper.o src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o
+OBJS           = src/pg_cuvs.o src/cuvs_ipc.o src/cuvs_util.o $(WRAPPER_OBJ) src/hnsw_export.o src/cuvs_build_corpus.o src/pg_cuvs_compaction.o
 
 # nvcc settings (Phase 1: brute-force only; CAGRA added later)
 NVCC          ?= nvcc
@@ -48,12 +60,26 @@ CUVS_INCLUDE  ?= $(CUVS_PREFIX)/include
 CUVS_RAPIDS_INCLUDE ?= $(CUVS_PREFIX)/include/rapids
 CUVS_LIB      ?= $(CUVS_PREFIX)/lib
 
+# ---- CI Tier 1: CPU-reference shim (no CUDA/cuVS) -------------------------
+# `make PGCUVS_CPU_SHIM=1` swaps the nvcc-built cuVS wrapper for a pure-C CPU
+# shim (src/cuvs_wrapper_shim_cpu.c) so the extension + daemon build and run on
+# a GPU-less hosted CI runner — zero CUDA toolkit. See design/CI_STRATEGY.md
+# (ADR-067). cuvs_wrapper.h is the single GPU boundary, so nothing else changes.
+ifdef PGCUVS_CPU_SHIM
+WRAPPER_OBJ      = src/cuvs_wrapper_shim_cpu.o
+CUVS_SO_LINK     = -lm
+CUVS_SERVER_LINK = -lm
+else
+WRAPPER_OBJ      = src/cuvs_wrapper.o
+CUVS_SO_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart -Wl,-rpath,$(CUVS_LIB)
+CUVS_SERVER_LINK = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -Wl,-rpath,$(CUVS_LIB)
+endif
+
 PG_CPPFLAGS    = -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -I./src
 # -Wl,-rpath embeds the cuVS lib path so postmaster finds libcuvs.so
 # without LD_LIBRARY_PATH being set (ADR-007).
-SHLIB_LINK     = -L$(CUVS_LIB) -lcuvs -lcudart \
-                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic \
-                 -Wl,-rpath,$(CUVS_LIB) -lrt
+SHLIB_LINK     = $(CUVS_SO_LINK) \
+                 -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lrt
 
 PG_CONFIG     ?= pg_config
 PGXS         := $(shell $(PG_CONFIG) --pgxs)
@@ -90,8 +116,7 @@ CC             ?= gcc
 SERVER_CFLAGS  = -O2 -g -Wall -Wextra -I./src \
                  -I$(CUVS_INCLUDE) -I$(CUVS_RAPIDS_INCLUDE) -std=gnu11 \
                  -D_POSIX_C_SOURCE=200809L
-SERVER_LDFLAGS = -L$(CUVS_LIB) -lcuvs -lrmm -lcudart -lstdc++ \
-                 -Wl,-rpath,$(CUVS_LIB) \
+SERVER_LDFLAGS = $(CUVS_SERVER_LINK) -lstdc++ \
                  -lpthread -lrt \
                  -lcurl -lssl -lcrypto
 
@@ -117,7 +142,12 @@ src/cuvs_util_server.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 src/cuvs_build_corpus_server.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
-$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o src/cuvs_wrapper.o
+# CI Tier 1: pure-C CPU shim object (no CUDA). Shared by the .so and the daemon
+# (same object both link cuvs_wrapper.o today). Built with gcc, -fPIC for the .so.
+src/cuvs_wrapper_shim_cpu.o: src/cuvs_wrapper_shim_cpu.c src/cuvs_wrapper.h src/cuvs_ipc.h
+	$(CC) -O2 -g -fPIC -I./src -std=gnu11 -c $< -o $@
+
+$(SERVER_BIN): src/pg_cuvs_server.o src/cuvs_ipc_server.o src/cuvs_util_server.o src/cuvs_objstore_server.o src/cuvs_build_corpus_server.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server: $(SERVER_BIN)
@@ -150,7 +180,7 @@ src/cuvs_objstore_server_test.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuv
 src/cuvs_build_corpus_server_test.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o src/cuvs_wrapper.o
+$(SERVER_TEST_BIN): src/pg_cuvs_server_test.o src/cuvs_ipc_server_test.o src/cuvs_util_server_test.o src/cuvs_objstore_server_test.o src/cuvs_build_corpus_server_test.o $(WRAPPER_OBJ)
 	$(CXX) -o $@ $^ $(SERVER_LDFLAGS)
 
 server-test: $(SERVER_TEST_BIN)
@@ -195,6 +225,14 @@ installcheck-nogpu: test-unit
 # ISOLATION is set. Requires a running daemon + GPU, like installcheck.
 installcheck-isolation:
 	$(pg_isolation_regress_installcheck) $(ISOLATION_OPTS) $(ISOLATION)
+
+# ---- Tier-1 installcheck (CPU-reference shim subset) ----------------------
+# The REGRESS suite minus REGRESS_TIER2_ONLY. Used by the tier1-shim CI job;
+# requires a (shim) daemon up, same as installcheck.
+installcheck-tier1:
+	$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS_TIER1)
+
+.PHONY: installcheck-isolation installcheck-tier1
 
 .PHONY: installcheck-isolation
 
