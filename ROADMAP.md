@@ -31,6 +31,7 @@
 | 3P | IVF-PQ AM — `CREATE INDEX USING ivfpq`, reloptions(`n_lists`/`pq_bits`/`pq_dim`), `cuvs.ivfpq_n_probes` GUC(default 64). PQ codes 내부 저장으로 VRAM 10–100× 절감. `.tids`+`.ivfpq` 사이드카. `default_version` 0.2.0으로 상향. installcheck 20/20 + isolation 2/2 GREEN (ADR-049) |
 | 3Q | CAGRA Streaming Updates — `cuvsCagraExtend`(INSERT) + `cuvsCagraMerge`+cuvsFilter(DELETE/컴팩션) 실시간 인덱스 업데이트, .delta 경로 대체. VACUUM tombstone 연동(`cuvs_amvacuumcleanup`) 포함. INSERT/DELETE/UPDATE e2e · .delta 미생성 · vram_bytes 갱신 Scenario 6-8 PASS. installcheck 21/21 + isolation 2/2 GREEN (ADR-051) |
 | 4C | Background Compaction + CONCURRENTLY 정합성 — PG bgworker auto-REINDEX + 4 GUC(`cuvs.auto_compact` 외 3종) + `pg_stat_gpu_search`에 `extend_count`/`compact_count`/`last_compact_at` 관측성 컬럼 추가. REINDEX CONCURRENTLY+DELETE isolation 테스트(3/3 GREEN). extend_count→compact_count 갱신 e2e(auto_compact.sql). installcheck 22/22 + isolation 3/3 GREEN (ADR-050) |
+| 3C / 3D | GCS artifact snapshot + replica async warmup — manifest/checksum/version 기반 GCS upload(빌드 후 detached)/download(warmup cold-miss). unsharded + sharded(3G.2) 양쪽. fail-closed: corrupt(SHA256)/heap-incompat(relfilenode hard-reject)/cuVS-version(매니페스트 버전 게이트). 3D warmup 풀·cold 등록·cache-miss requeue·`pg_stat_gpu_search` warmup 컬럼. **인증**: A100에서 실 ephemeral GCS 버킷 round-trip(`make gpu-test-objstore`) — 업로드·warmup 하이드레이션 recall 일치·3종 fail-closed reject·버킷 생성/파괴 클린. installcheck 25/25 + isolation 3/3 GREEN (ADR-013/ADR-066). **비고**: 본체는 3F/3G 작업 중 배선됐으나 SSOT가 "미완료"로 뒤처진 reverse false-done이었음 — 실 GCS 검증 부재 + 매니페스트 빈틈(version 스탬프·base_generation) 보강 후 인증. emulator 기반 CI 회귀는 후속(트리거) |
 
 ### 미완료
 
@@ -38,7 +39,6 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| 3C / 3D | GCS artifact snapshot 본체 / Replica async warmup | **repo 공개 전 필수** (순차 경로로 승격) |
 | fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
 | MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload | 다중 테넌트 파티션 온라인-스케일 선결 — 현 `MAX_INDEXES=64`가 하드월(>64 파티션 축출 시 ERROR+REINDEX, auto-reload 미배선). 측정·근거 ADR-061 / STRATEGY_NOTES §G | **repo 공개 전 또는 멀티테넌트 첫 외부 수요** — 타깃이 멀티테넌트인데 65번째 테넌트에서 ERROR는 첫 외부 사용자 이탈 사유 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
@@ -52,7 +52,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3) — 기능 순차 경로 완료. **다음 순차 작업: 3C → 3D (repo 공개 전 필수)**.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **다음 순차 작업: repo 공개 전 운영 하드닝(fallback 관측성 · VRAM budget 강제 · OOM 후 재사용 검증) — 아래 트리거 백로그 "운영 하드닝 잔여" 중 'repo 공개 전' 항목**.
 
 ---
 
@@ -60,7 +60,9 @@
 
 순차 경로(릴리스 후 기능)와 섞지 않는다. 각 항목은 트리거가 충족될 때 순차 트랙으로 승격한다.
 
-### 분산 운영 — 3C/3D (repo 공개 전 필수 — 순차 경로로 승격)
+### 분산 운영 — 3C/3D (완료·인증 — 완료 표 참조)
+
+> **완료 (2026-06-10, ADR-013/ADR-066)**: 아래 스펙은 모두 구현·인증됐다. 실 GCS round-trip + fail-closed가 A100에서 `make gpu-test-objstore`로 검증됐고(installcheck 25/25 + isolation 3/3), SSOT는 완료 표로 이전됐다. 이 절은 원 스펙 기록으로 보존한다. 잔여 후속(트리거): emulator 기반 CI 회귀(`STORAGE_EMULATOR_HOST` + fake-gcs-server), S3 provider.
 
 #### 3C → 3D — GCS Snapshot + Replica Async Warmup
 **왜 repo 공개 전에**: read replica는 production PostgreSQL 운용의 기본 패턴. 3C/3D 없이 공개하면 외부 사용자가 replica 설정에서 첫 번째 벽에 부딪힌다 — GCS snapshot 없이 각 replica가 REINDEX를 독립 실행해야 하고(GPU 빌드 비용 × 노드 수), 3D 없이 cold-start QPS가 무너진다.
@@ -138,7 +140,7 @@
 
 | 항목 | 필요 작업 |
 |------|-----------|
-| **3C/3D 완료** | GCS artifact snapshot + replica async warmup — replica 운용 없이는 production 부적합 |
+| ~~**3C/3D 완료**~~ [OK] | GCS artifact snapshot + replica async warmup — **완료·인증** (ADR-013/ADR-066, `make gpu-test-objstore`). 잔여: emulator CI 회귀(트리거) |
 | GitHub repo 공개 | public release. 라이선스: **Apache 2.0** (확정) |
 | 재현 가능한 벤치마크 공개 | `BENCHMARK.md` — 핵심은 **overhead characterization**: GPU가 distance computation을 제거하면 IPC / PG heap fetch가 새 병목이 된다는 것을 latency 분해로 실증. pgvector(CPU HNSW) 대비 QPS/latency 비교는 부수. selectivity sweep은 멀티테넌트 filtered search 효과 지지 실험으로 포함(논문 중심 아님) |
 | 외부 사용자용 설치 가이드 | README 정비 (설치, quick start, CUDA/cuVS 버전 매트릭스) |

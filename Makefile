@@ -100,7 +100,7 @@ src/pg_cuvs_server.o: src/pg_cuvs_server.c src/cuvs_ipc.h src/cuvs_util.h src/cu
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
 # cuvs_objstore.o for server (GCS client — not linked into the PG extension .so)
-src/cuvs_objstore_server.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuvs_ipc.h
+src/cuvs_objstore_server.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuvs_ipc.h src/cuvs_version.h
 	$(CC) $(SERVER_CFLAGS) -c $< -o $@
 
 # cuvs_ipc.o for server (same source, no PG headers needed)
@@ -144,7 +144,7 @@ src/cuvs_ipc_server_test.o: src/cuvs_ipc.c src/cuvs_ipc.h src/cuvs_build_corpus.
 src/cuvs_util_server_test.o: src/cuvs_util.c src/cuvs_util.h src/cuvs_ipc.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
-src/cuvs_objstore_server_test.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuvs_ipc.h
+src/cuvs_objstore_server_test.o: src/cuvs_objstore.c src/cuvs_objstore.h src/cuvs_ipc.h src/cuvs_version.h
 	$(CC) $(SERVER_TEST_CFLAGS) -c $< -o $@
 
 src/cuvs_build_corpus_server_test.o: src/cuvs_build_corpus.c src/cuvs_build_corpus.h
@@ -226,7 +226,7 @@ unexport VM_IP VM_HOST
 
 .PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
 	gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon gpu-test-e2e \
-	gpu-test-delta-restart gpu-test-all
+	gpu-test-delta-restart gpu-test-all gpu-test-objstore
 
 vm-start:
 	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.gpu"; exit 1)
@@ -319,6 +319,15 @@ gpu-test-daemon:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
 		CONDA_ENV=$(CONDA_ENV) bash -s" \
 		< infra/scripts/integration-test.sh
+
+# Phase 3C: real GCS snapshot round-trip + fail-closed certification against an
+# EPHEMERAL bucket (created + destroyed by the script). Needs gcloud (/snap/bin)
+# and a service account with storage.buckets.create. Piped over stdin (bash -s);
+# /snap/bin is added to PATH so gcloud resolves in the non-login ssh shell.
+gpu-test-objstore:
+	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && \
+		PATH=\$$PATH:/snap/bin bash -s" \
+		< infra/scripts/objstore-roundtrip-e2e.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:

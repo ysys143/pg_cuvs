@@ -424,6 +424,8 @@ Phase 3B 완료 기준:
 
 #### Phase 3C — Artifact Manifest / Object Storage-backed Immutable Index Snapshots
 
+> **상태 (2026-06-10): 완료·인증** (ADR-013/ADR-066). 본체(`src/cuvs_objstore.c` libcurl GCS 클라이언트, 빌드 후 detached 업로드, warmup 다운로드)는 3F/3G 작업 중 배선됐던 reverse false-done이었고, 본 컷에서 실 GCS round-trip 검증 + 매니페스트 빈틈(`cuvs_version` 필드 신설, `pg_cuvs_version` 0.1.0→0.3.0, `base_generation` 0→실 crc) + load-time 버전 호환 fail-closed 게이트를 닫고 인증했다. 아래 완료 기준 (a)–(d) 모두 충족. 검증: `make gpu-test-objstore`(A100, 실 ephemeral 버킷) — 업로드·warmup 하이드레이션 recall@10 일치·corrupt(SHA)/relfilenode/cuVS-version 3종 fail-closed reject; installcheck 25/25 + isolation 3/3 GREEN. 후속(트리거): emulator(`STORAGE_EMULATOR_HOST` + fake-gcs-server) 기반 CI 회귀, S3 provider.
+
 구현 항목:
 - local `cuvs.index_dir` artifact를 object storage snapshot으로 확장한다.
 - object storage snapshot은 **heap/table 배포 수단이 아니다**. PostgreSQL heap은 physical replication, basebackup/WAL archive, managed replica, logical replication, dump/restore 같은 PostgreSQL 메커니즘이 책임진다.
@@ -454,6 +456,8 @@ Phase 3C 완료 기준:
 - heap-incompatible node는 artifact를 로드하지 않고 REINDEX 또는 PostgreSQL restore/replication 절차를 요구한다.
 
 #### Phase 3D — Replica / Multi-node Loading + Async Warmup
+
+> **상태 (2026-06-10): 완료·인증** (ADR-013/ADR-066). warmup 풀·cold 등록·cache-miss requeue·`pg_stat_gpu_search` warmup 컬럼·relfilenode replica 가드 모두 live. 다운로드/하이드레이션 경로는 3C round-trip 인증(`make gpu-test-objstore`)에서 함께 검증됨 — wiped 노드(`.relfilenode`만 보유)가 heap rebuild 없이 GCS에서 하이드레이션 후 exact top-k 반환.
 
 Delivered scope:
 - daemon startup no longer blocks on GCS hydration. Missing local artifacts are registered as cold entries, the UDS socket opens, and background warmup workers download/load artifacts progressively.

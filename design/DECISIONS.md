@@ -244,8 +244,8 @@ Vamana build(GPU) → DiskANN binary → CPU Vamana search  (대규모, NVMe)
 
 ## ADR-013 — Phase 3C Object Storage: Derived Data + Snapshot Source of Truth 방향
 
-**날짜**: 2026-05-23
-**상태**: S3-specific 표현에서 GCS-first object storage 설계로 일반화됨
+**날짜**: 2026-05-23 (2026-06-10 CERTIFIED)
+**상태**: S3-specific 표현에서 GCS-first object storage 설계로 일반화됨 → **Phase 3C MVP 구현·인증 완료** (실 GCS round-trip + fail-closed 검증). 상세 인증 기록은 ADR-066.
 
 **문제**: 수십억 규모 인덱스를 어떻게 저장하고 멀티노드에서 공유할지 결정이 필요하다.
 
@@ -2544,3 +2544,23 @@ selectivity × Q 조합에 따라 streaming BF / D-wedge post-filter / CAGRA 중
 - **heap-based gather**: random page I/O + TOAST 비용이 GPU 이득을 상쇄 — sidecar 경로 대비 열위
 - **IVF-PQ (ADR-049)**: VRAM 절감 접근이지 VRAM 초과 exact search 해법이 아님
 - **multi-GPU sharding (3E/3F/3G)**: GPU 대수 선형 증가 요구 — 비용 문제를 하드웨어로 해결
+
+---
+
+## ADR-066 — Phase 3C 인증 + 매니페스트 버전 호환 게이트
+
+**날짜**: 2026-06-10
+**상태**: ACCEPTED / 구현·검증 완료
+
+**배경 (reverse false-done)**: 소스 감사 결과 3C/3D 본체(`src/cuvs_objstore.c` libcurl GCS 클라이언트, 빌드 후 detached 업로드, warmup cold-miss 다운로드+SHA256+relfilenode hard-reject, 3D warmup 풀/cold 등록/관측 컬럼)는 **이미 live 경로에 배선**돼 있었으나 ROADMAP는 3C/3D를 "미완료"로 표기했다. 3A(ADR-009)의 정반대 사례 — 코드는 있는데 SSOT가 뒤처짐. 진짜 결손은 (1) GCS round-trip이 실제로 검증된 적이 없음(엔드포인트 하드코딩 + 테스트 버킷 부재; ADR-024/3G status/spec-audit가 반복 인용한 "bucket 부재로 자동 검증 불가"), (2) 매니페스트 계약의 몇몇 빈틈.
+
+**결정 1 — 닫은 매니페스트 빈틈** (`CuvsManifest` / `cuvs_objstore.c` / `pg_cuvs_server.c`):
+- `pg_cuvs_version` 하드코딩 `"0.1.0"` → 단일 출처 `src/cuvs_version.h`의 `PG_CUVS_VERSION`(=0.3.0, `pg_cuvs.control`과 동기).
+- **`cuvs_version` 필드 신설** — 스펙 계약이 요구하나 누락돼 있었음. `CUVS_BUILD_VERSION`(빌드 시 링크된 cuVS, =26.04.00) 스탬프. CAGRA 직렬화가 cuVS 버전에 종속되므로 cross-version 로드는 안전 미보장.
+- `base_generation`이 업로드 시 항상 `0`이던 것(주석: "not tracked at upload time")을 빌드 시 이미 계산되는 `.tids` body_crc32(`cuvs_crc32`)로 배선 — unsharded(`finish_build_commit`에 `base_generation` 파라미터 추가, 양 콜러가 `tids_gen` 전달) + sharded(`build_sharded`에서 `base_gen` 호이스트) 양 경로.
+
+**결정 2 — load 시 버전 호환 fail-closed 게이트** (`cuvs_objstore_download`): 매니페스트 파싱 후 다운로드 전, `manifest.cuvs_version != CUVS_BUILD_VERSION`이면 hard-reject(REINDEX 요구). 빈 `cuvs_version`(pre-cert artifact)은 unknown→reject(fail-closed). `pg_cuvs_version` drift는 WARN만. 가드 순서: **relfilenode → OID → cuVS version → (download) SHA256**.
+
+**결정 3 — 실 버킷 검증 (사용자 선택: "real ephemeral bucket on VM")**: CI-portable emulator 대신 A100 VM에서 **실제 ephemeral GCS 버킷**으로 round-trip 인증. `infra/scripts/objstore-roundtrip-e2e.sh` + `make gpu-test-objstore`: 버킷 생성(trap으로 파괴) → `--snapshot-uri` 데몬 → 빌드/업로드 → 로컬 wipe(`,relfilenode`만 유지)+restart→warmup 다운로드→exact recall → 3종 fail-closed(corrupt SHA / relfilenode mismatch / cuVS version mismatch) 각각 reject 확인. VM SA가 gcloud 신원과 동일해 IAM 추가 배선 불필요. **emulator 기반 자동 회귀는 후속(트리거)** — `STORAGE_EMULATOR_HOST` 엔드포인트 오버라이드 + fake-gcs-server.
+
+**검증 증거 (2026-06-10, A100-40GB, cuVS 26.04.00)**: `make gpu-test-objstore` 전 항목 PASS(업로드, 매니페스트 계약 필드, warmup 하이드레이션 recall@10 일치, 3종 fail-closed reject, 버킷 생성·파괴 클린). 회귀 무영향: installcheck **25/25** + isolation **3/3** GREEN. 관련: [[ADR-013]], ADR-024(sharded snapshot), ADR-065(cudaMemGetInfo 금지 — 본 작업과 직교).

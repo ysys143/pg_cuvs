@@ -33,6 +33,7 @@
  * ---------------------------------------------------------------- */
 typedef struct CuvsManifest {
     char     pg_cuvs_version[32];
+    char     cuvs_version[32];      /* cuVS release the artifact was built against (ADR-013 version gate) */
     char     metric_name[8];       /* "l2", "cosine", "ip" */
     uint32_t database_oid;
     uint32_t table_oid;

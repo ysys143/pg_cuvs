@@ -18,6 +18,7 @@
 #include "cuvs_objstore.h"
 #include "cuvs_util.h"
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* */
+#include "cuvs_version.h"   /* PG_CUVS_VERSION, CUVS_BUILD_VERSION (ADR-013 manifest stamps) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -725,6 +726,7 @@ manifest_to_json(const CuvsManifest *m, char *out, size_t out_sz)
         snprintf(out, out_sz,
             "{\n"
             "  \"pg_cuvs_version\": \"%s\",\n"
+            "  \"cuvs_version\": \"%s\",\n"
             "  \"database_oid\": %u,\n"
             "  \"table_oid\": %u,\n"
             "  \"index_oid\": %u,\n"
@@ -740,7 +742,7 @@ manifest_to_json(const CuvsManifest *m, char *out, size_t out_sz)
             "    \"shards\": {\"sha256\": \"%s\", \"size_bytes\": %lld}\n"
             "  }\n"
             "}\n",
-            m->pg_cuvs_version,
+            m->pg_cuvs_version, m->cuvs_version,
             m->database_oid, m->table_oid, m->index_oid, m->relfilenode,
             m->base_generation, m->metric_name, m->dim,
             (long long)m->vector_count, (long long)m->build_timestamp,
@@ -751,6 +753,7 @@ manifest_to_json(const CuvsManifest *m, char *out, size_t out_sz)
         snprintf(out, out_sz,
             "{\n"
             "  \"pg_cuvs_version\": \"%s\",\n"
+            "  \"cuvs_version\": \"%s\",\n"
             "  \"database_oid\": %u,\n"
             "  \"table_oid\": %u,\n"
             "  \"index_oid\": %u,\n"
@@ -766,7 +769,7 @@ manifest_to_json(const CuvsManifest *m, char *out, size_t out_sz)
             "    \"tids\":  {\"sha256\": \"%s\", \"size_bytes\": %lld}\n"
             "  }\n"
             "}\n",
-            m->pg_cuvs_version,
+            m->pg_cuvs_version, m->cuvs_version,
             m->database_oid, m->table_oid, m->index_oid, m->relfilenode,
             m->base_generation, m->metric_name, m->dim,
             (long long)m->vector_count, (long long)m->build_timestamp,
@@ -786,6 +789,9 @@ manifest_from_json(const char *json, CuvsManifest *m)
     memset(m, 0, sizeof(*m));
     if (json_get_str(json,  "pg_cuvs_version", m->pg_cuvs_version,
                      sizeof(m->pg_cuvs_version)) != 0)   return -1;
+    /* cuvs_version: optional for back-compat with pre-3C-cert manifests; a
+     * missing value stays "" and is rejected by the load-time version gate. */
+    json_get_str(json, "cuvs_version", m->cuvs_version, sizeof(m->cuvs_version));
     if (json_get_u32(json,  "relfilenode",    &m->relfilenode)     != 0) return -1;
     if (json_get_u32(json,  "database_oid",   &m->database_oid)    != 0) return -1;
     if (json_get_u32(json,  "table_oid",      &m->table_oid)       != 0) return -1;
@@ -913,7 +919,8 @@ cuvs_objstore_upload(
     int64_t build_ts = (int64_t)time(NULL);
     CuvsManifest m;
     memset(&m, 0, sizeof(m));
-    strncpy(m.pg_cuvs_version, "0.1.0", sizeof(m.pg_cuvs_version) - 1);
+    strncpy(m.pg_cuvs_version, PG_CUVS_VERSION,   sizeof(m.pg_cuvs_version) - 1);
+    strncpy(m.cuvs_version,    CUVS_BUILD_VERSION, sizeof(m.cuvs_version) - 1);
     m.database_oid     = db_oid;
     m.table_oid        = table_oid;
     m.index_oid        = index_oid;
@@ -1037,7 +1044,8 @@ cuvs_objstore_upload_sharded(
     /* Build manifest */
     build_ts = (int64_t)time(NULL);
     memset(&m, 0, sizeof(m));
-    strncpy(m.pg_cuvs_version, "0.1.0", sizeof(m.pg_cuvs_version) - 1);
+    strncpy(m.pg_cuvs_version, PG_CUVS_VERSION,   sizeof(m.pg_cuvs_version) - 1);
+    strncpy(m.cuvs_version,    CUVS_BUILD_VERSION, sizeof(m.cuvs_version) - 1);
     m.database_oid      = db_oid;
     m.table_oid         = table_oid;
     m.index_oid         = index_oid;
@@ -1174,6 +1182,24 @@ cuvs_objstore_download(
                  db_oid, index_oid, m.database_oid, m.index_oid);
         return -1;
     }
+
+    /* ---- Version compatibility gate (ADR-013) ----
+     * A CAGRA artifact serialized by a different cuVS is not guaranteed to
+     * deserialize safely (serialization format is cuVS-version-coupled). Hard
+     * reject on cuVS mismatch — the node must REINDEX from its local heap. An
+     * empty manifest cuvs_version (pre-cert artifact) is treated as unknown and
+     * rejected, fail-closed. pg_cuvs drift is a warning only. */
+    if (strcmp(m.cuvs_version, CUVS_BUILD_VERSION) != 0) {
+        LOG_WARN("[objstore] cuVS VERSION MISMATCH %u/%u: manifest cuvs=%s "
+                 "running=%s — artifact NOT loaded; REINDEX required.\n",
+                 db_oid, index_oid,
+                 m.cuvs_version[0] ? m.cuvs_version : "(none)", CUVS_BUILD_VERSION);
+        return -1;
+    }
+    if (strcmp(m.pg_cuvs_version, PG_CUVS_VERSION) != 0)
+        LOG_WARN("[objstore] pg_cuvs version drift %u/%u: manifest=%s running=%s "
+                 "(loading anyway)\n",
+                 db_oid, index_oid, m.pg_cuvs_version, PG_CUVS_VERSION);
 
     /* Reconstruct the versioned prefix from the manifest's build_timestamp */
     char vprefix[1024];

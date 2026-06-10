@@ -3578,6 +3578,7 @@ typedef struct {
     uint32_t metric;
     uint32_t dim;
     int64_t  vector_count;
+    uint32_t base_generation;   /* this build's .tids body_crc32 (3C manifest) */
 } UploadThreadArgs;
 
 static void *
@@ -3597,7 +3598,7 @@ objstore_upload_thread(void *arg)
         a->metric,
         a->dim,
         a->vector_count,
-        0   /* base_generation: not yet tracked at upload time */
+        a->base_generation   /* this build's .tids body_crc32 */
     );
     if (rc == 0)
         LOG_INFO("objstore: uploaded index %u/%u to %s\n",
@@ -3625,6 +3626,7 @@ typedef struct {
     uint32_t dim;
     int64_t  vector_count;
     uint32_t shard_count;
+    uint32_t base_generation;   /* this build's .tids body_crc32 (3C manifest) */
 } ShardedUploadArgs;
 
 static void *
@@ -3635,7 +3637,7 @@ objstore_upload_sharded_thread(void *arg)
         a->snapshot_uri, a->cluster_id, a->gcs_key_file, a->index_dir,
         a->db_oid, a->table_oid, a->index_oid, a->relfilenode,
         a->metric, a->dim, a->vector_count,
-        0,   /* base_generation: not tracked at upload time */
+        a->base_generation,   /* this build's .tids body_crc32 */
         a->shard_count);
     if (rc == 0)
         LOG_INFO("objstore: uploaded sharded index %u/%u (%u shards) to %s\n",
@@ -3794,12 +3796,12 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     int  vectors_committed = 0;
     vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
     snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+    uint32_t base_gen = cuvs_crc32(new_tids, tid_bytes);   /* .tids body_crc32 — also the 3C manifest base_generation */
     if (ok)
     {
-        uint32_t tids_gen = cuvs_crc32(new_tids, tid_bytes);
         FILE *vf = fopen(vecs_tmp, "wb");
         int vok = (vf != NULL);
-        if (vok && cuvs_vectors_write(vf, n_vecs, dim, metric, tids_gen, vecs) != 0) vok = 0;
+        if (vok && cuvs_vectors_write(vf, n_vecs, dim, metric, base_gen, vecs) != 0) vok = 0;
         if (vok && fflush(vf) != 0) vok = 0;
         if (vok && fsync(fileno(vf)) != 0) vok = 0;
         if (vf && fclose(vf) != 0) vok = 0;
@@ -4030,6 +4032,7 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
             sa->dim          = cmd->dim;
             sa->vector_count = cmd->n_vecs;
             sa->shard_count  = (uint32_t) sc;
+            sa->base_generation = base_gen;
 
             pthread_t up_tid;
             pthread_attr_t up_attr;
@@ -4076,7 +4079,7 @@ static void finish_build_commit(int client_fd, const CuvsCmdFrame *cmd,
                                 const char *save_dir, CuvsCagraIndex new_handle,
                                 uint64_t *new_tids, int target_gpu, size_t needed,
                                 int vectors_committed, const char *vecs_tmp,
-                                const char *vecs_final);
+                                const char *vecs_final, uint32_t base_generation);
 
 static void
 handle_build(int client_fd, const CuvsCmdFrame *cmd)
@@ -4318,7 +4321,8 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
     /* ADR-059: the persist/commit/registry/reply sequence is shared with the
      * multi-partial build path (handle_build_multi). */
     finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
-                        target_gpu, needed, vectors_committed, vecs_tmp, vecs_final);
+                        target_gpu, needed, vectors_committed, vecs_tmp, vecs_final,
+                        tids_gen);
 }
 
 /* Persist a freshly built CAGRA index (tmp+rename), swap it into the registry,
@@ -4330,7 +4334,7 @@ static void
 finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir,
                     CuvsCagraIndex new_handle, uint64_t *new_tids, int target_gpu,
                     size_t needed, int vectors_committed, const char *vecs_tmp,
-                    const char *vecs_final)
+                    const char *vecs_final, uint32_t base_generation)
 {
     char idx_final[512],  idx_tmp[576];
     char tids_final[512], tids_tmp[576];
@@ -4583,6 +4587,7 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
             ua->metric      = cmd->metric;
             ua->dim         = cmd->dim;
             ua->vector_count = cmd->n_vecs;
+            ua->base_generation = base_generation;
 
             pthread_t upload_tid;
             pthread_attr_t upload_attr;
@@ -4871,7 +4876,8 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
         free(descs); free(part_vecs); free(n_each); free(maps); free(map_lens);
 
         finish_build_commit(client_fd, cmd, save_dir, new_handle, new_tids,
-                            target_gpu, needed, vectors_committed, vecs_tmp, vecs_final);
+                            target_gpu, needed, vectors_committed, vecs_tmp, vecs_final,
+                            tids_gen);
         return;   /* new_tids ownership passed to the registry */
     }
 
