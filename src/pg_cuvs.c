@@ -47,6 +47,10 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/itemptr.h"
+#include "storage/ipc.h"       /* shmem_request_hook, shmem_startup_hook */
+#include "storage/lwlock.h"    /* AddinShmemInitLock */
+#include "storage/shmem.h"     /* ShmemInitStruct, RequestAddinShmemSpace */
+#include "storage/spin.h"      /* slock_t — fallback-stats array guard */
 #include "utils/snapmgr.h"
 #include "access/xact.h"
 #include "access/transam.h"
@@ -429,6 +433,143 @@ static int
 cuvs_search_wait_should_abort(void)
 {
     return (QueryCancelPending || ProcDiePending) ? 1 : 0;
+}
+
+/* ----------------------------------------------------------------
+ * Fallback observability (shared memory)
+ *
+ * The GPU-vs-CPU routing decision is made in cuvsamcostestimate (plan time):
+ * when any gate fires, the cost is set above disable_cost so the planner picks
+ * seqscan/pgvector. That decision never reaches the daemon, so the daemon-sourced
+ * pg_stat_gpu_search cannot show it. Operators otherwise have no SQL signal for
+ * "this index is silently serving from CPU." We record per-(db,index) fallback
+ * counts + last reason in a small shared-memory array (cluster-wide; filtered to
+ * the current database by the SRF) so the pg_stat_gpu_fallback view can surface it.
+ *
+ * Counts are a RELATIVE pressure signal, not exact query counts: cuvsamcostestimate
+ * may be called more than once per query during planning. Watch the trend against
+ * the daemon's GPU search_count to tell whether queries are leaking to CPU.
+ * ---------------------------------------------------------------- */
+typedef enum CuvsFbReason
+{
+    CUVS_FB_NONE = 0,
+    CUVS_FB_DISABLED,        /* enable_cuvs = off */
+    CUVS_FB_BREAKER,         /* circuit breaker open (repeated runtime failures) */
+    CUVS_FB_STALE,           /* .stale sidecar (heap writes since build) */
+    CUVS_FB_DRIFT,           /* delete-drift gate */
+    CUVS_FB_DAEMON_DOWN,     /* daemon socket missing */
+    CUVS_FB_NO_ARTIFACT,     /* no .tids (built on empty table) */
+    CUVS_FB_DELTA,           /* .delta corrupt / over cap / gen mismatch */
+    CUVS_FB_TOMBSTONE        /* .tombstone corrupt / over cap / gen mismatch */
+} CuvsFbReason;
+
+#define CUVS_FB_SLOTS 128    /* > MAX_INDEXES(64); lazy slots, never freed on DROP */
+
+typedef struct CuvsFbSlot
+{
+    Oid         db_oid;          /* MyDatabaseId; InvalidOid (with index_oid) = empty */
+    Oid         index_oid;
+    uint64      fallback_count;
+    int         last_reason;
+    TimestampTz last_fallback_at;
+} CuvsFbSlot;
+
+typedef struct CuvsFbShmem
+{
+    slock_t    mutex;
+    CuvsFbSlot slots[CUVS_FB_SLOTS];
+} CuvsFbShmem;
+
+static CuvsFbShmem *g_fb = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+static const char *
+cuvs_fb_reason_name(int r)
+{
+    switch (r)
+    {
+        case CUVS_FB_DISABLED:    return "disabled";
+        case CUVS_FB_BREAKER:     return "circuit_breaker";
+        case CUVS_FB_STALE:       return "stale";
+        case CUVS_FB_DRIFT:       return "delete_drift";
+        case CUVS_FB_DAEMON_DOWN: return "daemon_down";
+        case CUVS_FB_NO_ARTIFACT: return "no_artifact";
+        case CUVS_FB_DELTA:       return "delta_unusable";
+        case CUVS_FB_TOMBSTONE:   return "tombstone_unusable";
+        default:                  return "none";
+    }
+}
+
+static Size
+cuvs_fb_memsize(void)
+{
+    return sizeof(CuvsFbShmem);
+}
+
+static void
+cuvs_fb_shmem_request(void)
+{
+    if (prev_shmem_request_hook)
+        prev_shmem_request_hook();
+    RequestAddinShmemSpace(cuvs_fb_memsize());
+}
+
+static void
+cuvs_fb_shmem_startup(void)
+{
+    bool found;
+
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+
+    LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+    g_fb = ShmemInitStruct("pg_cuvs fallback stats", cuvs_fb_memsize(), &found);
+    if (!found)
+    {
+        SpinLockInit(&g_fb->mutex);
+        memset(g_fb->slots, 0, sizeof(g_fb->slots));  /* InvalidOid == 0 => all empty */
+    }
+    LWLockRelease(AddinShmemInitLock);
+}
+
+/* Record one fallback for (MyDatabaseId, index_oid). Cheap: bounded linear scan
+ * under a spinlock; the timestamp is taken outside the lock. */
+static void
+cuvs_fb_record(Oid index_oid, int reason)
+{
+    int         i, free_slot = -1;
+    TimestampTz now;
+
+    if (g_fb == NULL || reason == CUVS_FB_NONE)
+        return;
+
+    now = GetCurrentTimestamp();
+    SpinLockAcquire(&g_fb->mutex);
+    for (i = 0; i < CUVS_FB_SLOTS; i++)
+    {
+        CuvsFbSlot *s = &g_fb->slots[i];
+        if (s->index_oid == index_oid && s->db_oid == MyDatabaseId)
+        {
+            s->fallback_count++;
+            s->last_reason = reason;
+            s->last_fallback_at = now;
+            SpinLockRelease(&g_fb->mutex);
+            return;
+        }
+        if (free_slot < 0 && s->index_oid == InvalidOid)
+            free_slot = i;
+    }
+    if (free_slot >= 0)
+    {
+        CuvsFbSlot *s = &g_fb->slots[free_slot];
+        s->db_oid = MyDatabaseId;
+        s->index_oid = index_oid;
+        s->fallback_count = 1;
+        s->last_reason = reason;
+        s->last_fallback_at = now;
+    }
+    SpinLockRelease(&g_fb->mutex);
 }
 
 void
@@ -836,6 +977,16 @@ _PG_init(void)
         snprintf(worker.bgw_function_name, BGW_MAXLEN,
                  "cuvs_compaction_worker_main");
         RegisterBackgroundWorker(&worker);
+    }
+
+    /* Fallback observability: claim shared memory for the per-index fallback
+     * counters (pg_stat_gpu_fallback). Only valid from shared_preload_libraries. */
+    if (process_shared_preload_libraries_in_progress)
+    {
+        prev_shmem_request_hook = shmem_request_hook;
+        shmem_request_hook = cuvs_fb_shmem_request;
+        prev_shmem_startup_hook = shmem_startup_hook;
+        shmem_startup_hook = cuvs_fb_shmem_startup;
     }
 }
 
@@ -1334,14 +1485,32 @@ cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
      *  6. artifact existence (no .tids → index was built on empty table)
      *  7. delta unusable (.delta corrupt / generation mismatch / over cap)
      *  8. tombstone unusable (.tombstone corrupt / over cap / gen mismatch) */
-    gpu_off = !enable_cuvs
-           || cuvs_circuit_is_open((uint32_t) index_oid)
-           || cuvs_index_is_stale(index_oid)
-           || cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples)
-           || !cuvs_daemon_socket_ready()
-           || !cuvs_index_has_artifact(index_oid)
-           || cuvs_index_delta_unusable(index_oid)
-           || cuvs_index_tombstone_unusable(index_oid);
+    /* Evaluate the gates in priority order so we can record WHY the GPU path was
+     * dropped (observability). Short-circuits exactly like the original OR chain:
+     * each check runs only if no earlier one matched. */
+    {
+        int fb_reason = CUVS_FB_NONE;
+        if (!enable_cuvs)
+            fb_reason = CUVS_FB_DISABLED;
+        else if (cuvs_circuit_is_open((uint32_t) index_oid))
+            fb_reason = CUVS_FB_BREAKER;
+        else if (cuvs_index_is_stale(index_oid))
+            fb_reason = CUVS_FB_STALE;
+        else if (cuvs_index_delete_drift_stale(index_oid, path->indexinfo->rel->tuples))
+            fb_reason = CUVS_FB_DRIFT;
+        else if (!cuvs_daemon_socket_ready())
+            fb_reason = CUVS_FB_DAEMON_DOWN;
+        else if (!cuvs_index_has_artifact(index_oid))
+            fb_reason = CUVS_FB_NO_ARTIFACT;
+        else if (cuvs_index_delta_unusable(index_oid))
+            fb_reason = CUVS_FB_DELTA;
+        else if (cuvs_index_tombstone_unusable(index_oid))
+            fb_reason = CUVS_FB_TOMBSTONE;
+
+        gpu_off = (fb_reason != CUVS_FB_NONE);
+        if (gpu_off)
+            cuvs_fb_record(index_oid, fb_reason);
+    }
 
     if (gpu_off)
     {
@@ -4082,6 +4251,78 @@ pg_cuvs_gpu_cache_stats(PG_FUNCTION_ARGS)
         }
     }
     /* daemon down (UNAVAILABLE) -> empty result, not an error */
+
+    return (Datum) 0;
+}
+
+/* ----------------------------------------------------------------
+ * pg_cuvs_gpu_fallback_stats() — per-index CPU-fallback counters for indexes in
+ * the current database, backing the pg_stat_gpu_fallback view. Reads the backend
+ * shared-memory array that cuvsamcostestimate records into. Empty when nothing
+ * has fallen back. Counts are a relative pressure signal (see the "Fallback
+ * observability" note near _PG_init), not exact per-query counts.
+ * ---------------------------------------------------------------- */
+#define GPU_FB_NCOLS 4
+
+PG_FUNCTION_INFO_V1(pg_cuvs_gpu_fallback_stats);
+Datum
+pg_cuvs_gpu_fallback_stats(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+    TupleDesc        tupdesc;
+    Tuplestorestate *tupstore;
+    MemoryContext    per_query_ctx;
+    MemoryContext    oldcontext;
+
+    if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    if (!(rsinfo->allowedModes & SFRM_Materialize))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("return type must be a row type")));
+
+    per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+    oldcontext = MemoryContextSwitchTo(per_query_ctx);
+    tupstore = tuplestore_begin_heap(true, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult  = tupstore;
+    rsinfo->setDesc    = tupdesc;
+    MemoryContextSwitchTo(oldcontext);
+
+    if (g_fb != NULL)
+    {
+        CuvsFbSlot snap[CUVS_FB_SLOTS];
+        int        i;
+
+        SpinLockAcquire(&g_fb->mutex);
+        memcpy(snap, g_fb->slots, sizeof(snap));
+        SpinLockRelease(&g_fb->mutex);
+
+        for (i = 0; i < CUVS_FB_SLOTS; i++)
+        {
+            Datum values[GPU_FB_NCOLS];
+            bool  nulls[GPU_FB_NCOLS];
+
+            if (snap[i].index_oid == InvalidOid || snap[i].db_oid != MyDatabaseId)
+                continue;
+
+            memset(nulls, 0, sizeof(nulls));
+            values[0] = ObjectIdGetDatum(snap[i].index_oid);   /* regclass */
+            values[1] = Int64GetDatum((int64) snap[i].fallback_count);
+            values[2] = CStringGetTextDatum(cuvs_fb_reason_name(snap[i].last_reason));
+            if (snap[i].last_fallback_at != 0)
+                values[3] = TimestampTzGetDatum(snap[i].last_fallback_at);
+            else
+                nulls[3] = true;
+            tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+        }
+    }
 
     return (Datum) 0;
 }
