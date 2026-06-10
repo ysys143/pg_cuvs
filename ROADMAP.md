@@ -65,8 +65,9 @@
 #### 3C → 3D — GCS Snapshot + Replica Async Warmup
 **왜 repo 공개 전에**: read replica는 production PostgreSQL 운용의 기본 패턴. 3C/3D 없이 공개하면 외부 사용자가 replica 설정에서 첫 번째 벽에 부딪힌다 — GCS snapshot 없이 각 replica가 REINDEX를 독립 실행해야 하고(GPU 빌드 비용 × 노드 수), 3D 없이 cold-start QPS가 무너진다.
 
-- **3C**: manifest/checksum/version 기반 GCS upload/download 전체 경로 (3G.2 sharded snapshot과 통합)
-- **3D**: background warmup thread pool, cold entry 등록, cache miss CPU fallback
+- **3C**: manifest/checksum/version 기반 GCS upload/download 전체 경로. **3F/3G sharded 아티팩트 필수 지원**: unsharded(`.cagra`/`.tids`/`.vectors`)와 sharded(`.shards` manifest + `.s000.cagra`/`.s001.cagra`/...) 양쪽 모두 처리해야 함 — sharded 인덱스 사용자의 replica warmup이 3C에 의존. 한쪽만 구현하면 3F/3G를 사용하는 환경에서 replica 설정 불가
+- **3D**: background warmup thread pool, cold entry 등록, cache miss CPU fallback. sharded 인덱스의 경우 shard별 warmup 순서 및 부분 warmup 중 fallback 처리 포함
+- **CI 주의**: 3C sharded 경로 테스트는 multi-GPU 환경 필요 (3F-6과 동일 조건). single-GPU mock CI로는 sharded snapshot 경로 커버 불가 — GPU CI 전략 확정 시 반영 필요
 
 스펙: [design/PLAN.md — Phase 3C, 3D](design/PLAN.md) | ADR-013
 
