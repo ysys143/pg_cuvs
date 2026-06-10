@@ -52,7 +52,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **다음 순차 작업: repo 공개 전 운영 하드닝(fallback 관측성 · VRAM budget 강제 · OOM 후 재사용 검증) — 아래 트리거 백로그 "운영 하드닝 잔여" 중 'repo 공개 전' 항목**.
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **다음 순차 작업: 릴리스 준비**(README 정비 · `BENCHMARK.md` 공개 · CI GPU 전략 확정 — "에코시스템 진입 계획" 전제조건 참조) + MAX_INDEXES 동적화(멀티테넌트 첫 외부 수요 시, 트리거).
 
 ---
 
@@ -79,9 +79,9 @@
 
 | 항목 | 근거 | 성격 | 트리거 |
 |------|------|------|--------|
-| **fallback 관측성** | 감사 #2. `pg_stat_gpu_search`에 fallback/success 카운터 부재 — 쿼리가 조용히 CPU로 새는지 SQL로 알 수 없음(fallback은 backend plan-time 결정이라 데몬 미도달). | 코드(backend per-index fallback 카운터 → view 노출) | **repo 공개 전** — 외부 사용자의 첫 번째 디버깅 장벽 |
-| **VRAM budget 강제** | `set_vram_budget(0)` 기본값 무제한 + raw `cudaMemGetInfo` 신뢰 불가 — driver GPU mempool(VM 검증상 RMM pool 아닌 **CUDA async mempool** 추정)이 해제 메모리를 캐시 보유해 raw 잔여 체크가 실제 cuVS workspace 가용량을 반영하지 못함. 실효 budget 강제는 CUDA mempool attribute(`cudaMemPoolGetAttribute`) 경유 — active device resource 확정이 선결. | 코드(CUDA mempool attribute 기반 budget 체크 + GUC 기본값 재검토, ADR-065) | **repo 공개 전** — 기본값 무제한이 외부 사용자 OOM 유발 |
-| **OOM 후 인덱스 재사용 미검증** | CAGRA extend OOM 시 `_pr.poison()`으로 PooledRes 반환을 막지만, poison 이후 재빌드 없이 동일 인덱스에 쿼리했을 때 동작 불명. | 테스트(OOM 복구 → 재빌드 없이 쿼리 e2e) | **repo 공개 전** — 안전성 미검증 상태로 공개 부적합 |
+| ~~**fallback 관측성**~~ [OK] | 감사 #2. `pg_stat_gpu_search`에 fallback 카운터 부재 — 쿼리가 조용히 CPU로 새는지 SQL로 알 수 없음(fallback은 backend plan-time 결정이라 데몬 미도달). | 코드(backend shmem 카운터 → view) | **완료** (PR #43): 신규 `pg_stat_gpu_fallback` 뷰 + 백엔드 shmem 카운터(`cuvsamcostestimate`가 사유별 기록), `fallback_stat` 테스트, installcheck 26/26 |
+| ~~**VRAM budget 강제**~~ [OK] | `set_vram_budget(0)` 기본 무제한 + raw `cudaMemGetInfo` 신뢰 불가(CUDA async mempool 캐싱). | 코드(기본값 재검토 + mempool-aware, ADR-065) | **완료** (ADR-065 해소): 기본 budget = 총 VRAM의 90%(데몬 자체 회계로 강제, raw 조회 불요) + `cudaMemPoolGetAttribute` 기반 free 보정(best-effort). `gpu-test-vram` 36418/40465 MB PASS. **동적 sizing은 별개 follow-up** |
+| ~~**OOM 후 인덱스 재사용 미검증**~~ [OK] | CAGRA extend OOM 시 `_pr.poison()` 이후 재빌드 없이 동일 인덱스 쿼리 동작 불명. | 테스트(OOM 복구 → 재빌드 없이 쿼리) | **완료** (PR #42): `extend_cuda_oom`에 resident CAGRA 그래프 무결성(원본값 NN, tie-robust) + GPU-served assert 추가 |
 | **circuit breaker 전역화** | 감사 #5. breaker가 백엔드 프로세스-로컬(shared 아님) — 동시 연결에서 GPU 장애 시 전역 보호 안 됨(백엔드당 상한은 있음). | 코드(shared-memory breaker 상태) | 3C/3D 완료(프로덕션 배포 시점) |
 | **SQL latency split** | 감사 #1. `pg_stat_gpu_search`에 GPU/IPC/recheck 분해 미노출. | 코드(데몬 계측 + IPC + SQL 컬럼) | 명시 요청 시(ADR-044가 외부 측정 완료, SQL 노출 한계가치 낮음) |
 | **delta 누적 성능 저하 관측성** | brute-force 머지가 O(n_delta)라 delta 누적 시 검색 성능 저하. 현재 SQL로 "지금 REINDEX 해야 하나" 판단 기준 없음 — `pg_stat_gpu_search`에 delta 누적 경보 signal 미노출. | 코드(`pg_stat_gpu_search`에 `delta_ratio` 또는 `delta_warn` 컬럼 추가) | delta 누적 운영 문제 실측 시 |
