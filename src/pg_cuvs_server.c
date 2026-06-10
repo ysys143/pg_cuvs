@@ -53,8 +53,15 @@
 
 /* ----------------------------------------------------------------
  * Index registry
+ *
+ * The registry is a soft LRU working-set cap, NOT a hard wall: up to
+ * g_max_indexes indexes stay resident; beyond that the LRU is evicted to disk
+ * (durable) and reloaded on demand by the search-miss path. Sized once at
+ * startup from --max-indexes (default 1024, was a hard 64) — allocated with
+ * calloc and never realloc'd, so &g_indexes[i] addresses and the compacting-shift
+ * removal stay valid for the daemon's life.
  * ---------------------------------------------------------------- */
-#define MAX_INDEXES 64
+#define CUVS_DEFAULT_MAX_INDEXES 1024
 
 /* Phase 3D: per-index warmup lifecycle state. */
 typedef enum WarmupState {
@@ -224,7 +231,8 @@ record_search_stat(IndexEntry *e, uint32_t status, uint32_t latency_us,
     }
 }
 
-static IndexEntry  g_indexes[MAX_INDEXES];
+static int         g_max_indexes = CUVS_DEFAULT_MAX_INDEXES;  /* registry capacity; --max-indexes */
+static IndexEntry *g_indexes      = NULL;   /* calloc(g_max_indexes) at startup */
 static int         g_n_indexes   = 0;
 static pthread_mutex_t g_index_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -245,7 +253,7 @@ typedef struct ColdIndexEntry {
     int         valid;
 } ColdIndexEntry;
 
-static ColdIndexEntry g_cold_indexes[MAX_INDEXES];
+static ColdIndexEntry *g_cold_indexes = NULL;   /* calloc(g_max_indexes) at startup */
 static int            g_n_cold_indexes = 0;
 
 /* Daemon-global VRAM cache counters (mutated under g_index_mutex). Exposed via
@@ -1194,6 +1202,7 @@ static int write_tids_atomic(const char *tids_tmp,
                              const uint64_t *tids);
 static int fsync_path(const char *path);
 static int ensure_vram(size_t needed, int device_id);   /* defined after the LRU section */
+static size_t evict_lru(int device_id);                 /* soft-cap slot eviction (load_index) */
 
 /* save_index: persist a registry entry to disk atomically.
  * Same contract as handle_build's persistence path: tmp + rename + fsync.
@@ -1292,7 +1301,10 @@ load_index_sharded(uint32_t db_oid, uint32_t index_oid,
         return -1;
     }
 
-    if (g_n_indexes >= MAX_INDEXES)
+    /* Soft cap: evict the LRU to free a slot so a sharded reload succeeds. */
+    if (g_n_indexes >= g_max_indexes)
+        evict_lru(usable_gpu(0));
+    if (g_n_indexes >= g_max_indexes)
     {
         free(recs);
         return -1;
@@ -1544,7 +1556,13 @@ load_index(uint32_t db_oid, uint32_t index_oid)
         }
     }
 
-    if (g_n_indexes >= MAX_INDEXES)
+    /* Soft cap: if the registry is full, evict the LRU to free a slot so this
+     * reload (search-miss auto-reload) succeeds. ensure_vram above only evicts
+     * under VRAM pressure; with spare VRAM but full slots it would not, leaving
+     * an evicted index unable to return. */
+    if (g_n_indexes >= g_max_indexes)
+        evict_lru(target_gpu);
+    if (g_n_indexes >= g_max_indexes)
     {
         if (handle)       cuvs_cagra_free(handle, target_gpu);
         if (ivfpq_handle) cuvs_ivfpq_free(ivfpq_handle, target_gpu);
@@ -1682,7 +1700,7 @@ startup_load_indexes(void)
         read_relfilenode_sidecar(g_index_dir, db_oid, index_oid,
                                  &local_rfn, &local_table_oid);
 
-        if (g_n_cold_indexes < MAX_INDEXES)
+        if (g_n_cold_indexes < g_max_indexes)
         {
             ColdIndexEntry *ce = &g_cold_indexes[g_n_cold_indexes++];
             ce->db_oid            = db_oid;
@@ -3965,9 +3983,9 @@ build_sharded(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir,
     }
     else
     {
-        if (g_n_indexes >= MAX_INDEXES)
+        if (g_n_indexes >= g_max_indexes)
             evict_lru(usable_gpu(0));
-        if (g_n_indexes >= MAX_INDEXES)
+        if (g_n_indexes >= g_max_indexes)
         {
             /* Registry full but artifacts are durable on disk: a later search
              * reloads from the .shards manifest. Free GPU resources now. */
@@ -4522,17 +4540,23 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         existing->last_compact_at = time(NULL);
         build_rev_tid_map(existing);   /* rebuild map for new tids/n_vecs */
     } else {
-        if (g_n_indexes >= MAX_INDEXES)
+        if (g_n_indexes >= g_max_indexes)
             evict_lru(target_gpu);
-        if (g_n_indexes >= MAX_INDEXES) {
-            LOG_ERROR("[handle_build] registry full; rolling back disk commit\n");
-            unlink(idx_final);
-            unlink(tids_final);
-            if (vectors_committed) unlink(vecs_final);
+        if (g_n_indexes >= g_max_indexes) {
+            /* Registry full and the LRU couldn't be evicted (e.g. all entries
+             * inflight on other GPUs). The artifacts are already durable on
+             * disk, so DON'T roll back — free GPU resources and reply OK; the
+             * first query reloads from disk (load_index evicts for a slot).
+             * Mirrors build_sharded's defer-to-reload. */
+            LOG_WARN("[handle_build] registry full; %u/%u persisted, will reload on demand\n",
+                     cmd->db_oid, cmd->index_oid);
+            (void) vectors_committed;   /* .vectors stays on disk for the reload */
             cuvs_cagra_free(new_handle, target_gpu);
             free(new_tids);
             pthread_mutex_unlock(&g_index_mutex);
-            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "index registry full");
+            CuvsReplyHeader hdr_ok = {0};
+            hdr_ok.status = CUVS_STATUS_OK;
+            send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
             return;
         }
         IndexEntry *e = &g_indexes[g_n_indexes++];
@@ -4926,11 +4950,21 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
 {
     pthread_mutex_lock(&g_index_mutex);
 
-    /* Bounded by MAX_INDEXES; gather under the lock, send after unlocking. */
-    CuvsIndexStats stats[MAX_INDEXES];
+    /* Bounded by g_max_indexes; gather under the lock, send after unlocking.
+     * Heap-allocated — g_max_indexes can be large, so never a stack VLA. */
+    CuvsIndexStats *stats = malloc((size_t)g_max_indexes * sizeof(CuvsIndexStats));
     uint32_t n = 0;
 
-    for (int i = 0; i < g_n_indexes && n < MAX_INDEXES; i++)
+    if (!stats)
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_OK;   /* empty stats, not an error */
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    for (int i = 0; i < g_n_indexes && n < (uint32_t)g_max_indexes; i++)
     {
         IndexEntry *e = &g_indexes[i];
         if (!e->valid)
@@ -4991,7 +5025,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
 
     /* Phase 3D: also emit cold (not-yet-resident) entries so operators can
      * see warmup progress in pg_stat_gpu_search. */
-    for (int i = 0; i < g_n_cold_indexes && n < MAX_INDEXES; i++)
+    for (int i = 0; i < g_n_cold_indexes && n < (uint32_t)g_max_indexes; i++)
     {
         ColdIndexEntry *ce = &g_cold_indexes[i];
         if (!ce->valid)
@@ -5023,6 +5057,7 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
     send_all(client_fd, &hdr, sizeof(hdr));
     if (n > 0)
         send_all(client_fd, stats, (size_t)n * sizeof(CuvsIndexStats));
+    free(stats);
 }
 
 /* ----------------------------------------------------------------
@@ -5620,16 +5655,22 @@ handle_build_ivfpq(int client_fd, const CuvsCmdFrame *cmd)
         }
         else
         {
-            if (g_n_indexes >= MAX_INDEXES)
+            if (g_n_indexes >= g_max_indexes)
                 evict_lru(target_gpu);
-            if (g_n_indexes >= MAX_INDEXES)
+            if (g_n_indexes >= g_max_indexes)
             {
+                /* Soft cap: artifacts durable on disk, defer to reload-on-demand
+                 * (load_index reloads IVF-PQ). Don't roll back; reply OK. */
+                LOG_WARN("[handle_build_ivfpq] registry full; %u/%u persisted, will reload on demand\n",
+                         cmd->db_oid, cmd->index_oid);
                 cuvs_ivfpq_free(new_handle, target_gpu);
                 free(new_tids);
-                unlink(ivfpq_final);
-                unlink(tids_final);
                 pthread_mutex_unlock(&g_index_mutex);
-                send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "index registry full");
+                {
+                    CuvsReplyHeader hdr_ok = {0};
+                    hdr_ok.status = CUVS_STATUS_OK;
+                    send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+                }
                 return;
             }
             IndexEntry *e = &g_indexes[g_n_indexes++];
@@ -6604,6 +6645,12 @@ main(int argc, char **argv)
             strncpy(g_index_dir, argv[++i], sizeof(g_index_dir) - 1);
         else if (strcmp(argv[i], "--max-vram-mb") == 0 && i+1 < argc)
             g_max_vram_bytes = (size_t)atol(argv[++i]) * 1024 * 1024;
+        else if (strcmp(argv[i], "--max-indexes") == 0 && i+1 < argc)
+        {
+            int n = atoi(argv[++i]);
+            if (n >= 1)
+                g_max_indexes = n;   /* registry working-set capacity */
+        }
         else if (strcmp(argv[i], "--snapshot-uri") == 0 && i+1 < argc)
             strncpy(g_snapshot_uri, argv[++i], sizeof(g_snapshot_uri) - 1);
         else if (strcmp(argv[i], "--cluster-id") == 0 && i+1 < argc)
@@ -6683,6 +6730,20 @@ main(int argc, char **argv)
             }
         }
     }
+
+    /* Allocate the index registry now that --max-indexes is known (calloc =
+     * zero-initialized, matching the old static arrays). Done before
+     * startup_load_indexes() and any registry use; never realloc'd afterward. */
+    g_indexes      = calloc((size_t)g_max_indexes, sizeof(IndexEntry));
+    g_cold_indexes = calloc((size_t)g_max_indexes, sizeof(ColdIndexEntry));
+    if (!g_indexes || !g_cold_indexes)
+    {
+        LOG_ERROR("pg_cuvs_server: failed to allocate index registry (--max-indexes %d)\n",
+                  g_max_indexes);
+        return 1;
+    }
+    LOG_INFO("index registry capacity: %d (--max-indexes)\n", g_max_indexes);
+
     /* Initialize per-device VRAM budgets.
      *
      * ADR-065: when --max-vram-mb is omitted, default to a conservative fraction

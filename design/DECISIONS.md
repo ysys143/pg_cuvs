@@ -2627,3 +2627,41 @@ green CI badge가 "GPU 검증됨"으로 읽히면 그 자체가 CI의 false-done
 ### 후속
 
 ADR-066 비고의 emulator 기반 GCS 회귀(`STORAGE_EMULATOR_HOST` + fake-gcs-server)를 Tier 1에 편입 가능. 관련: [[ADR-065]](VRAM 자기-회계), [[ADR-066]](objstore 인증), 3O PR#39(false-done 교훈).
+
+---
+
+## ADR-068 — MAX_INDEXES: 하드월 → 소프트 LRU working-set 캡
+
+**날짜**: 2026-06-10
+**상태**: ACCEPTED / 구현·검증 완료 (repo 공개 전, 멀티테넌트 온라인 스케일)
+
+**문제**: 데몬 레지스트리가 `MAX_INDEXES=64` 고정 배열(`g_indexes[64]`). 타깃이 멀티테넌트인데
+65번째 테넌트/파티션에서 막히면 첫 외부 사용자 이탈 사유(ADR-061 / STRATEGY_NOTES §G).
+
+**근본 원인(감사로 3개 확인, 단일 아님)**:
+1. `load_index`가 레지스트리-풀에서 **슬롯 확보 eviction을 안 함**(`ensure_vram`은 VRAM만 evict).
+   VRAM 여유가 있는데 슬롯이 다 차면 `-1` → 검색 miss auto-reload(`handle_search`)가 풀 상태에서
+   실패 → 축출된 테넌트가 REINDEX/재시작 없이 못 돌아옴(조용한 CPU 폴백). **이것이 진짜 하드월** —
+   build는 이미 evict-on-full로 통과하고 있었다.
+2. `finish_build_commit`이 풀에서 hard-ERROR + rollback (반면 `build_sharded`는 graceful defer).
+3. 캡 자체가 고정 64.
+
+**결정**: 레지스트리를 *하드월*에서 *소프트 LRU working-set 캡*으로 전환. 최근 N개만 상주,
+나머지는 on-demand reload — `handle_search`의 search-miss 경로가 원래 하려던 동작.
+- **(A) configurable cap**: `g_indexes`/`g_cold_indexes`를 startup-`calloc` 포인터로 전환,
+  크기 = `--max-indexes`(기본 **1024**, was 64). startup 1회 할당·런타임 realloc 없음 →
+  `&g_indexes[i]` 주소 + compacting-shift 제거 불변식 유지. `handle_stats`의 스택 배열은
+  malloc로(VLA 금지). 16개 사용처를 `g_max_indexes`로 치환.
+- **(B) `load_index` 슬롯-확보 eviction**: 풀이면 `evict_lru`로 LRU를 비워 reload 성공
+  (sharded 포함). auto-reload 실질 배선.
+- **(C) build 경로 graceful defer**: `finish_build_commit`(CAGRA) + IVF-PQ 빌드가 풀에서
+  rollback+ERROR 대신 아티팩트 보존 + OK + "reload on demand"(build_sharded 패턴). 캡 초과
+  안전망(A의 1024로 드물지만).
+
+**대안 기각**: (a) 단순 상수 상향만 — 여전히 벽 + (B) 미해결로 축출분 복귀 불가. (b) 런타임
+realloc 무한 성장 — pointer-stability 위험, startup-fixed로 충분(`--max-indexes` 상향 가능).
+
+**검증 (A100, cuVS 26.04.00)**: `make gpu-test-maxidx` — `--max-indexes 4`로 10테넌트 빌드
+**ERROR 0** + 전 테넌트 쿼리 정확 + `pg_stat_gpu_cache` evictions=16/**reloads=10**(축출분이 GPU로
+재하이드레이션 = B 증명). 프로덕션 기본 1024 로그 확인. 회귀 무영향: installcheck 26/26 +
+isolation 3/3 GREEN. 관련: [[ADR-061]](전략), STRATEGY_NOTES §G.

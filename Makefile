@@ -226,7 +226,7 @@ unexport VM_IP VM_HOST
 
 .PHONY: vm-start vm-stop sync gpu-build gpu-test gpu-bench gpu-bench-1m gpu-shell \
 	gpu-test-unit gpu-test-regress gpu-test-isolation gpu-test-daemon gpu-test-e2e \
-	gpu-test-delta-restart gpu-test-all gpu-test-objstore gpu-test-vram
+	gpu-test-delta-restart gpu-test-all gpu-test-objstore gpu-test-vram gpu-test-maxidx
 
 vm-start:
 	@test -n "$(GCP_INSTANCE)" || (echo "ERROR: set GCP_INSTANCE in .env.gpu"; exit 1)
@@ -335,6 +335,13 @@ gpu-test-objstore:
 gpu-test-vram:
 	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
 		< infra/scripts/vram-budget-default.sh
+
+# MAX_INDEXES soft-cap: more tenants than registry slots must work (build w/o
+# ERROR + queries auto-reload evicted indexes to GPU). Dedicated daemon with a
+# tiny --max-indexes; asserts evictions>0 and reloads>0. Piped over stdin.
+gpu-test-maxidx:
+	ssh $(VM_HOST) "source ~/miniforge3/bin/activate $(CONDA_ENV) && bash -s" \
+		< infra/scripts/max-indexes-scale.sh
 
 # End-to-end durability smoke (alias of gpu-e2e for naming symmetry).
 gpu-test-e2e:
