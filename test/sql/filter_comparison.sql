@@ -166,6 +166,12 @@ FROM (
     JOIN fc ON fc.ctid = f.ctid
 ) s;
 
+-- Regression guard: 3O must ACTUALLY engage on a freshly-built index, not
+-- silently degrade to the D-wedge post-filter. The reverse map is now built at
+-- build time (finish_build_commit), so the CAGRA-first prefilter runs here.
+SELECT search_mode AS mode_forced_3o
+FROM pg_stat_gpu_search WHERE index_oid = 'fc_cagra'::regclass;
+
 -- Force D-wedge by setting threshold=0.0; same correctness expected.
 SET cuvs.filter_auto_threshold = 0.0;
 
@@ -180,6 +186,10 @@ FROM (
     ) f
     JOIN fc ON fc.ctid = f.ctid
 ) s;
+
+-- D-wedge post-filter path: gpu brute_force over the corpus.
+SELECT search_mode AS mode_forced_dwedge
+FROM pg_stat_gpu_search WHERE index_oid = 'fc_cagra'::regclass;
 
 RESET cuvs.filter_auto_threshold;
 

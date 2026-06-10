@@ -3983,13 +3983,14 @@ pg_cuvs_gpu_search_stats(PG_FUNCTION_ARGS)
         /* Phase 3F: shard count (0/1 = unsharded). */
         values[32] = Int32GetDatum((int32) s->shard_count);
 
-        /* Phase 3I-1 / 3L / 3P / ADR-064: last search mode for this index.
-         * Values: 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback,
-         *         3=brute_force, 5=ivfpq, 6=stream_bf */
+        /* Phase 3I-1 / 3L / 3P / 3O / ADR-064: last search mode for this index.
+         * Values: 0=gpu_cagra, 1=cpu_hnsw, 2=cpu_fallback, 3=brute_force,
+         *         4=cagra_prefilter, 5=ivfpq, 6=stream_bf */
         values[33] = CStringGetTextDatum(
             s->search_mode == 1 ? "cpu_hnsw" :
             s->search_mode == 2 ? "cpu_fallback" :
             s->search_mode == 3 ? "brute_force" :
+            s->search_mode == 4 ? "cagra_prefilter" :
             s->search_mode == 5 ? "ivfpq" :
             s->search_mode == 6 ? "stream_bf" : "gpu_cagra");
 

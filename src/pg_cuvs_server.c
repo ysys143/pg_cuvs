@@ -2022,11 +2022,9 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
-    /* Need the 3O reverse map (heapTID -> item_id). It is built on index LOAD,
-     * but not by handle_build, so a freshly-built-and-still-resident index has
-     * none yet — build it lazily here (we hold g_index_mutex; e->tids is stable). */
-    if (e->rev_tids == NULL && e->tids != NULL && e->n_vecs > 0)
-        build_rev_tid_map(e);
+    /* Need the 3O reverse map (heapTID -> item_id), built at build/load time.
+     * Genuinely absent only if build_rev_tid_map hit a malloc failure -> the
+     * backend falls back to its in-VRAM filtered path. */
     if (e->rev_tids == NULL || e->rev_item_ids == NULL || e->n_vecs <= 0)
     {
         pthread_mutex_unlock(&g_index_mutex);
@@ -4547,6 +4545,12 @@ finish_build_commit(int client_fd, const CuvsCmdFrame *cmd, const char *save_dir
         e->last_compact_at   = 0;
         e->rev_tids = NULL;  /* evicted slot may have stale freed ptr; NULL it */
         e->rev_item_ids = NULL;
+        /* 3O: build the heapTID->item_id reverse map at build time (not only on
+         * load). Without this a freshly-built resident index has no map, so 3O
+         * prefilter and ADR-064 streaming BF silently fall back until a restart
+         * or in-place REINDEX. e->tids/e->n_vecs are set above. This covers both
+         * handle_build and handle_build_multi (both finalize through here). */
+        build_rev_tid_map(e);
         reset_entry_stats(e);
     }
 
