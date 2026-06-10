@@ -231,6 +231,36 @@ COMMENT ON VIEW pg_stat_gpu_cache IS
   'empty while the daemon is down.';
 
 -- ----------------------------------------------------------------
+-- pg_stat_gpu_fallback — per-index CPU-fallback counters (backend shmem).
+-- A GPU index "falls back" when cuvsamcostestimate gates it off at plan time
+-- (the planner picks seqscan/pgvector); that decision never reaches the daemon,
+-- so pg_stat_gpu_search cannot show it. Backed by the SRF in src/pg_cuvs.c.
+-- ----------------------------------------------------------------
+CREATE FUNCTION pg_cuvs_gpu_fallback_stats(
+    OUT index_oid        regclass,
+    OUT fallback_count   bigint,
+    OUT last_reason      text,
+    OUT last_fallback_at timestamptz
+)
+RETURNS SETOF record
+AS '$libdir/pg_cuvs', 'pg_cuvs_gpu_fallback_stats'
+LANGUAGE C;
+
+COMMENT ON FUNCTION pg_cuvs_gpu_fallback_stats() IS
+  'Per-index CPU-fallback counters for the current database. Backs the '
+  'pg_stat_gpu_fallback view. Counts are a relative pressure signal (plan-time '
+  'cost estimate may run more than once per query), not exact query counts.';
+
+CREATE VIEW pg_stat_gpu_fallback AS
+  SELECT * FROM pg_cuvs_gpu_fallback_stats();
+
+COMMENT ON VIEW pg_stat_gpu_fallback IS
+  'Per-index GPU->CPU fallback: how many times the planner dropped the GPU '
+  'index path and why (last_reason: disabled/circuit_breaker/stale/delete_drift/'
+  'daemon_down/no_artifact/delta_unusable/tombstone_unusable). Watch the trend '
+  'against pg_stat_gpu_search.search_count to detect queries silently using CPU.';
+
+-- ----------------------------------------------------------------
 -- pg_stat_gpu_shards — per-shard placement and stats for sharded CAGRA
 -- indexes (Phase 3F, cuvs.shard_count >= 2). One row per shard; empty for
 -- unsharded indexes or while the daemon is down. Column order must match the

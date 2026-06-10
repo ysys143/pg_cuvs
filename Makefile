@@ -18,7 +18,7 @@ DATA           = sql/pg_cuvs--$(EXTVERSION).sql \
                  sql/pg_cuvs--0.2.0--0.3.0.sql \
                  sql/pg_cuvs--0.3.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Isolation tests (pg_isolation_regress) for concurrent-session correctness that
