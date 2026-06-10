@@ -2397,6 +2397,56 @@ caller가 TID whitelist를 `bigint[]`(block<<16|off 인코딩)로 직접 전달.
 
 **대안 기각**: Option C (GUC 세션 변수 `cuvs.prefilter_col/val`) — 타입 안전성 없음, 병렬 쿼리 위험, 프로덕션 부적합.
 
+## ADR-065 — RMM pool 격리와 VRAM budget 강제 한계
+
+**날짜**: 2026-06-10
+**상태**: 확정 (제약 기록) — 구현 미착수, VRAM budget GUC 착수 시 참조 필수.
+
+### 배경
+
+CAGRA extend OOM 주입 테스트(`pg_cuvs_eat_vram()`으로 CUDA 여유 메모리를 4 MiB로 축소)에서 `cuda_oom_blocked_extend = f` — extend가 계속 성공하는 현상이 발견됐다.
+
+### 근본 원인: RMM pool 캐싱
+
+cuVS는 RAPIDS Memory Manager(RMM) pool을 통해 CUDA 메모리를 관리한다. RMM pool은 이전 빌드/검색 세션에서 해제된 CUDA 메모리를 내부 캐시로 보유한다. 외부 `cudaMalloc` 또는 `cudaMemGetInfo`는 이 캐시를 건드릴 수 없다.
+
+결과:
+- raw `cudaMemGetInfo`가 반환하는 free memory = RMM pool 캐시를 제외한 잔여
+- cuVS extend/search의 workspace 조달은 RMM pool 내부에서 이뤄짐
+- raw CUDA 잔여가 4 MiB여도 RMM pool 캐시에 충분한 메모리가 있으면 cuVS 연산 성공
+
+### 결정: raw CUDA API 기반 VRAM budget 체크 금지
+
+`cudaMemGetInfo` / `cudaMalloc` probe를 VRAM budget 강제 수단으로 사용하지 않는다. 이 값은 RMM pool 캐시를 반영하지 않아 실제 cuVS workspace 가용량과 괴리가 있다.
+
+**실효 budget 강제 경로 (미착수)**:
+- RMM pool의 `pool_size()` / `pool_free_size()` API로 pool 잔여 직접 조회
+- 또는 cuVS resource handle을 통한 메모리 한도 설정 (`rmm::mr::pool_memory_resource` 생성 시 `maximum_size` 파라미터)
+- `set_vram_budget(0)` 현재 기본값 = 무제한 — 프로덕션 배포 전 재검토 필요
+
+### 현재 OOM 안전망
+
+raw budget 체크가 신뢰 불가임에도 OOM 안전은 다른 경로로 보장된다:
+
+1. cuVS 내부 RMM이 실제 OOM 시 예외 throw
+2. `handle_extend()`의 try-catch가 이를 잡아 delta fallback으로 전환
+3. `_pr.poison()`으로 손상된 PooledRes 반환 차단
+
+즉, **OOM 시 데이터 유실은 없다**. budget 강제의 부재는 "사전에 막지 못한다"는 것이지 "OOM 후 깨진다"는 것이 아니다.
+
+### 영향 범위
+
+| 컴포넌트 | 영향 |
+|----------|------|
+| `cuvs.vram_budget_mb` (미구현) | 구현 시 RMM pool API 경유 필수 |
+| Streaming BF 청크 크기 (ADR-064) | 청크당 workspace 추정에 RMM pool 상태 필요 |
+| OOM 주입 테스트 | `g_inject_extend_oom` 플래그 방식 유지 — raw CUDA 조작으로는 RMM pool 우회 불가 |
+
+### 대안 기각
+
+- **raw `cudaMemGetInfo` 기반 budget 체크**: RMM pool 캐시 미반영으로 신뢰 불가 — 기각
+- **`cudaMalloc` probe-and-free**: 동일 이유 + probe 자체가 RMM pool 밖에서 할당돼 cuVS와 경쟁 발생 가능 — 기각
+
 ## ADR-064 — Streaming / Out-of-Core BF: sidecar-gather 경로 (DEFERRED)
 
 **날짜**: 2026-06-09
