@@ -81,11 +81,17 @@ shim 빌드가 CUDA 툴킷 설치를 요구하면 hosted 러너 무료 이점이
 - steps: PG + pgvector 설치 → `make PGCUVS_CPU_SHIM=1` → 데몬 기동 → `make installcheck` + `make test-unit` + isolation
 - 기존 `.sql` 스위트 대부분 그대로 재사용(BF recall@10=1.0은 shim과 동일, CAGRA recall assert는 `>=`라 exact가 통과, mode assert는 데몬 로직이 진짜 도니 통과)
 
-### `.github/workflows/gpu.yml` (Tier 2, on-demand)
-- on: `workflow_dispatch` + `issue_comment`(`/gpu-test`) / `pull_request`(labeled `gpu-ci`)
-- runner: `[self-hosted, gpu]`(사용자 VM을 그 순간만 붙임)
-- steps: 실 cuVS 빌드 → 실 A100 installcheck → 결과를 PR에 코멘트
-- 비용은 사용자가 트리거할 때만 발생
+### `.github/workflows/gpu.yml` (Tier 2, on-demand) — 구현 모델 (정정)
+- on: **`workflow_dispatch`만** (Actions UI "Run workflow" 버튼 = 쓰기권한자만). 코멘트/라벨
+  자동 트리거는 fork-PR가 VM에서 임의 코드를 돌릴 위험이라 **비채택**(UI 버튼이 권한 게이트 내장).
+- 3-job 구조: **start-vm**(hosted, WIF 키리스 인증 → `gcloud instances start`) → **gpu-test**
+  (`[self-hosted, gpu, a100]` — VM 위 부팅-시작 러너가 `ubuntu`+conda로 실 `make installcheck`) →
+  **stop-vm**(hosted, `if: always()` → `gcloud instances stop`, 비용 누수 방지).
+- 보안: GCP 권한은 GitHub에 키로 두지 않고 **GCP의 WIF 신뢰정책**(repo 스코프)에 둠. self-hosted
+  러너는 트리거된 런 동안 VM이 켜진 시점만 온라인 → 상시 공격표면 없음. `environment: gpu` +
+  required reviewers로 VM 기동 전 사람 승인 게이트. 셋업: `docs/ci-gpu-setup.md`.
+- 비용은 버튼 누를 때만 발생. (초안의 `runner: [self-hosted, gpu]` 단일-잡 모델은 VM이 대부분
+  꺼져 있고 IP가 바뀌는 비용통제 VM과 맞지 않아 위 hosted-제어 모델로 개정.)
 
 ## 6. 정직성 라벨(필수)
 

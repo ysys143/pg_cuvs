@@ -1,0 +1,109 @@
+name: GPU regression (Tier 2)
+
+# Tier 2 — real A100 regression, run ON DEMAND from the GitHub UI.
+# Actions tab -> "GPU regression (Tier 2)" -> "Run workflow" (write access only).
+#
+# Model (design/CI_STRATEGY.md §5, ADR-067): a hosted runner starts the GPU VM
+# (keyless GCP auth via Workload Identity Federation), a self-hosted runner that
+# lives on the VM (as the build user, with the cuVS conda env) runs the real
+# installcheck, then a hosted runner stops the VM. Cost is incurred only when a
+# maintainer clicks Run. Setup: docs/ci-gpu-setup.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag to test (blank = this workflow's ref)"
+        required: false
+      pr:
+        description: "PR number to test (optional; checks out the PR merge ref)"
+        required: false
+
+permissions:
+  contents: read
+  id-token: write        # for Workload Identity Federation (keyless GCP auth)
+
+env:
+  GCP_INSTANCE: ${{ vars.GPU_CI_INSTANCE }}     # e.g. pg-cuvs-dev
+  GCP_ZONE: ${{ vars.GPU_CI_ZONE }}             # e.g. us-central1-b
+
+jobs:
+  # ── Start the GPU VM (hosted, keyless GCP auth) ──────────────────────────
+  start-vm:
+    name: Start GPU VM
+    runs-on: ubuntu-latest
+    environment: gpu        # add required reviewers here to gate before any cost
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Start instance + wait for SSH
+        run: |
+          gcloud compute instances start "$GCP_INSTANCE" --zone "$GCP_ZONE"
+          # The self-hosted runner is a boot-start service; give it a moment to
+          # register. The gpu-test job queues until the runner comes online.
+          sleep 45
+
+  # ── Real installcheck on the A100 (self-hosted runner ON the VM) ──────────
+  gpu-test:
+    name: GPU installcheck (A100)
+    needs: start-vm
+    runs-on: [self-hosted, gpu, a100]
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Check out PR merge ref (if pr input given)
+        if: ${{ github.event.inputs.pr != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr checkout ${{ github.event.inputs.pr }}
+
+      - name: Build + install (real cuVS)
+        run: |
+          source ~/miniforge3/bin/activate cuvs_dev
+          make
+          sudo -E make install
+          make server
+          sudo make install-server
+
+      - name: Restart services
+        run: |
+          sudo systemctl restart postgresql
+          sudo systemctl restart pg-cuvs-server
+          sleep 3
+
+      - name: Full regression (installcheck + isolation)
+        run: |
+          source ~/miniforge3/bin/activate cuvs_dev
+          make installcheck
+          make installcheck-isolation
+
+      - name: Upload diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-regression-diffs
+          path: |
+            test/regression.diffs
+            test/*.diffs
+          retention-days: 7
+
+  # ── Stop the GPU VM (hosted) — runs even on failure, no cost leak ─────────
+  stop-vm:
+    name: Stop GPU VM
+    needs: [start-vm, gpu-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Stop instance
+        run: gcloud compute instances stop "$GCP_INSTANCE" --zone "$GCP_ZONE"
