@@ -93,7 +93,7 @@ void cuvs_bf_free(CuvsBfIndex index, int device_id);
 /*
  * cuvs_bf_search_filtered — GPU BF search with host-side BITSET prefilter (3O).
  *
- * bitset_words : host uint32_t[] following cuVS convention: bit[item_id]=1 means
+ * bitset_words : host uint32_t[] following pg_cuvs convention: bit[item_id]=1 means
  *               EXCLUDE that item from search; bit=0 means include.
  * bitset_bits  : total bit count = n_vecs.
  *
@@ -166,7 +166,7 @@ int cuvs_cagra_search(
 /*
  * cuvs_cagra_search_filtered — GPU CAGRA search with BITSET prefilter (3O).
  *
- * bitset_words : host uint32_t[] following cuVS convention: bit[item_id]=1 means
+ * bitset_words : host uint32_t[] following pg_cuvs convention: bit[item_id]=1 means
  *               EXCLUDE that item from search; bit=0 means include.
  * bitset_bits  : total bit count = n_vecs.
  *

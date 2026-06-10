@@ -511,10 +511,16 @@ cuvs_bf_search_filtered(
         auto d_distances = raft::make_device_matrix<float,   int64_t>(res, 1, top_k);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
-        /* Upload bitset (cuVS convention: bit=1 = excluded) */
+        /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE (daemon memsets 0xFF then
+         * clears kept items); cuVS bitset_filter keeps SET bits (bit=1 = INCLUDE),
+         * so invert at this cuVS boundary. Padding bits past bitset_bits are ignored
+         * by bitset_view (bounded to bitset_bits). */
         int64_t n_words = (bitset_bits + 31) / 32;
+        std::vector<uint32_t> inv_bits((size_t)n_words);
+        for (int64_t w = 0; w < n_words; w++)
+            inv_bits[w] = ~bitset_words[w];
         auto d_bs_data = raft::make_device_vector<uint32_t, int64_t>(res, n_words);
-        raft::copy(d_bs_data.data_handle(), bitset_words, (size_t)n_words, res.get_stream());
+        raft::copy(d_bs_data.data_handle(), inv_bits.data(), (size_t)n_words, res.get_stream());
 
         auto bv        = cuvs::core::bitset_view<uint32_t, int64_t>(
                              d_bs_data.data_handle(), bitset_bits);
@@ -589,9 +595,15 @@ cuvs_cagra_search_filtered(
         auto d_distances = raft::make_device_matrix<float,    int64_t>(res, 1, top_k);
         raft::copy(d_queries.data_handle(), query_vec, dim, res.get_stream());
 
+        /* Upload bitset. pg_cuvs builds bit=1 = EXCLUDE; cuVS bitset_filter keeps
+         * SET bits (bit=1 = INCLUDE), so invert at this cuVS boundary. Padding bits
+         * past bitset_bits are ignored by bitset_view (bounded to bitset_bits). */
         int64_t n_words = (bitset_bits + 31) / 32;
+        std::vector<uint32_t> inv_bits((size_t)n_words);
+        for (int64_t w = 0; w < n_words; w++)
+            inv_bits[w] = ~bitset_words[w];
         auto d_bs_data = raft::make_device_vector<uint32_t, int64_t>(res, n_words);
-        raft::copy(d_bs_data.data_handle(), bitset_words, (size_t)n_words, res.get_stream());
+        raft::copy(d_bs_data.data_handle(), inv_bits.data(), (size_t)n_words, res.get_stream());
 
         auto bv        = cuvs::core::bitset_view<uint32_t, int64_t>(
                              d_bs_data.data_handle(), bitset_bits);

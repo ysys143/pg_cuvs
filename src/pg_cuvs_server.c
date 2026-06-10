@@ -2538,7 +2538,8 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
                 presults = malloc((size_t)(k > 0 ? k : 1) * sizeof(CuvsResult));
 
                 if (bitset && praw && presults) {
-                    /* bit=1 = exclude (cuVS convention): start all excluded */
+                    /* pg_cuvs convention: bit=1 = exclude. Start all excluded;
+                     * the cuVS wrapper inverts this to cuVS's bit=1 = include. */
                     memset(bitset, 0xFF, (size_t)nwords * sizeof(uint32_t));
                     /* clear bits for filter items (include them) */
                     for (uint32_t fi = 0; fi < cmd->n_filter_tids; fi++) {

@@ -107,7 +107,7 @@ shim_pair_cmp(const void *pa, const void *pb)
 }
 
 /* Exact top-k over ix, optionally excluding items whose bitset bit is set
- * (bit[id]=1 => EXCLUDE, cuVS convention). Pads tail with item_id=-1. */
+ * (bit[id]=1 => EXCLUDE, pg_cuvs convention). Pads tail with item_id=-1. */
 static void
 shim_topk(const ShimIndex *ix, const float *query, int dim, int top_k,
           const uint32_t *bitset, int64_t bitset_bits,

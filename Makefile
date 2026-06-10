@@ -25,12 +25,7 @@ REGRESS_OPTS   = --inputdir=test --outputdir=test
 # Excluded = tests the shim cannot/should not reproduce on CPU:
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw — CAGRA->pgvector HNSW *graph export*
 #     (real graph structure; a Tier-2 / real-GPU concern).
-#   filter_comparison — TEMPORARY: it currently exposes a real GPU bug the shim
-#     does NOT share — the 3O CAGRA-prefilter inverts the BITSET (cuVS bitset is
-#     bit=1=INCLUDE, pg_cuvs builds bit=1=EXCLUDE) so the golden blessed a broken
-#     wrong_tenant=10. Returns to Tier 1 once the polarity fix lands and the
-#     golden is regenerated to wrong_tenant=0 (the shim's exact answer).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge pg_cuvs_hnsw filter_comparison
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge pg_cuvs_hnsw
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # Isolation tests (pg_isolation_regress) for concurrent-session correctness that
