@@ -106,7 +106,7 @@ jobs:
       - name: Regression suite (installcheck + isolation)
         run: |
           export PATH=/usr/lib/postgresql/16/bin:$PATH
-          make installcheck
+          make installcheck || { echo "===== regression.diffs ====="; cat test/regression.diffs; false; }
           make installcheck-isolation
 
       - name: Upload diffs + daemon log on failure
