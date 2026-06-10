@@ -2,23 +2,29 @@
 # max-indexes-scale.sh — MAX_INDEXES soft-cap: more tenants than registry slots
 # must work (build without ERROR + queries auto-reload evicted indexes to GPU).
 #
-#   make gpu-test-maxidx
+#   make gpu-test-maxidx                          # real GPU daemon (Tier 2)
+#   PG_CUVS_SERVER_BIN=./pg_cuvs_server bash \
+#     infra/scripts/max-indexes-scale.sh          # CPU shim daemon (Tier 1, per-PR)
 #
 # Runs a DEDICATED daemon with a TINY cap (--max-indexes 4), builds N=10 tenant
 # indexes (> cap), then queries every tenant. Asserts:
 #   1. all builds succeed (no "registry full" ERROR) — eviction frees slots,
 #   2. every tenant query returns correct rows from its own index,
 #   3. pg_stat_gpu_cache shows evictions>0 AND reloads>0 — the working set churns
-#      and EVICTED indexes re-hydrate to GPU on query (the auto-reload fix), not
-#      a silent CPU fallback.
-# The production pg-cuvs-server unit is stopped for the run and restarted after.
+#      and EVICTED indexes re-hydrate on query (the auto-reload fix), not a silent
+#      CPU fallback.
+# Eviction is driven by the registry SLOT cap (cap < tenants), not VRAM, so the
+# scenario is GPU-agnostic: it reproduces deterministically under the CPU shim,
+# which is why Tier-1 CI runs it every PR. Override the daemon binary with
+# PG_CUVS_SERVER_BIN (default: the installed server). The production
+# pg-cuvs-server unit, if present, is stopped for the run and restarted after.
 
 set -e
 
 DB=postgres
 SOCK=/tmp/.s.pg_cuvs_maxidx
 IDX=/tmp/cuvs_indexes_maxidx
-BIN=/usr/lib/postgresql/16/bin/pg_cuvs_server
+BIN=${PG_CUVS_SERVER_BIN:-/usr/lib/postgresql/16/bin/pg_cuvs_server}
 LOG=/tmp/pg_cuvs_maxidx_daemon.log
 CAP=4
 NTEN=10
