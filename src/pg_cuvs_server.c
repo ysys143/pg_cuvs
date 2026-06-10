@@ -156,6 +156,12 @@ typedef struct IndexEntry {
     uint64_t        bf_batch_count;     /* Phase 3L-9: coalesced BF batch dispatches */
     char            last_error[128];
     WarmupState      warmup_state;     /* Phase 3D: WARMUP_HOT for resident indexes */
+    /* Phase 3D: warmup observability — populated when an index is hydrated from
+     * GCS by the warmup worker; stays 0 for locally-built indexes (never warmed). */
+    time_t          last_warmup_at;
+    uint32_t        warmup_duration_ms;
+    uint64_t        download_count;
+    uint64_t        cache_miss_count;
     uint32_t        gpu_device_id;    /* Phase 3E: which CUDA device this index lives on */
 
     /* Phase 3I-1: CPU HNSW fallback. Loaded lazily when use_cpu_hnsw=1. */
@@ -188,6 +194,10 @@ reset_entry_stats(IndexEntry *e)
     e->delta_merged_count = 0;
     e->bf_batch_count     = 0;
     e->last_error[0]      = '\0';
+    e->last_warmup_at     = 0;   /* Phase 3D warmup observability */
+    e->warmup_duration_ms = 0;
+    e->download_count     = 0;
+    e->cache_miss_count   = 0;
 }
 
 /* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
@@ -485,7 +495,11 @@ warmup_worker_thread(void *arg)
         }
         if (he)
         {
-            he->warmup_state = WARMUP_HOT;
+            he->warmup_state       = WARMUP_HOT;
+            he->last_warmup_at     = time(NULL);
+            he->warmup_duration_ms = dur_ms;
+            he->download_count     = (target_ce ? target_ce->download_count : 0) + 1;
+            he->cache_miss_count   = (target_ce ? target_ce->cache_miss_count : 0);
         }
 
         /* Remove from cold registry (shift down). */
@@ -4957,10 +4971,10 @@ handle_stats(int client_fd, const CuvsCmdFrame *cmd)
         s->delta_merged_count = e->delta_merged_count;
         s->delta_search_mode  = (e->delta_idx && e->n_delta > 0) ? 2 : 0;
         s->warmup_state       = (uint32_t)e->warmup_state;
-        s->last_warmup_at     = 0;
-        s->warmup_duration_ms = 0;
-        s->download_count     = 0;
-        s->cache_miss_count   = 0;
+        s->last_warmup_at     = (int64_t)e->last_warmup_at;       /* Phase 3D: retained post-hydration */
+        s->warmup_duration_ms = e->warmup_duration_ms;
+        s->download_count     = (uint32_t)e->download_count;
+        s->cache_miss_count   = e->cache_miss_count;
         s->gpu_device_id      = e->gpu_device_id;   /* 0xFFFFFFFF when sharded */
         s->shard_count        = (uint32_t)e->shard_count;
         s->search_mode        = e->last_search_mode; /* Phase 3I-1 */

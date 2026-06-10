@@ -176,6 +176,15 @@ if [ -n "$GROUND" ] && [ "$GOT" = "$GROUND" ]; then
 else
     fail "2b. recall mismatch: got=[$GOT] expected=[$GROUND]"
 fi
+# 2c (3D observability): warmup stats are RETAINED on the now-hot entry — they
+# must not reset to 0 after the cold->hot transition (the bug this cut fixes).
+DLC=$(scalar_sql "SELECT download_count FROM pg_stat_gpu_search WHERE index_oid='obj_cagra'::regclass;")
+WTS=$(scalar_sql "SELECT (last_warmup_at IS NOT NULL)::text FROM pg_stat_gpu_search WHERE index_oid='obj_cagra'::regclass;")
+if [ "${DLC:-0}" -ge 1 ] 2>/dev/null && [ "$WTS" = "true" ]; then   # ::text bool renders true/false
+    pass "2c. warmup observability retained post-hydration (download_count=$DLC, last_warmup_at set)"
+else
+    fail "2c. warmup stats not retained on hot entry (download_count=[$DLC] last_warmup_at_set=[$WTS])"
+fi
 
 # ---- Phase 3a: corrupt artifact -> SHA reject -----------------------------
 # relfilenode + OID + version all match, so the guard falls through to SHA verify.
@@ -189,6 +198,16 @@ if ! ls "$IDX"/*.cagra >/dev/null 2>&1 && grep -qi "SHA256 MISMATCH" "$LOG"; the
     pass "3a. corrupt artifact: SHA256 mismatch -> rejected, no local .cagra"
 else
     fail "3a. corrupt artifact NOT rejected"; grep -i "objstore\|sha256\|mismatch" "$LOG" | tail -10
+fi
+# 3a' (3D graceful degradation): the rejected download leaves NO local .tids, so
+# the backend's plan-time artifact gate routes the query to CPU seqscan — a
+# normal query must STILL return the correct top-10, not error or empty.
+GOT_CPU=$(scalar_sql "SELECT string_agg(id::text, ',' ORDER BY v <-> '$QUERY')
+                      FROM (SELECT id, v FROM obj_items ORDER BY v <-> '$QUERY' LIMIT 10) s;")
+if [ -n "$GROUND" ] && [ "$GOT_CPU" = "$GROUND" ]; then
+    pass "3a'. graceful CPU fallback when index unhydratable: top-10 correct"
+else
+    fail "3a'. CPU fallback wrong: got=[$GOT_CPU] expected=[$GROUND]"
 fi
 
 # ---- Phase 3b: heap relfilenode mismatch -> hard reject -------------------

@@ -457,7 +457,7 @@ Phase 3C 완료 기준:
 
 #### Phase 3D — Replica / Multi-node Loading + Async Warmup
 
-> **상태 (2026-06-10): 완료·인증** (ADR-013/ADR-066). warmup 풀·cold 등록·cache-miss requeue·`pg_stat_gpu_search` warmup 컬럼·relfilenode replica 가드 모두 live. 다운로드/하이드레이션 경로는 3C round-trip 인증(`make gpu-test-objstore`)에서 함께 검증됨 — wiped 노드(`.relfilenode`만 보유)가 heap rebuild 없이 GCS에서 하이드레이션 후 exact top-k 반환.
+> **상태 (2026-06-10): 완료·인증** (ADR-013/ADR-066). warmup 풀·cold 등록·cache-miss requeue·`pg_stat_gpu_search` warmup 컬럼·relfilenode replica 가드 모두 live. 다운로드/하이드레이션 경로는 3C round-trip 인증(`make gpu-test-objstore`)에서 함께 검증됨 — wiped 노드(`.relfilenode`만 보유)가 heap rebuild 없이 GCS에서 하이드레이션 후 exact top-k 반환. **보조 2항목도 마감(ADR-066 결정 4)**: (a) warmup 관측 통계가 hot 전환 후 0으로 리셋되던 결함 수정 → `download_count`/`last_warmup_at` 보존 검증, (b) 하이드레이션 불가 시 plan-time artifact gate로 graceful CPU fallback(정상 top-k) 검증.
 
 Delivered scope:
 - daemon startup no longer blocks on GCS hydration. Missing local artifacts are registered as cold entries, the UDS socket opens, and background warmup workers download/load artifacts progressively.
