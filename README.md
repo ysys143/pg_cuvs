@@ -132,7 +132,7 @@ Benchmark results (A100-40GB, 1M×384, VM E2E, **synthetic random data**):
 
 \* recall=1.0000 on synthetic random data (uniform distribution); expect lower on real embeddings.  
 \*\* 0.978 on synthetic clustered data (20 clusters, sigma=0.05). Real embedding datasets pending.  
-See `design/BENCHMARK_CROSSOVER.md` for full methodology.
+See [`BENCHMARK.md`](BENCHMARK.md) for the latency decomposition, the Cohere 1M×1024 real-embedding comparison, and the filtered-search selectivity sweep; `design/BENCHMARK_CROSSOVER.md` for full crossover methodology.
 
 ## Roadmap
 
