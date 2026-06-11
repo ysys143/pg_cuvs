@@ -127,7 +127,8 @@
 | **백엔드 아티팩트 스탬프(timeline/system_identifier)** | ADR-069. 외부 아티팩트가 WAL/복제 밖 → standby/PITR에서 timeline 발산 시 stale 결과 위험. 데몬은 pg_control/timeline 못 읽음 → 백엔드가 `.tids` 헤더 스탬프 + plan-time 검증해야 fail-closed 가능. | 코드(사이드카 포맷 + 백엔드 검증) | replica/PITR 정합성 요구 시 |
 | **corpus → BufFile 옵션** | ADR-069. 코퍼스를 PG `BufFile` temp 파일로 옮기면 `temp_file_limit`이 *진짜로* 적용(디스크 백킹 트레이드오프). 메모리 제약 환경 대안. | 코드(corpus tier에 BufFile 추가) | host RAM 제약 환경 수요 시 |
 | **daemon host-bytes cap + evict-on-host-pressure** | ADR-069. resident host 배열(`rev_tids`/`rev_item_ids`/`tids` ~20B/vec)이 개수 LRU(`g_max_indexes`)로만 제한 → host RAM은 인덱스 크기 비례 누적. | 코드(host-bytes 카운터 + host 압박 시 eviction) | 데몬 host RSS 누적 실측 시 |
-| **빌드 락 동시성 Tier-2 검증** | ADR-069. #2 unlock의 starvation-부재(동시 검색 비차단)·reservation 동시성은 단일 클라이언트 Tier-1로 검증 불가. `build_sharded` 멀티GPU도 동일. | Tier-2(A100, 멀티클라이언트/멀티GPU) | 출시 전 또는 동시성 회귀 의심 시 |
+| ~~**빌드 락 동시성 Tier-2 검증**~~ [OK] | ADR-069. #2 unlock의 starvation-부재(동시 검색 비차단) 검증. | **완료** (A100, 2026-06-11): 6.97s GPU 빌드 중 동시 검색 25회 각 50–110ms(블록 없음). installcheck 30/30 + isolation 3/3. |
+| **`build_sharded` 멀티GPU 검증** | ADR-069. 샤드 빌드의 reservation/eviction은 2+ GPU 필요(dev VM은 단일 A100). | Tier-2 멀티GPU VM | 멀티GPU 배포/회귀 의심 시 |
 
 스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-069 | `design/OPS_GPU_PLAYBOOK.md`
 

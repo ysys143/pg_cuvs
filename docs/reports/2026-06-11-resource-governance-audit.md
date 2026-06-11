@@ -125,8 +125,12 @@ host-bytes cap)은 ROADMAP 트리거 백로그.
 - PR #54 — 버그 #1·#2·#3 + IVF-PQ eviction 수정 + #2/#3 병렬경로(handle_build_multi) 적용 + Tier-1 회귀 4종 + 데몬 ASAN 상시. **CI GREEN 27/27**
 - 본 보고서
 
+### Tier-2 검증 (A100, cuVS, 2026-06-11)
+- **installcheck 30/30 + isolation 3/3** — 4종 신규 테스트·IVF-PQ eviction·병렬빌드 전부 실 GPU에서 통과. shim에서 reconcile한 expected가 실 GPU 출력과 일치(VRAM MB 결정적).
+- **빌드 락 starvation 부재 확정** — 6.97초 GPU 빌드 중 동시 검색 25회 각 50–110ms(psql connect 포함). 빌드가 검색을 블록하지 않음.
+
 ### 남은 것 (트리거 백로그)
-- 빌드 락 동시성(starvation 부재) Tier-2 검증 + `build_sharded` 멀티GPU 검증 (단일 클라이언트·단일 GPU shim으로는 검증 불가)
+- `build_sharded` 멀티GPU 검증 — 샤드 reservation/eviction은 2+ GPU 필요(dev VM은 단일 A100).
 - cgroup/systemd `MemoryMax=` 운영 가이드
 - scratch-aware VRAM admission (intermediate/graph degree 기반 또는 RMM pool cap)
 - 백엔드 아티팩트 스탬프(timeline/system_identifier) — standby/PITR fail-closed

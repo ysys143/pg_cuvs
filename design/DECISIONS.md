@@ -2736,6 +2736,10 @@ Tier-1 CPU shim 회귀(installcheck, **PR #54 GREEN 27/27, 데몬 ASAN 빌드**)
 멀티GPU는 단일 클라이언트·단일 GPU shim으로 검증 불가 → Tier-2. 대형 항목(cgroup 가이드, scratch-aware admission,
 백엔드 스탬프, corpus→BufFile, daemon host-bytes cap)은 ROADMAP 트리거 백로그.
 
+**Tier-2 검증 (A100, cuVS, 2026-06-11)**: installcheck **30/30** + isolation **3/3** 실 GPU 통과(신규 4종·IVF-PQ
+eviction·병렬빌드 포함; shim reconcile expected가 실 GPU와 일치). **빌드 락 starvation 부재 확정** — 6.97초 GPU
+빌드 중 동시 검색 25회 각 50–110ms(블록 없음). 잔여: `build_sharded` 멀티GPU(2+ GPU 필요, dev VM은 단일 A100).
+
 ### 후속
 
 관련: [[ADR-068]](MAX_INDEXES 소프트 LRU — 같은 eviction/회계 경로), [[ADR-065]](VRAM 자기-회계),
