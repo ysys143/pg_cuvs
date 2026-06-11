@@ -2665,3 +2665,47 @@ realloc 무한 성장 — pointer-stability 위험, startup-fixed로 충분(`--m
 **ERROR 0** + 전 테넌트 쿼리 정확 + `pg_stat_gpu_cache` evictions=16/**reloads=10**(축출분이 GPU로
 재하이드레이션 = B 증명). 프로덕션 기본 1024 로그 확인. 회귀 무영향: installcheck 26/26 +
 isolation 3/3 GREEN. 관련: [[ADR-061]](전략), STRATEGY_NOTES §G.
+
+## ADR-069 — 벤치마크 실험 프로토콜 v2: 물리/판단 분리 + 코스트모델 보정 루프 선행
+
+**날짜**: 2026-06-11
+**상태**: ACCEPTED / 프로토콜 확정, 실행 미착수 (스펙: [design/BENCHMARK_PROTOCOL.md](BENCHMARK_PROTOCOL.md))
+
+**문제**: 엄밀 벤치마크에는 세 가지 구조적 함정이 있다. (1) **자원-기울임 공정성** — GPU에 VRAM
+40GB를 주고 CPU에 4GB·2프로세스만 주는 비교는 무효인데, DRAM과 VRAM은 GB로 등화 불가.
+(2) **보정-재실행 결합** — 코스트모델은 현재 미보정 상수 3개(`CUVS_STARTUP_COST` 등,
+CROSSOVER §8)이고 보정엔 촘촘한 교차곡선이 필요한데, 순진하게 설계하면 코스트모델 수정마다
+전체 벤치마크 재실행. 국소 신호로 전체를 수정하는 위험도 동반. (3) **차원 폭발** —
+{5 사이즈}×{PG 노브}×{인덱스 노브}×{3 config}×{필터}×{증분} 격자 전수는 불가능.
+
+**결정** (4개):
+1. **물리/판단 분리**: forced-hnsw/forced-cuvs 곡선(=물리)은 코스트모델 무관 불변 자산으로 1회
+   실측. planner-auto(=판단)는 둘 중 하나를 고를 뿐이므로 **EXPLAIN-only 스윕**(셀당 ~ms)으로
+   검증 → 보정 루프 비용이 "전체 재실행"에서 "EXPLAIN 재스윕 수 분"으로 절감. 분리가 깨지는
+   경계를 규율로 고정: 루프 중 plan-time 상수만 수정 허용, runtime 라우팅
+   (`filter_auto_threshold` 등) 수정은 영향 셀만 스코프 재실측. 전 결과 행에
+   `cost_model_version`/`runtime_routing_version` 태그.
+2. **보정 루프 선행**: Stage A(교차-밀집 물리, 적응 이분탐색: 거친 log-격자 + ratio 부호전환
+   구간만 분할) → Stage B(regret 기준 보정 루프: ε=10% 무차별 밴드 밖 regret>0 셀 0개가 합격 —
+   교차점 근방 오분류는 손해 ~0이라 무의미) → Stage C(동결·버전) → Stage D(필터·증분·Pareto·
+   논문 스위트). **동결 전에 planner-auto 개입 스위트 금지**(전부 무효화되므로).
+3. **자원 공정성 = $/J 등화 + raw 공개**: GB 등화 포기. (a) same-box(GPU 인스턴스 부속 CPU/RAM
+   전체)와 (b) iso-$(동일 시간당 단가 CPU 인스턴스) 두 baseline 동시 보고 + raw 자원
+   (VRAM/RSS/core-s/GPU-s/J) 전면 기록으로 독자 재정규화 보장.
+4. **Ring 구조 경쟁자 계약**: Ring A(in-PG 정면: pgvector/pgvectorscale/vchord, iso-recall),
+   Ring B(앵커: raw cuVS/faiss — 통합 세금 상한, QPS 슛아웃 금지), Ring C(외부 DB:
+   milvus/qdrant/lancedb — 별도 system-level 문서, 운영 비대칭 병기), Ring D(10억+/아카이브 —
+   천장 기록만). 각 시스템은 한 링에만.
+
+**대안 기각**: (a) 균일 밀집 격자 — 교차 무관 구간 낭비, 이분탐색이 교차 구간(10K–100K, 마침
+실측 최저가 구간)만 조밀화. (b) 오분류 0 합격 기준 — 교차점 경계에서 달성 불가·무의미, regret
+한정으로 대체. (c) DRAM/VRAM GB 등화 — 단일 "공정" 숫자는 존재하지 않음, 등화 대신 가격
+부여(§2). (d) 보정 루프를 스위트 뒤에 배치 — 수정 시 필터·증분 등 auto 결과 전량 무효화.
+
+**정직한 한계(사전 등록)**: cold/warm·delta backlog·데몬 큐 깊이는 plan-time에 원리적으로 알 수
+없어 envelope 도달 불가 구간이 존재할 수 있다 — 보정 실패가 아니라 "plan-time 정보 부족"
+클래스의 발견으로 분류, 처방은 런타임 적응 후보로 백로그 적재.
+
+관련: ADR-039(BF 자동선택), ADR-044(프로파일링), ADR-061(전략·표적 세그먼트), ADR-063/064(필터
+경로), CROSSOVER §8(코스트모델 재보정 플래그). 트랙: 제품(P0–P5)과 논문(R1–R5) 분리, 상세는
+프로토콜 §14.
