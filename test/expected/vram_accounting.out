@@ -15,7 +15,9 @@
 -- (CPU shim): the shim's VRAM accounting is a deterministic in-process counter.
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+NOTICE:  extension "pg_cuvs" already exists, skipping
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
 CREATE TABLE vram_acct (id int, embedding vector(64));
 INSERT INTO vram_acct
@@ -27,14 +29,20 @@ FROM generate_series(1, 8000) g;
 CREATE INDEX vram_acct_idx ON vram_acct USING cagra (embedding vector_l2_ops);
 -- Snapshot 1: CAGRA resident, no BF index yet.
 SELECT vram_used_mb AS v1 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+-- Capture a query vector as a literal so the index (GPU path) is used; a
+-- subquery operand would prevent the index scan and skip the BF build.
+SELECT embedding::text AS qv FROM vram_acct WHERE id = 1 \gset
 -- Force a brute-force search -> daemon (re)builds the resident main BF index.
+-- enable_seqscan=off makes the planner choose the index scan (GPU path), else a
+-- seqscan would answer the query without ever building the BF index.
 SET cuvs.search_mode = 'brute_force';
+SET enable_seqscan = off;
 SELECT count(*) FROM (
     SELECT id FROM vram_acct
-    ORDER BY embedding <-> (SELECT embedding FROM vram_acct WHERE id = 1)
+    ORDER BY embedding <-> :'qv'::vector
     LIMIT 5
 ) s;
- count
+ count 
 -------
      5
 (1 row)
@@ -42,7 +50,7 @@ SELECT count(*) FROM (
 -- Snapshot 2: total must now include the BF index VRAM (Bug #1 fix).
 SELECT (vram_used_mb > :v1) AND (bf_vram_mb > 0) AS bug1_total_includes_bf
 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
- bug1_total_includes_bf
+ bug1_total_includes_bf 
 ------------------------
  t
 (1 row)
