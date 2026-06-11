@@ -2593,7 +2593,7 @@ selectivity × Q 조합에 따라 streaming BF / D-wedge post-filter / CAGRA 중
 ## ADR-067 — CI 전략: 2-tier (CPU-reference shim + on-demand GPU)
 
 **날짜**: 2026-06-10
-**상태**: 확정 (스펙: [design/CI_STRATEGY.md](CI_STRATEGY.md)) — repo 공개 전 필수. 구현 미착수.
+**상태**: ACCEPTED / 구현·검증 완료 (2026-06-11). Tier 1 `ci.yml`(CPU shim, 매 PR 자동·무료) + Tier 2 `gpu.yml`(UI 버튼 `workflow_dispatch` + WIF 키리스 GCP 인증, self-hosted A100, 실 installcheck 26/26) — PR #46–48, #50. 스펙: [design/CI_STRATEGY.md](CI_STRATEGY.md). 잔여: emulator 기반 GCS CI 회귀(트리거).
 
 ### 배경
 
@@ -2602,7 +2602,7 @@ GPU CI는 무료 옵션이 없다 — GitHub hosted 러너에 GPU가 없어 self
 ### 결정: 2-tier
 
 - **Tier 1 (CPU-reference shim, GitHub hosted `ubuntu-latest`, 매 PR 자동, 무료)**: `src/cuvs_wrapper.h`(GPU/CUDA 호출의 단일 경계) 전 심볼을 CPU exact-kNN 구현으로 대체하는 TU(`cuvs_wrapper_shim_cpu.c`, `make PGCUVS_CPU_SHIM=1`). 데몬·백엔드 나머지는 불변. plumbing·IPC 계약·fail-closed·mode 라벨링·정확성(shim이 exact라 ground truth)·VRAM 회계 로직을 검증.
-- **Tier 2 (실 A100 installcheck, self-hosted GPU VM, 사용자 on-demand)**: `workflow_dispatch` + `/gpu-test` 코멘트 / `gpu-ci` 라벨. GPU 커널 correctness·approximate recall 회귀·실 mempool VRAM 거동·latency. release가 아니라 **사용자가 원할 때** 트리거(비용 통제권 사용자). release는 트리거 아닌 머지 정책("최근 Tier 2 GREEN 확인")으로 얹음.
+- **Tier 2 (실 A100 installcheck, self-hosted GPU VM, 사용자 on-demand)**: **`workflow_dispatch` UI 버튼만**(쓰기권한자 전용; `/gpu-test` 코멘트·`gpu-ci` 라벨 자동 트리거는 fork-PR가 VM에서 임의 코드 실행 위험이라 **비채택**). GPU 커널 correctness·approximate recall 회귀·실 mempool VRAM 거동·latency. release가 아니라 **사용자가 원할 때** 트리거(비용 통제권 사용자). release는 트리거 아닌 머지 정책("최근 Tier 2 GREEN 확인")으로 얹음.
 
 ### 무료 성립 조건
 

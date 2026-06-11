@@ -1,6 +1,6 @@
 # CI 전략 — 2-tier (CPU-reference shim + on-demand GPU)
 
-> 스펙. 결정 근거는 ADR-067로 승격 예정. 관련: ROADMAP "CI GPU 전략"(repo 공개 전 필수), [DECISIONS.md ADR-065](DECISIONS.md)(VRAM budget — mempool).
+> 스펙. 결정 근거는 [DECISIONS.md ADR-067](DECISIONS.md)로 승격됨 — **구현·검증 완료**(PR #46–48/#50). 관련: ROADMAP "CI GPU 전략", [ADR-065](DECISIONS.md)(VRAM budget — mempool).
 
 ## 1. 목표와 모델
 

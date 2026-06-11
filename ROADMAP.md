@@ -39,10 +39,10 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
-| fallback 관측성 · circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 | 트리거 |
+| circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 (fallback 관측성은 PR #43 완료) | 트리거 |
 | ~~MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload~~ [OK] | 다중 테넌트 파티션 온라인-스케일 선결. 측정·근거 ADR-061 / STRATEGY_NOTES §G | **완료** (ADR-068): 레지스트리를 *하드월*→*소프트 LRU 캡*으로 전환 — `--max-indexes`(기본 1024, was 64, calloc) + `load_index` 슬롯-확보 eviction(auto-reload 배선) + build 경로 graceful defer. `gpu-test-maxidx`: cap 4에 10테넌트 빌드 ERROR 0 + 전 테넌트 쿼리 GPU reload(evict=16/reload=10). installcheck 26/26 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
-| fp16 입력 | float16 벡터 입력으로 VRAM ~50% 절감 — `WITH (precision=fp16)` reloption, cuVS C API 지원 확인 필요 | 트리거 (cuVS fp16 지원 확인) |
+| fp16 CAGRA reloption | BF용 fp16은 **3L `cuvs.bf_precision` 완료·출고**(`cuvs_wrapper.cu` device fp16 사본, BF VRAM 절반). 잔여 = CAGRA `WITH (precision=fp16)` reloption 표면만. cuVS C API fp16은 BF에서 실증돼 **트리거 충족** | 트리거 (수요 시 즉시 착수) |
 
 ---
 
@@ -52,7 +52,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload). **다음 순차 작업: 릴리스 준비**(README 정비 · `BENCHMARK.md` 공개 · CI GPU 전략 확정=ADR-067 — "에코시스템 진입 계획" 전제조건 참조).
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). **다음 순차 작업: 릴리스 준비 — `BENCHMARK.md` 공개 + 라이선스 확정**("에코시스템 진입 계획" 전제조건 참조).
 
 ---
 
@@ -141,16 +141,16 @@
 | 항목 | 필요 작업 |
 |------|-----------|
 | ~~**3C/3D 완료**~~ [OK] | GCS artifact snapshot + replica async warmup — **완료·인증** (ADR-013/ADR-066, `make gpu-test-objstore`). 잔여: emulator CI 회귀(트리거) |
-| GitHub repo 공개 | public release. 라이선스: **Apache 2.0** (확정) |
+| ~~GitHub repo 공개~~ [OK] | **PUBLIC 공개됨**. 라이선스: **PostgreSQL License** (확정 — `LICENSE`·README 일치; 이전 표의 "Apache 2.0" 표기는 실제 파일과 불일치였어 정정) |
 | 재현 가능한 벤치마크 공개 | `BENCHMARK.md` — 핵심은 **overhead characterization**: GPU가 distance computation을 제거하면 IPC / PG heap fetch가 새 병목이 된다는 것을 latency 분해로 실증. pgvector(CPU HNSW) 대비 QPS/latency 비교는 부수. selectivity sweep은 멀티테넌트 filtered search 효과 지지 실험으로 포함(논문 중심 아님) |
 | 외부 사용자용 설치 가이드 | README 정비 (설치, quick start, CUDA/cuVS 버전 매트릭스) |
-| CI — GPU 테스트 전략 | **전략 확정** (ADR-067, 스펙 [design/CI_STRATEGY.md](design/CI_STRATEGY.md)): 2-tier — Tier 1 CPU-reference shim(`cuvs_wrapper.h` 경계 대체, hosted ubuntu, 매 PR 자동, 무료, plumbing·계약·mode·recall 검증) + Tier 2 실 A100 installcheck(self-hosted, 사용자 on-demand `/gpu-test`). 구현 미착수(shim TU + workflow 2종). |
+| ~~CI — GPU 테스트 전략~~ [OK] | **구현·검증 완료** (ADR-067, [design/CI_STRATEGY.md](design/CI_STRATEGY.md)): 2-tier — **Tier 1** `ci.yml`(CPU-reference shim `cuvs_wrapper.h` 경계 대체, hosted ubuntu, 매 PR 자동·무료; plumbing·계약·mode·recall + filter_comparison·MAX_INDEXES evict/reload 가드) + **Tier 2** `gpu.yml`(UI 버튼 `workflow_dispatch`, WIF 키리스 GCP 인증, self-hosted A100, 실 installcheck 26/26 검증). PR #46–48, #50. 잔여: emulator CI 회귀(트리거). |
 
 ### 진입 단계
 
 | 단계 | 목표 | 전제 조건 | 타이밍 |
 |------|------|-----------|--------|
-| 1 | repo 공개 + 벤치마크 공개 | 없음 | 즉시 가능 |
+| 1 | repo 공개 [OK] + 벤치마크 공개 | 없음 | repo 공개됨 · `BENCHMARK.md`만 잔여 |
 | 2 | cuvs-bench backend PR | 3Q 완료 [OK] | 즉시 착수 가능 |
 | 3 | cuVS 문서/README 링크 요청 | 2단계 merge | 2단계 후 |
 | 4 | NVIDIA 채널 노출 | 3단계 등재 | 3단계 후 |
