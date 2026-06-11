@@ -39,7 +39,10 @@ SELECT vram_used_mb AS v1 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
 SELECT embedding::text AS qv FROM vram_acct WHERE id = 1 \gset
 
 -- Force a brute-force search -> daemon (re)builds the resident main BF index.
+-- enable_seqscan=off makes the planner choose the index scan (GPU path), else a
+-- seqscan would answer the query without ever building the BF index.
 SET cuvs.search_mode = 'brute_force';
+SET enable_seqscan = off;
 SELECT count(*) FROM (
     SELECT id FROM vram_acct
     ORDER BY embedding <-> :'qv'::vector

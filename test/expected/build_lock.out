@@ -13,8 +13,13 @@
 -- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim).
 \set ON_ERROR_STOP on
 CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+NOTICE:  extension "pg_cuvs" already exists, skipping
 SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- Exercise the single-process build path (handle_build), where the Bug #2
+-- reservation/unlock lives.
+SET max_parallel_maintenance_workers = 0;
 -- VRAM baseline (counters are cumulative across the regression DB).
 SELECT vram_used_mb AS base FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
 CREATE TABLE lockt (id int, embedding vector(64));
@@ -31,7 +36,7 @@ SET cuvs.search_mode = 'brute_force';
 SELECT id FROM lockt
 ORDER BY embedding <-> (SELECT embedding FROM lockt WHERE id = 42)
 LIMIT 1;
- id
+ id 
 ----
  42
 (1 row)
@@ -41,7 +46,8 @@ LIMIT 1;
 DROP TABLE lockt;
 SELECT (vram_used_mb <= :base) AS bug2_no_reservation_leak
 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
- bug2_no_reservation_leak
+ bug2_no_reservation_leak 
 --------------------------
  t
 (1 row)
+
