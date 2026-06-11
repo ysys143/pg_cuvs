@@ -70,7 +70,13 @@
   - 작업: 운영 생애주기 전반 단일화 — 기동·모니터링(어느 `pg_stat_gpu_*` 뷰·임계값), 장애모드·복구(데몬 다운·VRAM OOM·fallback 급증·eviction 폭주), 업그레이드/롤백, 백업/복구(GCS 스냅샷), 스케일링·캐파, 인시던트 대응. 흩어진 런북을 OPS_GPU_PLAYBOOK로 연결.
   - **완료 기준**: 신규 운영자가 플레이북만으로 배포→모니터→장애대응→업그레이드 수행 가능; 각 절차에 실 명령·뷰·임계값 포함.
 
-대상: `design/OPS_GPU_PLAYBOOK.md` · `docs/playbooks/` · (신규) `ARCHITECTURE.md` + 문서 맵
+- **가이드 사이트 발행 (GitHub Pages, MkDocs)**
+  - 레퍼런스: [PG-Strom 문서](https://heterodb.github.io/pg-strom/)(MkDocs + RTD 테마, GitHub Pages, **동일 PostgreSQL License·같은 PG-GPU 카테고리** → IA 모델: Home/Install/Tutorial/Advanced Features/References/Release Notes) + [cuVS integrations](https://docs.rapids.ai/api/cuvs/stable/integrations/)(Faiss/Milvus/Lucene/Kinetica 등재; **PostgreSQL/DB 확장 전무 → pg_cuvs 첫 등재 기회**, 등재엔 dedicated 페이지+링크 필요).
+  - 작업: MkDocs(Material 또는 RTD 테마) + GitHub Actions로 Pages 발행(`ysys143.github.io/pg_cuvs`). IA는 PG-Strom 미러 — Home(개요) / Install(설치·버전매트릭스) / Tutorial(quickstart·필터검색·멀티테넌트) / Features(검색 모드·인덱스 AM·GUC·reloption) / References(SQL 함수·뷰·기법 요약) / Operations(플레이북) / Release Notes.
+  - **위 두 항목(문서 현행화·플레이북)의 단일 렌더 표면** — ARCHITECTURE·기능 reference·기법 요약·플레이북을 사이트가 렌더(중복 산출물 안 만듦, single source). cuVS integrations 등재용 dedicated 페이지(pg_cuvs ← cuVS) 준비 → **에코시스템 진입 단계 3**(cuVS 문서/README 링크 요청) 산출물.
+  - **완료 기준**: Pages URL 라이브 + PG-Strom 수준 IA + cuVS integrations PR에 링크할 dedicated 페이지 존재.
+
+대상: `design/OPS_GPU_PLAYBOOK.md` · `docs/playbooks/` · (신규) `ARCHITECTURE.md` + 문서 맵 · (신규) `mkdocs.yml` + Pages 배포 워크플로
 
 ---
 
@@ -161,7 +167,7 @@
 | ~~**3C/3D 완료**~~ [OK] | GCS artifact snapshot + replica async warmup — **완료·인증** (ADR-013/ADR-066, `make gpu-test-objstore`). 잔여: emulator CI 회귀(트리거) |
 | ~~GitHub repo 공개~~ [OK] | **PUBLIC 공개됨**. 라이선스: **PostgreSQL License** (확정 — `LICENSE`·README 일치; 이전 표의 "Apache 2.0" 표기는 실제 파일과 불일치였어 정정) |
 | 재현 가능한 벤치마크 공개 | `BENCHMARK.md` — 핵심은 **overhead characterization**: GPU가 distance computation을 제거하면 IPC / PG heap fetch가 새 병목이 된다는 것을 latency 분해로 실증. pgvector(CPU HNSW) 대비 QPS/latency 비교는 부수. selectivity sweep은 멀티테넌트 filtered search 효과 지지 실험으로 포함(논문 중심 아님) |
-| 외부 사용자용 설치 가이드 | README 정비 (설치, quick start, CUDA/cuVS 버전 매트릭스) |
+| 외부 사용자용 가이드 | README 현재화 완료. **가이드 사이트 발행**으로 격상(GitHub Pages/MkDocs, PG-Strom IA 미러) — "릴리스 준비 — 문서·운영 정비" 절 |
 | ~~CI — GPU 테스트 전략~~ [OK] | **구현·검증 완료** (ADR-067, [design/CI_STRATEGY.md](design/CI_STRATEGY.md)): 2-tier — **Tier 1** `ci.yml`(CPU-reference shim `cuvs_wrapper.h` 경계 대체, hosted ubuntu, 매 PR 자동·무료; plumbing·계약·mode·recall + filter_comparison·MAX_INDEXES evict/reload 가드) + **Tier 2** `gpu.yml`(UI 버튼 `workflow_dispatch`, WIF 키리스 GCP 인증, self-hosted A100, 실 installcheck 26/26 검증). PR #46–48, #50. 잔여: emulator CI 회귀(트리거). |
 
 ### 진입 단계
@@ -170,7 +176,7 @@
 |------|------|-----------|--------|
 | 1 | repo 공개 [OK] + 벤치마크 공개 | 없음 | repo 공개됨 · `BENCHMARK.md`만 잔여 |
 | 2 | cuvs-bench backend PR | 3Q 완료 [OK] | 즉시 착수 가능 |
-| 3 | cuVS 문서/README 링크 요청 | 2단계 merge | 2단계 후 |
+| 3 | [cuVS integrations](https://docs.rapids.ai/api/cuvs/stable/integrations/) 등재 + cuVS README 링크 (현재 Faiss/Milvus/Lucene/Kinetica — PG 확장 전무 → 선점) | 2단계 merge + 가이드 사이트 dedicated 페이지 | 2단계 후 |
 | 4 | NVIDIA 채널 노출 | 3단계 등재 | 3단계 후 |
 
 **현황**: PostgreSQL 관련 언급이 cuVS 생태계에 전무 — 선점 기회. 현재 공식 통합: Milvus, Faiss, Elasticsearch(진행 중), Kinetica.
