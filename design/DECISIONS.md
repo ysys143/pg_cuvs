@@ -2708,10 +2708,15 @@ isolation 3/3 GREEN. 관련: [[ADR-061]](전략), STRATEGY_NOTES §G.
    registry swap뿐. → reservation-counter로 GPU 빌드 구간 언락.
 3. **빌드 OOM evict-retry 부재** — `cuvs_cagra_build` NULL(OOM 구분 불가) 시 즉시 BUILD_FAILED.
    `estimate_vram_bytes`가 빌드 scratch를 빼므로 사전 `ensure_vram` 통과 후에도 OOM 가능. OOM 신호
-   인프라(`cuvs_last_build_was_oom` + `inject_build_oom` seam, IPC opcode 20)는 배선했으나, evict-retry
-   본체는 **이번에 보류**: Tier-1 CPU shim에서 `handle_build`가 retry 경로의 `evict_lru`를 호출할 때
-   **데몬이 크래시**했고(로컬 macOS 무재현 — 데몬 미컴파일, PG14≠PG16), 크래시 코드를 출고할 수 없어
-   즉시-BUILD_FAILED(기존 동작)로 되돌렸다. 실제 retry는 Tier-2(A100)에서 재현·진단 후 후속.
+   (`cuvs_last_build_was_oom`, RMM `bad_alloc` 포함) + `inject_build_oom` seam(opcode 20) + 데몬이 OOM 시
+   evict 후 1회 재시도. **수정 완료**.
+
+**부수 발견 — IVF-PQ eviction 크래시(기존 잠복 버그)**: #3 retry를 Tier-1 CI에 올리자 데몬이 SEGV. ASAN
+백트레이스로 근본 원인 확정 — `evict_lru → save_index → cuvs_cagra_serialize(e->handle)`인데 IVF-PQ 엔트리는
+`e->handle==NULL`(인덱스가 `ivfpq_handle`에 있음) → NULL deref. `ivfpq_smoke`가 남긴 IVF-PQ 인덱스가 LRU일 때
+retry의 `evict_lru`가 이를 건드려 터짐. **IVF-PQ 인덱스는 원래부터 안전하게 evict 불가**(maxidx는 CAGRA-only라
+못 잡음; ADR-068 soft-LRU의 사각). 수정: `evict_lru`에 IVF-PQ 분기(아티팩트 durable → save 없이 free +
+reload-on-demand, sharded 패턴) + `save_index` NULL-handle 방어. **ASAN을 Tier-1 데몬 빌드에 상시 편입**(UAF/오버플로 커버).
 
 ### 대안 기각
 
@@ -2723,12 +2728,11 @@ isolation 3/3 GREEN. 관련: [[ADR-061]](전략), STRATEGY_NOTES §G.
 
 ### 검증
 
-Tier-1 CPU shim 회귀(installcheck, PR #54 GREEN 25/25): `vram_accounting`(버그#1 — BF 검색 후
-total_vram_used가 BF VRAM 포함), `build_lock`(버그#2 — 빌드가 정상 완료 + reservation no-leak). 빌드 락
-**동시성**(starvation 부재)과 `build_sharded` 멀티GPU는 Tier-1(단일 클라이언트·단일 GPU shim)로 검증 불가 →
-Tier-2. 버그#3 evict-retry는 위 사유로 보류. 대형 항목(cgroup 가이드, scratch-aware admission, 백엔드 스탬프,
-corpus→BufFile, daemon host-bytes cap, **버그#3 evict-retry**, **handle_build_multi 병렬빌드에 #2/#3 미적용**)은
-ROADMAP 트리거 백로그.
+Tier-1 CPU shim 회귀(installcheck, **PR #54 GREEN 26/26, 데몬 ASAN 빌드**): `vram_accounting`(버그#1),
+`build_lock`(버그#2 — 빌드 정상 + reservation no-leak), `build_oom`(버그#3 — OOM 1회 주입 → evict + retry 성공,
+ASAN 무크래시). 빌드 락 **동시성**(starvation 부재)과 `build_sharded` 멀티GPU는 단일 클라이언트·단일 GPU shim으로
+검증 불가 → Tier-2. 대형 항목(cgroup 가이드, scratch-aware admission, 백엔드 스탬프, corpus→BufFile,
+daemon host-bytes cap, **handle_build_multi 병렬빌드에 #2/#3 미적용**)은 ROADMAP 트리거 백로그.
 
 ### 후속
 

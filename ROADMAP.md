@@ -56,13 +56,14 @@
 
 ### 자원 거버넌스 하드닝 — 확정 버그 3개 (ADR-069, PR #54)
 
-> 자원 거버넌스 감사 + 적대적 리뷰 2라운드에서 **정책과 무관하게 코드로 확정된 버그 3개**. PR #54에서 #1·#2 출고(Tier-1 GREEN 25/25), #3은 보류(아래). 큰 거버넌스 항목은 트리거 백로그로 분리.
+> 자원 거버넌스 감사 + 적대적 리뷰 2라운드에서 **정책과 무관하게 코드로 확정된 버그 3개**(+IVF-PQ eviction 부수 발견). PR #54에서 전부 출고 — **Tier-1 GREEN 26/26, 데몬 ASAN 빌드**. 큰 거버넌스 항목은 트리거 백로그로 분리.
 
-- **[OK] VRAM 회계 누락** — `total_vram_used`가 unsharded `main_bf_vram_bytes` / sharded `shards[].bf_vram_bytes` 미합산 → eviction 과약정 → OOM. (IVF-PQ `ivfpq_vram_bytes`는 `vram_bytes`와 중복이라 비-합산.) **완료**: `vram_accounting.sql` Tier-1 GREEN.
-- **[OK] 빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드 내내 보유 → 검색/통계/드롭 블록. **완료**: reservation-counter(`g_pending_build_vram`)로 GPU 빌드 구간 언락(양 경로); `build_lock.sql` Tier-1 GREEN(빌드 정상+reservation no-leak). 동시성(starvation 부재)·`build_sharded` 멀티GPU는 Tier-2.
-- **[보류] 빌드 OOM evict-retry** — OOM 신호 인프라(`cuvs_last_build_was_oom`+`inject_build_oom`)는 배선했으나 retry 본체에서 **shim 데몬 크래시**(로컬 무재현) → 즉시-BUILD_FAILED(기존)로 되돌림. Tier-2 재현 후 후속(트리거 백로그).
+- **[OK] VRAM 회계 누락** — `total_vram_used`가 unsharded `main_bf_vram_bytes` / sharded `shards[].bf_vram_bytes` 미합산 → eviction 과약정 → OOM. (IVF-PQ `ivfpq_vram_bytes`는 `vram_bytes`와 중복이라 비-합산.) **완료**: `vram_accounting.sql`.
+- **[OK] 빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드 내내 보유 → 검색/통계/드롭 블록. **완료**: reservation-counter(`g_pending_build_vram`)로 GPU 빌드 구간 언락(양 경로); `build_lock.sql`. 동시성(starvation 부재)·`build_sharded` 멀티GPU는 Tier-2.
+- **[OK] 빌드 OOM evict-retry** — OOM 신호(`cuvs_last_build_was_oom`)+`inject_build_oom`(opcode 20)+evict 후 1회 재시도. **완료**: `build_oom.sql`(ASAN 무크래시).
+- **[OK] (부수) IVF-PQ eviction 크래시** — `evict_lru→save_index→cuvs_cagra_serialize(NULL handle)` SEGV(IVF-PQ는 `handle==NULL`). 기존 잠복(IVF-PQ 인덱스 evict 불가); #3 retry가 ASAN으로 노출. **완료**: `evict_lru` IVF-PQ 분기(save 없이 free+reload) + `save_index` NULL 방어 + Tier-1 데몬 ASAN 상시.
 
-대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `test/sql/{vram_accounting,build_lock}.sql` | ADR-069
+대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `.github/workflows/ci.yml`(ASAN) · `test/sql/{vram_accounting,build_lock,build_oom}.sql` | ADR-069
 
 ### 릴리스 준비 — 문서·운영 정비 (순차)
 
@@ -125,7 +126,6 @@
 | **백엔드 아티팩트 스탬프(timeline/system_identifier)** | ADR-069. 외부 아티팩트가 WAL/복제 밖 → standby/PITR에서 timeline 발산 시 stale 결과 위험. 데몬은 pg_control/timeline 못 읽음 → 백엔드가 `.tids` 헤더 스탬프 + plan-time 검증해야 fail-closed 가능. | 코드(사이드카 포맷 + 백엔드 검증) | replica/PITR 정합성 요구 시 |
 | **corpus → BufFile 옵션** | ADR-069. 코퍼스를 PG `BufFile` temp 파일로 옮기면 `temp_file_limit`이 *진짜로* 적용(디스크 백킹 트레이드오프). 메모리 제약 환경 대안. | 코드(corpus tier에 BufFile 추가) | host RAM 제약 환경 수요 시 |
 | **daemon host-bytes cap + evict-on-host-pressure** | ADR-069. resident host 배열(`rev_tids`/`rev_item_ids`/`tids` ~20B/vec)이 개수 LRU(`g_max_indexes`)로만 제한 → host RAM은 인덱스 크기 비례 누적. | 코드(host-bytes 카운터 + host 압박 시 eviction) | 데몬 host RSS 누적 실측 시 |
-| **빌드 OOM evict-retry (버그#3 본체)** | ADR-069/PR#54. OOM 신호 인프라는 배선됐으나 retry의 `evict_lru` 호출이 shim 데몬 크래시(로컬 무재현). | 코드(크래시 진단·수정 + retry) | Tier-2(A100)에서 재현·진단 |
 | **#2/#3 병렬빌드(handle_build_multi) 미적용** | ADR-069. reservation-unlock(#2)·OOM-retry(#3)는 단일 `handle_build`/`build_sharded`에만 적용; ADR-058 병렬빌드 경로(대형·OOM 빈발)는 미적용. | 코드(handle_build_multi에 동일 패턴) | 대형 병렬빌드에서 starvation/OOM 실측 시 |
 
 스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-069 | `design/OPS_GPU_PLAYBOOK.md`

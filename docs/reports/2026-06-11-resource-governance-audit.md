@@ -4,8 +4,8 @@
 |------|-----|
 | 날짜 | 2026-06-11 |
 | 범위 | 표준 PostgreSQL 레버 준수 감사 · 적대적 리뷰 2라운드 · 자원 거버넌스 정책(v3) · 확정 버그 3개 수정 |
-| 결과 | ADR-069 채택 + ROADMAP 등재 + 버그 #1·#2 출고(PR #54), #3 보류 |
-| 검증 | Tier-1 CI GREEN 25/25 (`vram_accounting`=버그#1, `build_lock`=버그#2). #3 evict-retry는 shim 데몬 크래시로 보류→Tier-2. 빌드 락 동시성·sharded 멀티GPU도 Tier-2 |
+| 결과 | ADR-069 채택 + ROADMAP 등재 + 버그 #1·#2·#3 전부 출고(PR #54) + 부수로 IVF-PQ eviction 크래시 수정 + Tier-1 데몬 ASAN 상시 |
+| 검증 | **Tier-1 CI GREEN 26/26, 데몬 AddressSanitizer 빌드**(`vram_accounting`=#1, `build_lock`=#2, `build_oom`=#3). 빌드 락 동시성·sharded 멀티GPU·병렬빌드(handle_build_multi)는 Tier-2 |
 
 ---
 
@@ -18,9 +18,9 @@
   자원만** 강제할 수 있다. pg_cuvs의 핵심 자원(memfd/shm 코퍼스 · 데몬 host RAM · GPU VRAM · 외부 아티팩트)은
   전부 그 밖이라, `maintenance_work_mem`/`temp_file_limit`로 통제하려는 시도는 **category error**다.
   진짜 레버는 host RAM=**OS/cgroup**, VRAM=**reactive evict-retry**, 정확성=**백엔드 스탬프**다.
-- **부수 성과**: 정책과 무관하게 **코드로 확정된 버그 3개**(VRAM 회계 누락 · 빌드 락 starvation ·
-  빌드 OOM retry 부재)를 발견. #1·#2는 수정·출고(Tier-1 GREEN), #3은 retry 본체가 shim 데몬을 크래시시켜
-  보류(신호 인프라만 출고, Tier-2 재현 후속). 데이터 안전/성능 등급.
+- **부수 성과**: 정책과 무관하게 **확정 버그 3개**(VRAM 회계 · 빌드 락 starvation · 빌드 OOM retry)를 수정·출고
+  (Tier-1 GREEN 26/26). #3 검증 중 **더 오래된 잠복 버그(IVF-PQ eviction NULL-handle SEGV)**까지 ASAN으로
+  적발·수정하고, Tier-1 데몬을 **AddressSanitizer 상시 빌드**로 전환. 데이터 안전/성능 등급.
 
 ## 2. 배경 / 목표
 
@@ -82,18 +82,25 @@ host-bytes cap)은 ROADMAP 트리거 백로그.
 - **검증**: `vram_accounting.sql` — CREATE INDEX 후(CAGRA only) vs brute_force 검색 후(CAGRA+BF) 스냅샷,
   총량이 BF만큼 증가하는지.
 
-### 6.2 빌드 OOM evict-retry 부재 — `fix(build)` **[보류]**
+### 6.2 빌드 OOM evict-retry 부재 — `fix(build)`
 - **증상**: `cuvs_cagra_build` NULL(모든 실패 동일) 시 즉시 BUILD_FAILED. `estimate_vram_bytes`가 빌드
   scratch를 빼므로 사전 `ensure_vram` 통과 후에도 OOM 가능.
-- **부분 구현**: wrapper가 `std::bad_alloc`(RMM OOM 포함)을 `cuvs_last_build_was_oom()`로 신호 + CPU shim
-  미러 + `inject_build_oom` seam(opcode 20)까지 배선.
-- **보류 사유(정직)**: retry 본체(데몬이 OOM 시 `evict_lru` 후 1회 재시도)를 Tier-1 CI에 올리자 **shim 데몬이
-  크래시**(`build_oom` 실행 중 다운 → 후속 테스트 fast-fail). 로컬 macOS로는 데몬 자체가 안 돌아(컴파일은
-  `_DARWIN_C_SOURCE`로 통과하나 실행 환경 부재, PG14≠PG16) **무재현·무진단**. 크래시 코드를 출고할 수 없어
-  retry 호출을 즉시-BUILD_FAILED(기존 동작)로 되돌리고, 신호 인프라만 남겨 Tier-2(A100) 재현·진단 후속으로 분리.
-- **교훈**: Tier-1 shim으로 못 거르는 클래스(데몬 동시성/크래시)는 Tier-2가 필요하다는 ADR-067 경계가 그대로 확인됨.
+- **수정**: wrapper가 `std::bad_alloc`(RMM OOM 포함)을 `cuvs_last_build_was_oom()`로 신호 + CPU shim 미러 +
+  `inject_build_oom` seam(opcode 20) + 데몬이 OOM 시 `evict_lru` 후 1회 재시도(실제로 VRAM을 비운 경우만).
+- **검증**: `build_oom.sql`(victim 인덱스 상주 + OOM 1회 주입 → evict + retry 성공, CREATE INDEX OK).
 
-### 6.3 빌드 락 starvation — `fix(build)`
+### 6.3 (부수 발견) IVF-PQ eviction 크래시 — `fix(evict)`
+- **발견 경위(정직)**: 6.2 retry를 처음 Tier-1에 올리자 **데몬이 SEGV**(`build_oom` 중 다운). 로컬 macOS는
+  데몬 실행환경 부재(PG14≠PG16)라 무재현 → **Tier-1 데몬을 AddressSanitizer로 빌드**해 백트레이스 확보.
+- **근본 원인**: `evict_lru → save_index → cuvs_cagra_serialize(e->handle)`인데 **IVF-PQ 엔트리는 `e->handle==NULL`**
+  (인덱스가 `ivfpq_handle`에 있음) → NULL deref. `ivfpq_smoke`가 남긴 IVF-PQ가 LRU일 때 6.2의 retry `evict_lru`가
+  건드려 터짐. **IVF-PQ 인덱스는 원래부터 안전하게 evict 불가**(maxidx는 CAGRA-only라 못 잡음 — ADR-068 soft-LRU의 사각).
+- **수정**: `evict_lru`에 IVF-PQ 분기(아티팩트 durable → save 없이 free + reload-on-demand, sharded 패턴) +
+  `save_index` NULL-handle 방어. **ASAN을 Tier-1 데몬 빌드에 상시 편입**(UAF/오버플로 상시 커버).
+- **교훈**: "원인 모르는 크래시는 추측 패치 금지". 가설(UAF)을 세우되 **ASAN으로 확정**하고 고쳤다 — 추측대로 짰으면
+  실제 원인(IVF-PQ NULL handle)을 놓쳤을 것. 그리고 #3가 노출한 건 #3 버그가 아니라 **더 오래된 잠복 버그**였다.
+
+### 6.4 빌드 락 starvation — `fix(build)`
 - **증상**: `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드(수 분)+디스크 I/O 내내 보유 →
   모든 검색/통계/드롭 블록.
 - **수정**: reservation-counter(`g_pending_build_vram`, `total_vram_used`가 합산)로 VRAM 예약 후 GPU 빌드
@@ -113,13 +120,12 @@ host-bytes cap)은 ROADMAP 트리거 백로그.
 ## 8. 산출물 / 남은 것
 
 ### 이번 세션
-- `design/DECISIONS.md` ADR-069 (정책 + 버그 3개)
-- `ROADMAP.md` — 버그 #1·#2(출고) + #3·대형 거버넌스 항목(트리거 백로그)
-- PR #54 — 버그 #1·#2 패치 + Tier-1 회귀 2종(`vram_accounting`/`build_lock`), CI GREEN 25/25
+- `design/DECISIONS.md` ADR-069 (정책 + 버그 3개 + IVF-PQ eviction 수정)
+- `ROADMAP.md` — 버그 #1·#2·#3·IVF-PQ eviction(출고) + 병렬빌드·대형 거버넌스(트리거 백로그)
+- PR #54 — 버그 #1·#2·#3 + IVF-PQ eviction 수정 + Tier-1 회귀 3종 + 데몬 ASAN 상시. **CI GREEN 26/26**
 - 본 보고서
 
 ### 남은 것 (트리거 백로그)
-- **버그 #3 evict-retry 본체** — shim 데몬 크래시 Tier-2(A100) 재현·진단·수정
 - **#2/#3 병렬빌드 적용** — `handle_build_multi`(ADR-058)에 reservation-unlock·OOM-retry 미적용(대형 빌드 경로)
 - 빌드 락 동시성(starvation 부재) Tier-2 검증 + `build_sharded` 멀티GPU 검증
 - cgroup/systemd `MemoryMax=` 운영 가이드
