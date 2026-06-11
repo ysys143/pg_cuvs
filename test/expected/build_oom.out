@@ -1,0 +1,64 @@
+-- build_oom.sql — ADR-069 Bug #3: a CAGRA build that OOMs (build-time scratch is
+-- not covered by the pre-build VRAM estimate) must evict an LRU index and retry
+-- once before failing, instead of returning BUILD_FAILED immediately.
+--
+-- Setup: a victim index (boom_a) stays resident so the retry has something to
+-- evict. Arm exactly one synthetic build OOM, then CREATE INDEX on boom_b. With
+-- the bug, the first (and only) cuvs_cagra_build returns NULL -> BUILD_FAILED ->
+-- CREATE INDEX raises an error and ON_ERROR_STOP aborts the test. With the fix,
+-- the daemon evicts boom_a and the retry succeeds, so CREATE INDEX completes.
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Runs in Tier-1 CI
+-- (CPU shim): cuvs_set_inject_build_oom is implemented in the shim too.
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- Victim index: resident LRU candidate for the retry to evict.
+CREATE TABLE boom_a (id int, embedding vector(8));
+INSERT INTO boom_a
+SELECT g, format('[%s,0,0,0,0,0,0,0]', (g * 0.1)::numeric(8,3))::vector
+FROM generate_series(1, 200) g;
+CREATE INDEX boom_a_idx ON boom_a USING cagra (embedding vector_l2_ops);
+-- Cumulative eviction baseline (counters are daemon-lifetime).
+SELECT evictions AS e0 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+-- Arm one build OOM: the next CREATE INDEX's first build fails, the daemon
+-- evicts the LRU (boom_a) and retries.
+SELECT pg_cuvs_inject_build_oom(1);
+ pg_cuvs_inject_build_oom
+--------------------------
+
+(1 row)
+
+CREATE TABLE boom_b (id int, embedding vector(8));
+INSERT INTO boom_b
+SELECT g, format('[0,%s,0,0,0,0,0,0]', (g * 0.1)::numeric(8,3))::vector
+FROM generate_series(1, 200) g;
+CREATE INDEX boom_b_idx ON boom_b USING cagra (embedding vector_l2_ops);
+SELECT pg_cuvs_inject_build_oom(0);
+ pg_cuvs_inject_build_oom
+--------------------------
+
+(1 row)
+
+-- The retried build is a working index: an exact (brute_force) self-query
+-- returns the row itself as its own nearest neighbor.
+SET cuvs.search_mode = 'brute_force';
+SELECT id FROM boom_b
+ORDER BY embedding <-> (SELECT embedding FROM boom_b WHERE id = 7)
+LIMIT 1;
+ id
+----
+  7
+(1 row)
+
+-- The retry path evicted the LRU index at least once.
+SELECT evictions > :e0 AS bug3_evicted_and_retried
+FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
+ bug3_evicted_and_retried
+--------------------------
+ t
+(1 row)
+
+DROP TABLE boom_a;
+DROP TABLE boom_b;
