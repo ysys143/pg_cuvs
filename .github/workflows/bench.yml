@@ -1,0 +1,219 @@
+name: Benchmark (protocol, Stage A-D)
+
+# Local-owned workflow skeleton. Ownership: bench/protocol/README.md §4; interface: CONTRACT.md §8.
+# Thin by design: inject env (CONTRACT §2) -> bench/protocol/run.sh -> push results/protocol/**
+# to a dedicated results branch. ALL measurement logic lives in repo scripts (web-owned), so the
+# workflow stays version-controlled and credential-isolated (scripts never push; only this does).
+#
+# Dispatch model (mirrors gpu.yml, ADR-067): an optional hosted job starts the GPU VM via WIF, the
+# self-hosted runner ON the VM runs run.sh, an optional hosted job stops it. With WIF unset (current
+# state) start/stop are skipped and the always-up VM + boot-start runner are used as-is.
+#
+# The harness (bench/protocol/run.sh + lib/ + engines/) is checked out from the `ref` input, so this
+# file can live on main (required for API dispatch, CONTRACT §8.5) and be dispatched against the
+# harness branch BEFORE it merges.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag holding the harness (bench/protocol/run.sh). Blank = this ref."
+        required: false
+      pr:
+        description: "PR number to test (checks out the PR merge ref)"
+        required: false
+      stage:
+        description: "PGCUVS_STAGE"
+        type: choice
+        options: [A, B, C, D]
+        default: A
+      module:
+        description: "PGCUVS_MODULE (A:physics; D:filter|incremental|pareto|concurrency|coldstart|ceiling)"
+        default: physics
+      cells:
+        description: "PGCUVS_CELLS"
+        default: "N=1k,10k,100k,1m;dim=1024;k=10;recall=0.95,0.99"
+      configs:
+        description: "PGCUVS_CONFIGS"
+        default: "forced-hnsw,forced-cuvs,auto"
+      baseline:
+        description: "PGCUVS_BASELINE"
+        type: choice
+        options: [same-box, iso-$]
+        default: same-box
+      dataset:
+        description: "PGCUVS_DATASET"
+        type: choice
+        options: [cohere-1m, cohere-10m, synth-clustered, synth-random]
+        default: cohere-1m
+      reps:
+        description: "PGCUVS_REPS (latency cell repetitions)"
+        default: "5"
+      cost_model_version:
+        description: "PGCUVS_COST_MODEL_VERSION (stamped on every row)"
+        default: "v0"
+      runtime_routing_version:
+        description: "PGCUVS_RUNTIME_ROUTING_VERSION (stamped on every row)"
+        default: "v0"
+      dry_run:
+        description: "PGCUVS_DRY_RUN — expand cells only, no GPU work, no results"
+        type: boolean
+        default: false
+      resume:
+        description: "PGCUVS_RESUME — skip cells already in .progress (idempotent re-run)"
+        type: boolean
+        default: false
+      cpu_shim:
+        description: "PGCUVS_CPU_SHIM — plumbing only, no GPU (skips build + publish)"
+        type: boolean
+        default: false
+      build:
+        description: "Rebuild + reinstall pg_cuvs from ref before running"
+        type: boolean
+        default: true
+      stop_vm:
+        description: "Stop the GPU VM after the run (off = keep warm for adaptive refine loop)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write          # push results to the results branch
+  id-token: write          # Workload Identity Federation (keyless GCP auth) for VM start/stop
+
+concurrency:
+  group: gpu-singleton     # single A100 — never double-book a run (CONTRACT §8.4 / README §5)
+  cancel-in-progress: false
+
+env:
+  GCP_INSTANCE: ${{ vars.GPU_CI_INSTANCE }}     # e.g. pg-cuvs-dev
+  GCP_ZONE: ${{ vars.GPU_CI_ZONE }}             # e.g. us-central1-b
+  RESULTS_BRANCH: bench-results/protocol
+
+jobs:
+  # ── Optionally start the GPU VM (hosted, keyless GCP auth). Skipped unless WIF is set. ──
+  start-vm:
+    name: Start GPU VM
+    if: ${{ vars.GCP_WIF_PROVIDER != '' }}
+    runs-on: ubuntu-latest
+    environment: gpu
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Start instance + wait for runner
+        run: |
+          gcloud compute instances start "$GCP_INSTANCE" --zone "$GCP_ZONE"
+          sleep 45    # boot-start self-hosted runner registers; bench job queues until online
+
+  # ── Run the harness on the A100 (self-hosted runner ON the VM) ─────────────────────────
+  bench:
+    name: Benchmark on A100
+    needs: start-vm
+    if: ${{ !cancelled() && needs.start-vm.result != 'failure' }}
+    runs-on: [self-hosted, gpu, a100]
+    timeout-minutes: 600
+    env:
+      # CONTRACT §2 env mapping (names verbatim) — this block is the SSOT with the inputs above.
+      PGCUVS_STAGE: ${{ inputs.stage }}
+      PGCUVS_MODULE: ${{ inputs.module }}
+      PGCUVS_CELLS: ${{ inputs.cells }}
+      PGCUVS_CONFIGS: ${{ inputs.configs }}
+      PGCUVS_BASELINE: ${{ inputs.baseline }}
+      PGCUVS_DATASET: ${{ inputs.dataset }}
+      PGCUVS_REPS: ${{ inputs.reps }}
+      PGCUVS_COST_MODEL_VERSION: ${{ inputs.cost_model_version }}
+      PGCUVS_RUNTIME_ROUTING_VERSION: ${{ inputs.runtime_routing_version }}
+      PGCUVS_DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+      PGCUVS_RESUME: ${{ inputs.resume && '1' || '' }}
+      PGCUVS_CPU_SHIM: ${{ inputs.cpu_shim && '1' || '' }}
+      PGCUVS_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      # Postgres connection — peer auth as the runner user (ubuntu) over the unix socket.
+      PGHOST: /var/run/postgresql
+      PGPORT: "5432"
+      PGDATABASE: bench
+      PGUSER: ubuntu
+      CUVS_INDEX_DIR: /tmp/cuvs_indexes        # MUST match pg-cuvs-server --index-dir
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Check out PR merge ref (if pr given)
+        if: ${{ inputs.pr != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr checkout ${{ inputs.pr }}
+
+      - name: Build + install pg_cuvs (real cuVS)
+        if: ${{ inputs.build && inputs.cpu_shim != true }}
+        run: |
+          source ~/miniforge3/bin/activate cuvs_dev
+          make
+          sudo -E make install
+          make server
+          sudo make install-server
+          sudo systemctl restart postgresql
+          sudo systemctl restart pg-cuvs-server
+          sleep 3
+
+      - name: Run benchmark harness
+        run: |
+          source ~/miniforge3/bin/activate cuvs_dev
+          chmod +x bench/protocol/run.sh bench/protocol/lib/*.sh bench/protocol/lib/engines/*.sh 2>/dev/null || true
+          set -o pipefail
+          bash bench/protocol/run.sh | tee "/tmp/bench_${PGCUVS_RUN_ID}.log"
+          # surface the CONTRACT §3 terminal marker into the run summary
+          grep -E '^PGCUVS_RESULT:' "/tmp/bench_${PGCUVS_RUN_ID}.log" | tail -1 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Publish results to ${{ env.RESULTS_BRANCH }}
+        if: ${{ always() && inputs.dry_run != true && inputs.cpu_shim != true }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -d results/protocol ]; then echo "no results/protocol — nothing to publish"; exit 0; fi
+          pub="$(mktemp -d)"
+          url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # clone the results branch (isolated from the build workspace); create it orphan if absent
+          if git clone --depth 1 --branch "$RESULTS_BRANCH" "$url" "$pub/repo" 2>/dev/null; then
+            :
+          else
+            git clone --depth 1 "$url" "$pub/repo"
+            ( cd "$pub/repo" && git switch --orphan "$RESULTS_BRANCH" && git rm -rfq . 2>/dev/null || true )
+          fi
+          mkdir -p "$pub/repo/results"
+          rm -rf "$pub/repo/results/protocol"
+          cp -a results/protocol "$pub/repo/results/protocol"
+          cd "$pub/repo"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/protocol
+          git commit -m "bench: ${PGCUVS_RUN_ID} stage=${PGCUVS_STAGE} dataset=${PGCUVS_DATASET}" \
+            || { echo "no result changes to publish"; exit 0; }
+          git push origin "HEAD:$RESULTS_BRANCH"
+
+      - name: Upload raw run log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-log-${{ github.run_id }}
+          path: /tmp/bench_*.log
+          retention-days: 14
+
+  # ── Optionally stop the VM (only if WIF set AND stop_vm requested — keeps the warm box for ──
+  # ── the adaptive refine loop by default; set stop_vm=true on a final run to tear down). ────
+  stop-vm:
+    name: Stop GPU VM
+    needs: [start-vm, bench]
+    if: ${{ always() && vars.GCP_WIF_PROVIDER != '' && inputs.stop_vm }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Stop instance
+        run: gcloud compute instances stop "$GCP_INSTANCE" --zone "$GCP_ZONE"
