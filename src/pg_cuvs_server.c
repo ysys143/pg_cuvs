@@ -567,15 +567,22 @@ total_vram_used(int device_id)
             continue;
         if (e->shard_count >= 2)
         {
-            /* Sharded: sum only the shards resident on this device. */
+            /* Sharded: sum only the shards resident on this device. Include the
+             * per-shard resident BF index (Phase 3L): it is freed on eviction
+             * (free_index_shards) so it must be accounted, else eviction
+             * over-commits VRAM. */
             for (int s = 0; s < e->shard_count; s++)
                 if (e->shards[s].valid &&
                     e->shards[s].gpu_device_id == (uint32_t)device_id)
-                    total += e->shards[s].vram_bytes;
+                    total += e->shards[s].vram_bytes
+                           + e->shards[s].bf_vram_bytes;
         }
         else if (e->gpu_device_id == (uint32_t)device_id)
         {
-            total += e->vram_bytes + e->delta_vram_bytes;
+            /* Include the resident main BF index (Phase 3L). NOT ivfpq_vram_bytes:
+             * an IVF-PQ entry sets both vram_bytes and ivfpq_vram_bytes to the
+             * same `needed`, so counting the latter would double-count. */
+            total += e->vram_bytes + e->delta_vram_bytes + e->main_bf_vram_bytes;
         }
     }
     return total;
