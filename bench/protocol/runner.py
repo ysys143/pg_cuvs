@@ -233,8 +233,15 @@ def main():
 
     gt_path = os.path.join(a.gt_dir, f"gt_{n}.npy")
     if not os.path.exists(gt_path):
-        sys.exit(f"[runner] missing GT {gt_path} — build it "
-                 f"(infra/anbench/build_gt.py) for N={n} before this cell")
+        # auto-build exact GT (GPU brute force, cupy) — self-sufficient live path.
+        # quick at small N; required because gt_{1k,10k} aren't pre-built (issue #56).
+        log(f"GT {gt_path} missing — building via build_gt.py (N={n}, k=100)")
+        import subprocess
+        r = subprocess.run([sys.executable, os.path.join(ANBENCH, "build_gt.py"),
+                            "--corpus", a.corpus, "--queries", a.queries,
+                            "--n", str(n), "--k", "100", "--out", gt_path])
+        if r.returncode != 0 or not os.path.exists(gt_path):
+            sys.exit(f"[runner] GT build failed for N={n} ({gt_path})")
 
     import psycopg
     queries = np.ascontiguousarray(read_fbin(a.queries))
