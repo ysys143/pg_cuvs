@@ -52,7 +52,25 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). **다음 순차 작업: 릴리스 준비 — `BENCHMARK.md` 공개 + 라이선스 확정**("에코시스템 진입 계획" 전제조건 참조).
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **다음 순차 작업: 릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조).
+
+### 릴리스 준비 — 문서·운영 정비 (순차)
+
+> repo가 PUBLIC이 된 지금, 외부 사용자·기여자·운영자가 **현행 제품을 ADR 발굴 없이** 이해·운용할 수 있어야 한다. 현 문서는 ADR 69개(`DECISIONS.md` 214KB) + `PLAN.md`(1523줄) + 분산 design/docs로 **역사적 근거·작업메모 누적**에 가까워, 현재 제품의 기능·아키텍처·적용 기법·고려사항을 일목요연하게 볼 단일 reference가 없다(README가 유일 개요).
+
+- **문서 정합성/현행화 (current-state reference 정비)**
+  - `ARCHITECTURE.md`(신규): 현행 컴포넌트(확장 `.so` / sidecar 데몬 / shmem IPC), 데이터·제어 흐름, 인덱스 생애주기(build→serialize→load→evict→reload), VRAM 자기-회계, 멀티-GPU 샤딩, GCS 스냅샷.
+  - 기능/능력 reference: 현존 검색 모드·인덱스 AM(cagra/ivfpq/hnsw/BF)·GUC·reloption 일람 통합(현재 PLAN/ADR/README 분산).
+  - 적용 기법·고려사항 요약: 비자명 엔지니어링 — BITSET 극성 규약, rev-map prefilter(3O), fail-closed 계약, VRAM 자기-회계(ADR-065), delta/tombstone 병합, CPU-reference shim CI, false-done 방지 원칙.
+  - 문서 맵: ADR/PLAN = "역사적 근거", reference = "현행 SSOT"로 명확히 구분. drift(`SPEC.md` 등) reconcile.
+  - **완료 기준**: 외부 기여자/사용자가 reference 문서군만으로 "무엇을·어떻게·왜"를 ADR 발굴 없이 파악. 문서 맵이 현행 vs 역사를 구분.
+
+- **운영 플레이북 완성 (`design/OPS_GPU_PLAYBOOK.md` 단일화)**
+  - 현황: OPS_GPU_PLAYBOOK(331줄)은 GPU 튜닝 + MIG만 다룸. `docs/playbooks/`에 3종(replica-bootstrap·capacity-planning·benchmark-runbook); **release-upgrade 런북 부재**.
+  - 작업: 운영 생애주기 전반 단일화 — 기동·모니터링(어느 `pg_stat_gpu_*` 뷰·임계값), 장애모드·복구(데몬 다운·VRAM OOM·fallback 급증·eviction 폭주), 업그레이드/롤백, 백업/복구(GCS 스냅샷), 스케일링·캐파, 인시던트 대응. 흩어진 런북을 OPS_GPU_PLAYBOOK로 연결.
+  - **완료 기준**: 신규 운영자가 플레이북만으로 배포→모니터→장애대응→업그레이드 수행 가능; 각 절차에 실 명령·뷰·임계값 포함.
+
+대상: `design/OPS_GPU_PLAYBOOK.md` · `docs/playbooks/` · (신규) `ARCHITECTURE.md` + 문서 맵
 
 ---
 
