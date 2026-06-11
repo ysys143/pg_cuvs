@@ -70,6 +70,8 @@
 
 > repo가 PUBLIC이 된 지금, 외부 사용자·기여자·운영자가 **현행 제품을 ADR 발굴 없이** 이해·운용할 수 있어야 한다. 현 문서는 ADR 69개(`DECISIONS.md` 214KB) + `PLAN.md`(1523줄) + 분산 design/docs로 **역사적 근거·작업메모 누적**에 가까워, 현재 제품의 기능·아키텍처·적용 기법·고려사항을 일목요연하게 볼 단일 reference가 없다(README가 유일 개요).
 
+> **입력 자료**: [`docs/levers-and-governance.md`](docs/levers-and-governance.md) — 레버 카탈로그(GUC 34/reloption 11/데몬플래그 9, 소스 추출) + 표준 PG 레버 거버넌스(ADR-069 운영자 버전) + 세션 학습(PR#54) + **문서화 감사 결과(§5: 드리프트·미설명 레버·backport TODO 체크리스트)**. 아래 "문서 정합성/현행화"·"운영 플레이북"·"References"가 이 문서를 승격·소비한다.
+
 - **문서 정합성/현행화 (current-state reference 정비)**
   - `ARCHITECTURE.md`(신규): 현행 컴포넌트(확장 `.so` / sidecar 데몬 / shmem IPC), 데이터·제어 흐름, 인덱스 생애주기(build→serialize→load→evict→reload), VRAM 자기-회계, 멀티-GPU 샤딩, GCS 스냅샷.
   - 기능/능력 reference: 현존 검색 모드·인덱스 AM(cagra/ivfpq/hnsw/BF)·GUC·reloption 일람 통합(현재 PLAN/ADR/README 분산).
