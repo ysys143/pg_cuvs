@@ -2728,11 +2728,13 @@ reload-on-demand, sharded 패턴) + `save_index` NULL-handle 방어. **ASAN을 T
 
 ### 검증
 
-Tier-1 CPU shim 회귀(installcheck, **PR #54 GREEN 26/26, 데몬 ASAN 빌드**): `vram_accounting`(버그#1),
-`build_lock`(버그#2 — 빌드 정상 + reservation no-leak), `build_oom`(버그#3 — OOM 1회 주입 → evict + retry 성공,
-ASAN 무크래시). 빌드 락 **동시성**(starvation 부재)과 `build_sharded` 멀티GPU는 단일 클라이언트·단일 GPU shim으로
-검증 불가 → Tier-2. 대형 항목(cgroup 가이드, scratch-aware admission, 백엔드 스탬프, corpus→BufFile,
-daemon host-bytes cap, **handle_build_multi 병렬빌드에 #2/#3 미적용**)은 ROADMAP 트리거 백로그.
+Tier-1 CPU shim 회귀(installcheck, **PR #54 GREEN 27/27, 데몬 ASAN 빌드**): `vram_accounting`(버그#1),
+`build_lock`(버그#2 — 빌드 정상 + reservation no-leak), `build_oom`(버그#3 — OOM 1회 주입 → evict + retry 성공),
+`build_multi_oom`(#2/#3을 **병렬빌드 `handle_build_multi`**에 적용 — 강제 병렬 + OOM → evict + retry, 데몬 로그로
+`[handle_build_multi] build OOM ... retrying` 확인). 모두 ASAN 무크래시. **#2/#3은 세 빌드 경로 전부 적용**
+(`handle_build`/`build_sharded`/`handle_build_multi`). 빌드 락 **동시성**(starvation 부재)과 `build_sharded`
+멀티GPU는 단일 클라이언트·단일 GPU shim으로 검증 불가 → Tier-2. 대형 항목(cgroup 가이드, scratch-aware admission,
+백엔드 스탬프, corpus→BufFile, daemon host-bytes cap)은 ROADMAP 트리거 백로그.
 
 ### 후속
 

@@ -5,7 +5,7 @@
 | 날짜 | 2026-06-11 |
 | 범위 | 표준 PostgreSQL 레버 준수 감사 · 적대적 리뷰 2라운드 · 자원 거버넌스 정책(v3) · 확정 버그 3개 수정 |
 | 결과 | ADR-069 채택 + ROADMAP 등재 + 버그 #1·#2·#3 전부 출고(PR #54) + 부수로 IVF-PQ eviction 크래시 수정 + Tier-1 데몬 ASAN 상시 |
-| 검증 | **Tier-1 CI GREEN 26/26, 데몬 AddressSanitizer 빌드**(`vram_accounting`=#1, `build_lock`=#2, `build_oom`=#3). 빌드 락 동시성·sharded 멀티GPU·병렬빌드(handle_build_multi)는 Tier-2 |
+| 검증 | **Tier-1 CI GREEN 27/27, 데몬 AddressSanitizer 빌드**(`vram_accounting`=#1, `build_lock`=#2, `build_oom`=#3, `build_multi_oom`=#2/#3 병렬경로). #2/#3은 세 빌드 경로(`handle_build`/`build_sharded`/`handle_build_multi`) 전부 적용. 빌드 락 동시성·sharded 멀티GPU는 Tier-2 |
 
 ---
 
@@ -122,12 +122,11 @@ host-bytes cap)은 ROADMAP 트리거 백로그.
 ### 이번 세션
 - `design/DECISIONS.md` ADR-069 (정책 + 버그 3개 + IVF-PQ eviction 수정)
 - `ROADMAP.md` — 버그 #1·#2·#3·IVF-PQ eviction(출고) + 병렬빌드·대형 거버넌스(트리거 백로그)
-- PR #54 — 버그 #1·#2·#3 + IVF-PQ eviction 수정 + Tier-1 회귀 3종 + 데몬 ASAN 상시. **CI GREEN 26/26**
+- PR #54 — 버그 #1·#2·#3 + IVF-PQ eviction 수정 + #2/#3 병렬경로(handle_build_multi) 적용 + Tier-1 회귀 4종 + 데몬 ASAN 상시. **CI GREEN 27/27**
 - 본 보고서
 
 ### 남은 것 (트리거 백로그)
-- **#2/#3 병렬빌드 적용** — `handle_build_multi`(ADR-058)에 reservation-unlock·OOM-retry 미적용(대형 빌드 경로)
-- 빌드 락 동시성(starvation 부재) Tier-2 검증 + `build_sharded` 멀티GPU 검증
+- 빌드 락 동시성(starvation 부재) Tier-2 검증 + `build_sharded` 멀티GPU 검증 (단일 클라이언트·단일 GPU shim으로는 검증 불가)
 - cgroup/systemd `MemoryMax=` 운영 가이드
 - scratch-aware VRAM admission (intermediate/graph degree 기반 또는 RMM pool cap)
 - 백엔드 아티팩트 스탬프(timeline/system_identifier) — standby/PITR fail-closed

@@ -62,8 +62,9 @@
 - **[OK] 빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드 내내 보유 → 검색/통계/드롭 블록. **완료**: reservation-counter(`g_pending_build_vram`)로 GPU 빌드 구간 언락(양 경로); `build_lock.sql`. 동시성(starvation 부재)·`build_sharded` 멀티GPU는 Tier-2.
 - **[OK] 빌드 OOM evict-retry** — OOM 신호(`cuvs_last_build_was_oom`)+`inject_build_oom`(opcode 20)+evict 후 1회 재시도. **완료**: `build_oom.sql`(ASAN 무크래시).
 - **[OK] (부수) IVF-PQ eviction 크래시** — `evict_lru→save_index→cuvs_cagra_serialize(NULL handle)` SEGV(IVF-PQ는 `handle==NULL`). 기존 잠복(IVF-PQ 인덱스 evict 불가); #3 retry가 ASAN으로 노출. **완료**: `evict_lru` IVF-PQ 분기(save 없이 free+reload) + `save_index` NULL 방어 + Tier-1 데몬 ASAN 상시.
+- **[OK] 병렬빌드(handle_build_multi)에 #2/#3 적용** — ADR-058/059 병렬 경로(대형·OOM 빈발)는 단일 경로와 별개라 미적용이었음. **완료**: 동일 reservation/unlock + OOM evict-retry 적용. `build_multi_oom.sql`(강제 병렬 + OOM → evict + retry, 데몬 로그 `[handle_build_multi]` 확인). #2/#3은 이제 세 빌드 경로 전부 커버.
 
-대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `.github/workflows/ci.yml`(ASAN) · `test/sql/{vram_accounting,build_lock,build_oom}.sql` | ADR-069
+대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `.github/workflows/ci.yml`(ASAN) · `test/sql/{vram_accounting,build_lock,build_oom,build_multi_oom}.sql` | ADR-069
 
 ### 릴리스 준비 — 문서·운영 정비 (순차)
 
@@ -126,7 +127,7 @@
 | **백엔드 아티팩트 스탬프(timeline/system_identifier)** | ADR-069. 외부 아티팩트가 WAL/복제 밖 → standby/PITR에서 timeline 발산 시 stale 결과 위험. 데몬은 pg_control/timeline 못 읽음 → 백엔드가 `.tids` 헤더 스탬프 + plan-time 검증해야 fail-closed 가능. | 코드(사이드카 포맷 + 백엔드 검증) | replica/PITR 정합성 요구 시 |
 | **corpus → BufFile 옵션** | ADR-069. 코퍼스를 PG `BufFile` temp 파일로 옮기면 `temp_file_limit`이 *진짜로* 적용(디스크 백킹 트레이드오프). 메모리 제약 환경 대안. | 코드(corpus tier에 BufFile 추가) | host RAM 제약 환경 수요 시 |
 | **daemon host-bytes cap + evict-on-host-pressure** | ADR-069. resident host 배열(`rev_tids`/`rev_item_ids`/`tids` ~20B/vec)이 개수 LRU(`g_max_indexes`)로만 제한 → host RAM은 인덱스 크기 비례 누적. | 코드(host-bytes 카운터 + host 압박 시 eviction) | 데몬 host RSS 누적 실측 시 |
-| **#2/#3 병렬빌드(handle_build_multi) 미적용** | ADR-069. reservation-unlock(#2)·OOM-retry(#3)는 단일 `handle_build`/`build_sharded`에만 적용; ADR-058 병렬빌드 경로(대형·OOM 빈발)는 미적용. | 코드(handle_build_multi에 동일 패턴) | 대형 병렬빌드에서 starvation/OOM 실측 시 |
+| **빌드 락 동시성 Tier-2 검증** | ADR-069. #2 unlock의 starvation-부재(동시 검색 비차단)·reservation 동시성은 단일 클라이언트 Tier-1로 검증 불가. `build_sharded` 멀티GPU도 동일. | Tier-2(A100, 멀티클라이언트/멀티GPU) | 출시 전 또는 동시성 회귀 의심 시 |
 
 스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-069 | `design/OPS_GPU_PLAYBOOK.md`
 
