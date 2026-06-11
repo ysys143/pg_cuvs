@@ -141,12 +141,8 @@ def run_queries(conn, table, queries, kmax, set_sql, index_dir, config,
     import numpy as np
     from anbench_common import percentiles_ms
     with conn.cursor() as cur:
-        if config == "forced-cuvs":
-            cur.execute(f"SET cuvs.index_dir = '{index_dir}'")  # CRITICAL
-        elif config == "forced-seqscan":
-            cur.execute("SET enable_cuvs=off")
-            cur.execute("SET enable_indexscan=off")
-            cur.execute("SET enable_bitmapscan=off")
+        # plan-forcing GUCs are session-level (set once in main); here we only
+        # apply the per-sweep knob.
         if set_sql:
             cur.execute(set_sql)
         nq = len(queries)
@@ -255,6 +251,20 @@ def main():
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     if a.config in ("forced-cuvs",):
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+
+    # Session-level plan forcing. A 'forced' config measures THAT engine's path
+    # even where the planner would pick another at small N (e.g. at N=1k the cuvs
+    # startup cost > a 1k-row seq scan, so without this the planner seq-scans and
+    # the cuvs guard fails). Stage B measures the planner's actual choice separately.
+    if a.config in ("forced-hnsw", "forced-cuvs"):
+        conn.execute("SET enable_seqscan = off")
+        conn.execute("SET enable_bitmapscan = off")
+    if a.config == "forced-cuvs":
+        conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
+    if a.config == "forced-seqscan":
+        conn.execute("SET enable_cuvs = off")
+        conn.execute("SET enable_indexscan = off")
+        conn.execute("SET enable_bitmapscan = off")
 
     setup_table(conn, table, a.corpus, n, dim)
 
