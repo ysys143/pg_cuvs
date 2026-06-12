@@ -25,7 +25,10 @@ run_engine(){
 
   # shellcheck disable=SC1091
   source "$conda/bin/activate" "$env"
-  exec python3 "$PROTO/runner.py" \
+  # PGCUVS_MODULE selects the runner: physics → runner.py, concurrency → load probe
+  local pyrunner="runner.py"
+  [ "${PGCUVS_MODULE:-physics}" = "concurrency" ] && pyrunner="runner_concurrency.py"
+  exec python3 "$PROTO/$pyrunner" \
     --config "$config" --cell "$cell_id" \
     --csv "$CSV" --run-id "$RUN_ID" --stage "$STAGE" \
     --dataset "${DATASET:-cohere-1m}" --reps "${REPS:-5}" \
