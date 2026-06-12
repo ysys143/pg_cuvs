@@ -1,0 +1,9 @@
+N10k_d1024_k10_r0.95|forced-cuvs
+N10k_d1024_k10_r0.95|forced-cuvs-bf
+N10k_d1024_k10_r0.95|forced-cuvs-bf-batch
+N100k_d1024_k10_r0.95|forced-cuvs
+N100k_d1024_k10_r0.95|forced-cuvs-bf
+N100k_d1024_k10_r0.95|forced-cuvs-bf-batch
+N1m_d1024_k10_r0.95|forced-cuvs
+N1m_d1024_k10_r0.95|forced-cuvs-bf
+N1m_d1024_k10_r0.95|forced-cuvs-bf-batch
