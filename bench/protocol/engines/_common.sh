@@ -18,10 +18,11 @@ run_engine(){
 
   # daemon pid so ResourceSampler folds pg-cuvs-server host RSS in (CONTRACT §4)
   local dpid=""
-  if [ "$config" = "forced-cuvs" ] || [ "$config" = "auto" ]; then
-    dpid="$(systemctl show -p MainPID --value pg-cuvs-server 2>/dev/null || true)"
-    [ "$dpid" = "0" ] && dpid=""
-  fi
+  case "$config" in
+    forced-cuvs*|auto)   # forced-cuvs, forced-cuvs-bf, forced-cuvs-bf-batch, auto
+      dpid="$(systemctl show -p MainPID --value pg-cuvs-server 2>/dev/null || true)"
+      [ "$dpid" = "0" ] && dpid="" ;;
+  esac
 
   # shellcheck disable=SC1091
   source "$conda/bin/activate" "$env"
