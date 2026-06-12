@@ -149,8 +149,9 @@ def main():
     cell = runner.parse_cell(a.cell)
     n, dim, k, target = cell["N"], cell["dim"], cell["k"], cell["recall_target"]
     is_cuvs = a.config in CUVS_CONFIGS
+    is_seq = a.config == "forced-seqscan"     # cpu exact: the planner's small-N path
     table = runner.TABLES.get(a.config) or ("t_cuvs" if is_cuvs else None)
-    if table is None or a.config not in KNOB_GUC:
+    if table is None or (a.config not in KNOB_GUC and not is_seq):
         raise NotImplementedError(f"concurrency config {a.config} not supported")
     search_mode, bf_wait = CUVS_SEARCH.get(a.config, (None, None))
 
@@ -166,8 +167,12 @@ def main():
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     if is_cuvs:
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
-    conn.execute("SET enable_seqscan = off")
-    conn.execute("SET enable_bitmapscan = off")
+    if is_seq:                            # force the CPU brute-force scan (no index)
+        conn.execute("SET enable_indexscan = off")
+        conn.execute("SET enable_bitmapscan = off")
+    else:
+        conn.execute("SET enable_seqscan = off")
+        conn.execute("SET enable_bitmapscan = off")
     if is_cuvs:
         conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
     if search_mode:                       # BF variants: search the .vectors sidecar
@@ -175,7 +180,10 @@ def main():
         conn.execute(f"SET cuvs.bf_batch_wait_us = {bf_wait}")
 
     runner.setup_table(conn, table, a.corpus, n, dim)
-    name, index_type = ensure_index(conn, a.config, table, n, a.index_dir)
+    if is_seq:
+        name, index_type = None, "seqscan"
+    else:
+        name, index_type = ensure_index(conn, a.config, table, n, a.index_dir)
     if is_cuvs:
         ok, plan = runner.explain_uses_index(conn, table, queries[0], "cagra")
         if not ok:
@@ -188,14 +196,17 @@ def main():
     load_query_table(conn, queries, dim)
     conn.close()
 
-    # startup GUCs for every pgbench connection (force the index + iso-recall knob)
-    opts = ["-c", "enable_seqscan=off", "-c", "enable_bitmapscan=off",
-            "-c", f"{KNOB_GUC[a.config]}={knob}"]
-    if is_cuvs:
-        opts += ["-c", f"cuvs.index_dir={a.index_dir}"]
-        if search_mode:
-            opts += ["-c", f"cuvs.search_mode={search_mode}",
-                     "-c", f"cuvs.bf_batch_wait_us={bf_wait}"]
+    # startup GUCs for every pgbench connection (force the path + iso-recall knob)
+    if is_seq:
+        opts = ["-c", "enable_indexscan=off", "-c", "enable_bitmapscan=off"]
+    else:
+        opts = ["-c", "enable_seqscan=off", "-c", "enable_bitmapscan=off",
+                "-c", f"{KNOB_GUC[a.config]}={knob}"]
+        if is_cuvs:
+            opts += ["-c", f"cuvs.index_dir={a.index_dir}"]
+            if search_mode:
+                opts += ["-c", f"cuvs.search_mode={search_mode}",
+                         "-c", f"cuvs.bf_batch_wait_us={bf_wait}"]
     pgoptions = " ".join(opts)
     qsql = (f"\\set qid random(1, {nq})\n"
             f"SELECT id FROM {table} ORDER BY embedding <-> "
