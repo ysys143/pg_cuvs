@@ -24,7 +24,9 @@ sys.path.insert(0, ANBENCH)
 import observe  # noqa: E402
 import runner   # noqa: E402  reuse setup_table/build_index/choose_iso_recall/etc.
 
-CLIENTS = [1, 8, 32, 64, 128]
+# cap at 64: the VM PG default max_connections (~100) refuses c=128, and the
+# single-daemon throughput ceiling is already visible by c≈8. 4/16 resolve the knee.
+CLIENTS = [1, 4, 8, 16, 32, 64]
 KNOB_GUC = {"forced-hnsw": "hnsw.ef_search", "forced-cuvs": "cuvs.k"}
 
 

@@ -124,6 +124,33 @@ def fig_build(dfb, out):
     plt.close(fig)
 
 
+def fig_concurrency(dfq, out):
+    """QPS vs concurrent clients (labels: p99 ms). Shows the single-daemon ceiling."""
+    d = dfq.dropna(subset=["qps"])
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for cfg, (lab, col) in ENGINES.items():
+        g = d[d["config"] == cfg].sort_values("clients")
+        if g.empty:
+            continue
+        ax.plot(g["clients"], g["qps"], "-", marker="o", lw=2.4, color=col, label=lab)
+        for _, r in g.iterrows():
+            ax.annotate(f"p99 {r['p99_us']/1000:.0f}ms", (r["clients"], r["qps"]),
+                        textcoords="offset points",
+                        xytext=(0, 12 if cfg == "forced-cuvs" else -16),
+                        ha="center", fontsize=8, color=col)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("concurrent clients (pgbench -c, log2)")
+    ax.set_ylabel("QPS (sustained, pgbench -T)")
+    ax.set_title("Throughput under concurrency — single-daemon ceiling")
+    ax.legend()
+    fig.text(0.5, 0.005,
+             "N=1M · k=10 · iso-recall@10=0.95 · same-box A100 · vector bound from a table (realistic) · " + SUB.split(' · ', 1)[1],
+             ha="center", fontsize=8, color="#555")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.savefig(os.path.join(out, "concurrency.png"), dpi=150)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
@@ -137,6 +164,11 @@ def main():
     dfq = df[df["phase"] == "query"].copy()
     dfb = df[df["phase"] == "build"].copy()
 
+    # concurrency data (varying `clients`) → the load-version figure; else Stage-A.
+    if "clients" in dfq and dfq["clients"].nunique() > 1:
+        fig_concurrency(dfq, a.out)
+        print(f"wrote figures to {a.out}/: concurrency.png")
+        return
     fig_ratio(dfq, a.out)
     fig_latency(dfq, a.out)
     fig_qps(dfq, a.out)
