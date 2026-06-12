@@ -544,3 +544,13 @@ COMMENT ON FUNCTION pg_cuvs_inject_extend_oom(integer) IS
   'Test-only: arm (1) or disarm (0) synthetic OOM injection in cuvs_cagra_extend. '
   'When armed, the next extend throws bad_alloc, exercising _pr.poison() → '
   'BUILD_FAILED → delta fallback. The flag self-clears on fire.';
+
+CREATE FUNCTION pg_cuvs_inject_build_oom(n_fail integer)
+RETURNS void
+AS '$libdir/pg_cuvs', 'pg_cuvs_inject_build_oom'
+LANGUAGE C VOLATILE STRICT;
+
+COMMENT ON FUNCTION pg_cuvs_inject_build_oom(integer) IS
+  'Test-only (ADR-070 Bug #3): arm synthetic OOM for the next n_fail '
+  'cuvs_cagra_build calls in the daemon (0 = disarm), to exercise the build '
+  'evict-and-retry path. Each failing build decrements the counter.';

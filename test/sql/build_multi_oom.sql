@@ -1,0 +1,57 @@
+-- build_multi_oom.sql — ADR-069 #2/#3 on the PARALLEL build path
+-- (handle_build_multi, ADR-058/059). The single-process tests (build_oom,
+-- build_lock) cover handle_build/build_sharded; this forces the ADR-058 parallel
+-- maintenance-worker path so the daemon's handle_build_multi does the GPU build,
+-- and asserts the OOM evict-and-retry there completes the build.
+--
+-- Forcing parallel: max_parallel_maintenance_workers>0 + min_parallel_table_scan_size=0
+-- + zero parallel costs make plan_create_index_workers grant a worker even for a
+-- tiny table, so cuvs_build_parallel -> CUVS_OP_BUILD_MULTI -> handle_build_multi.
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim,
+-- ASAN daemon — also guards the new reservation/retry against UAF/overflow).
+
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+SET max_parallel_maintenance_workers = 2;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+
+-- Victim index: resident LRU for the retry to evict.
+CREATE TABLE pm_a (id int, embedding vector(8));
+INSERT INTO pm_a
+SELECT g, format('[%s,0,0,0,0,0,0,0]', (g * 0.1)::numeric(8,3))::vector
+FROM generate_series(1, 2000) g;
+CREATE INDEX pm_a_idx ON pm_a USING cagra (embedding vector_l2_ops);
+
+SELECT evictions AS e0 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+
+-- Arm one build OOM, then a parallel CREATE INDEX: the daemon's
+-- handle_build_multi build OOMs, evicts pm_a, and retries -> succeeds.
+SELECT pg_cuvs_inject_build_oom(1);
+
+CREATE TABLE pm_b (id int, embedding vector(8));
+INSERT INTO pm_b
+SELECT g, format('[0,%s,0,0,0,0,0,0]', (g * 0.1)::numeric(8,3))::vector
+FROM generate_series(1, 2000) g;
+CREATE INDEX pm_b_idx ON pm_b USING cagra (embedding vector_l2_ops);
+
+SELECT pg_cuvs_inject_build_oom(0);
+
+-- The retried parallel build is a working index.
+SET cuvs.search_mode = 'brute_force';
+SELECT id FROM pm_b
+ORDER BY embedding <-> (SELECT embedding FROM pm_b WHERE id = 7)
+LIMIT 1;
+
+-- The retry path evicted the LRU at least once.
+SELECT evictions > :e0 AS bug3_multi_evicted_and_retried
+FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
+
+DROP TABLE pm_a;
+DROP TABLE pm_b;

@@ -78,7 +78,12 @@ jobs:
           export PATH=/usr/lib/postgresql/16/bin:$PATH
           make PGCUVS_CPU_SHIM=1
           sudo env "PATH=$PATH" make PGCUVS_CPU_SHIM=1 install
-          make PGCUVS_CPU_SHIM=1 server
+          # Daemon built with AddressSanitizer (ADR-070: capture the Bug #3 OOM
+          # evict-retry crash backtrace; permanent UAF/overflow coverage). The .so
+          # stays non-ASAN (built above) so PostgreSQL loads it normally.
+          make PGCUVS_CPU_SHIM=1 server \
+            EXTRA_SERVER_CFLAGS="-fsanitize=address -fno-omit-frame-pointer -O1" \
+            EXTRA_SERVER_LDFLAGS="-fsanitize=address"
           sudo env "PATH=$PATH" make install-server
           # Prove the shim .so has no GPU runtime dependency.
           ! ldd pg_cuvs.so | grep -qiE 'libcuvs|libcudart|librmm'
@@ -96,6 +101,9 @@ jobs:
           sudo mkdir -p /tmp/cuvs_indexes && sudo chmod 0777 /tmp/cuvs_indexes
           sudo pg_ctlcluster 16 main start
           sudo -u postgres createuser -s "$USER" || true
+          # ASAN: report to the daemon log; detect_leaks off (daemon holds memory
+          # by design); abort_on_error so a UAF produces a backtrace, not a hang.
+          ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1" \
           /usr/lib/postgresql/16/bin/pg_cuvs_server \
             --socket /tmp/.s.pg_cuvs --index-dir /tmp/cuvs_indexes \
             --max-vram-mb 38000 >/tmp/shim_daemon.log 2>&1 &

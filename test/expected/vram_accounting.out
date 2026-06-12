@@ -1,0 +1,58 @@
+-- vram_accounting.sql — ADR-069 Bug #1: total_vram_used() must include the
+-- resident brute-force index VRAM (main_bf_vram_bytes), else eviction
+-- over-commits the GPU.
+--
+-- Discriminator: snapshot daemon-reported VRAM right after CREATE INDEX (CAGRA
+-- resident, no BF yet), then force a brute_force search (builds the resident
+-- main BF index), then snapshot again. With the bug, the total is unchanged
+-- (BF VRAM uncounted); with the fix, the total grows by the BF index size.
+--
+-- The corpus is sized so the BF index is >= ~2 MB of VRAM (8000 x 64 x 4B),
+-- large enough to be visible at the view's MB granularity (tiny corpora round
+-- bf_vram_mb to 0; see brute_force.sql).
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Runs in Tier-1 CI
+-- (CPU shim): the shim's VRAM accounting is a deterministic in-process counter.
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+NOTICE:  extension "pg_cuvs" already exists, skipping
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+CREATE TABLE vram_acct (id int, embedding vector(64));
+INSERT INTO vram_acct
+SELECT g,
+       (SELECT '[' || string_agg((((g * 7 + d) % 100) * 0.01)::numeric(6,3)::text, ',')
+                    || ']'
+        FROM generate_series(1, 64) d)::vector
+FROM generate_series(1, 8000) g;
+CREATE INDEX vram_acct_idx ON vram_acct USING cagra (embedding vector_l2_ops);
+-- Snapshot 1: CAGRA resident, no BF index yet.
+SELECT vram_used_mb AS v1 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+-- Capture a query vector as a literal so the index (GPU path) is used; a
+-- subquery operand would prevent the index scan and skip the BF build.
+SELECT embedding::text AS qv FROM vram_acct WHERE id = 1 \gset
+-- Force a brute-force search -> daemon (re)builds the resident main BF index.
+-- enable_seqscan=off makes the planner choose the index scan (GPU path), else a
+-- seqscan would answer the query without ever building the BF index.
+SET cuvs.search_mode = 'brute_force';
+SET enable_seqscan = off;
+SELECT count(*) FROM (
+    SELECT id FROM vram_acct
+    ORDER BY embedding <-> :'qv'::vector
+    LIMIT 5
+) s;
+ count 
+-------
+     5
+(1 row)
+
+-- Snapshot 2: total must now include the BF index VRAM (Bug #1 fix).
+SELECT (vram_used_mb > :v1) AND (bf_vram_mb > 0) AS bug1_total_includes_bf
+FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
+ bug1_total_includes_bf 
+------------------------
+ t
+(1 row)
+
+DROP TABLE vram_acct;

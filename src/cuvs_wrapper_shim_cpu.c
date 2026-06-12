@@ -185,11 +185,30 @@ cuvs_bf_build(const float *vecs, int64_t n, int dim, uint32_t metric,
 void cuvs_bf_free(CuvsBfIndex index, int device_id)
 { (void)device_id; shim_free((ShimIndex *)index); }
 
+/* ADR-070 Bug #3: synthetic build-OOM seam, mirrors the GPU wrapper. */
+static int g_last_build_oom  = 0;
+static int g_inject_build_oom = 0;
+int  cuvs_last_build_was_oom(void) { int v = g_last_build_oom; g_last_build_oom = 0; return v; }
+void cuvs_set_inject_build_oom(int n_fail) { g_inject_build_oom = n_fail; }
+
+/* Return 1 (and arm g_last_build_oom) when a build should fake an OOM. */
+static int
+shim_build_oom_armed(void)
+{
+    if (g_inject_build_oom > 0) {
+        g_inject_build_oom--;
+        g_last_build_oom = 1;
+        return 1;
+    }
+    return 0;
+}
+
 CuvsCagraIndex
 cuvs_cagra_build(const float *vecs, int64_t n_vecs, int dim, uint32_t metric,
                  int graph_degree, int intermediate_graph_degree,
                  uint32_t build_algo, int device_id)
 { (void)graph_degree; (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
+  if (shim_build_oom_armed()) return NULL;
   return (CuvsCagraIndex) shim_new(vecs, n_vecs, dim, metric); }
 
 CuvsCagraIndex
@@ -199,6 +218,7 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
                        uint32_t build_algo, int device_id)
 {
     (void)graph_degree; (void)intermediate_graph_degree; (void)build_algo; (void)device_id;
+    if (shim_build_oom_armed()) return NULL;
     ShimIndex *ix = shim_new(NULL, total, dim, metric);
     if (!ix) return NULL;
     int64_t off = 0;

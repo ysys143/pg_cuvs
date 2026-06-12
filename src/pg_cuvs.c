@@ -4558,6 +4558,25 @@ pg_cuvs_inject_extend_oom(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+/* pg_cuvs_inject_build_oom(n_fail int) — ADR-070 Bug #3: arm synthetic OOM for
+ * the next n_fail cuvs_cagra_build calls in the daemon (0 = disarm), so a test
+ * can deterministically exercise the build evict-and-retry path. Test-only;
+ * no-op if the daemon is unavailable. */
+PG_FUNCTION_INFO_V1(pg_cuvs_inject_build_oom);
+Datum
+pg_cuvs_inject_build_oom(PG_FUNCTION_ARGS)
+{
+    int32 n_fail = PG_GETARG_INT32(0);
+    int   rc;
+
+    rc = cuvs_ipc_inject_build_oom(cuvs_socket_path, (int)n_fail);
+    if (rc != CUVS_STATUS_OK && rc != CUVS_STATUS_UNAVAILABLE)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_cuvs_inject_build_oom: daemon returned status %d", rc)));
+    PG_RETURN_VOID();
+}
+
 PG_FUNCTION_INFO_V1(pg_cuvs_gc_orphans);
 Datum
 pg_cuvs_gc_orphans(PG_FUNCTION_ARGS)

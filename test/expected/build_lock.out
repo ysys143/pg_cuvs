@@ -1,0 +1,53 @@
+-- build_lock.sql — ADR-069 Bug #2: handle_build / build_sharded release
+-- g_index_mutex for the multi-minute GPU build (so searches/stats/drops are not
+-- blocked), holding the build's VRAM via g_pending_build_vram. This test cannot
+-- assert the concurrency property (no starvation) deterministically in
+-- pg_regress; it verifies the two invariants that a broken restructure would
+-- violate: (1) the build still completes and the index is correct, and (2) the
+-- reservation is released — a leak would keep VRAM accounted after the entry is
+-- gone.
+--
+-- The corpus is sized so the index VRAM is >= ~2 MB, visible at the view's MB
+-- granularity (a leaked reservation would be ~that size).
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim).
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+NOTICE:  extension "pg_cuvs" already exists, skipping
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+-- Exercise the single-process build path (handle_build), where the Bug #2
+-- reservation/unlock lives.
+SET max_parallel_maintenance_workers = 0;
+-- VRAM baseline (counters are cumulative across the regression DB).
+SELECT vram_used_mb AS base FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+CREATE TABLE lockt (id int, embedding vector(64));
+INSERT INTO lockt
+SELECT g,
+       (SELECT '[' || string_agg((((g * 7 + d) % 100) * 0.01)::numeric(6,3)::text, ',')
+                    || ']'
+        FROM generate_series(1, 64) d)::vector
+FROM generate_series(1, 8000) g;
+CREATE INDEX lockt_idx ON lockt USING cagra (embedding vector_l2_ops);
+-- Build completed through the unlock/relock restructure and the index is correct:
+-- an exact (brute_force) self-query returns the row itself.
+SET cuvs.search_mode = 'brute_force';
+SELECT id FROM lockt
+ORDER BY embedding <-> (SELECT embedding FROM lockt WHERE id = 42)
+LIMIT 1;
+ id 
+----
+ 42
+(1 row)
+
+-- Drop the index; the daemon frees the entry. A leaked build reservation would
+-- keep VRAM accounted on the device after the entry is gone.
+DROP TABLE lockt;
+SELECT (vram_used_mb <= :base) AS bug2_no_reservation_leak
+FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
+ bug2_no_reservation_leak 
+--------------------------
+ t
+(1 row)
+

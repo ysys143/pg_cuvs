@@ -40,6 +40,8 @@
 #define CUVS_OP_SEARCH_STREAM_BF 19 /* ADR-064: out-of-core filtered BF — gather filter-passing
                                      * vectors from the .vectors sidecar (pread), chunked GPU BF,
                                      * running top-k merge. cmd.n_vecs carries the per-chunk cap. */
+#define CUVS_OP_INJECT_BUILD_OOM 20 /* ADR-070: arm synthetic OOM for the next N cuvs_cagra_build
+                                     * calls (cmd.dim = N; 0 = disarm) to test evict-and-retry. */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -623,6 +625,13 @@ int cuvs_ipc_free_vram(
 int cuvs_ipc_inject_extend_oom(
     const char *socket_path,
     int         enable          /* 1 = inject OOM on next extend, 0 = clear */
+);
+
+/* test (ADR-070 Bug #3): arm synthetic OOM for the next n_fail cuvs_cagra_build
+ * calls in the daemon (0 = disarm), to exercise the build evict-and-retry path. */
+int cuvs_ipc_inject_build_oom(
+    const char *socket_path,
+    int         n_fail          /* number of subsequent builds to fail with OOM */
 );
 
 /* Circuit breaker state machine moved to cuvs_util.h (structural commit). */

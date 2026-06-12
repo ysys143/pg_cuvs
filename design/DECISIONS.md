@@ -2709,3 +2709,82 @@ CROSSOVER §8)이고 보정엔 촘촘한 교차곡선이 필요한데, 순진하
 관련: ADR-039(BF 자동선택), ADR-044(프로파일링), ADR-061(전략·표적 세그먼트), ADR-063/064(필터
 경로), CROSSOVER §8(코스트모델 재보정 플래그). 트랙: 제품(P0–P5)과 논문(R1–R5) 분리, 상세는
 프로토콜 §14.
+
+---
+
+## ADR-070 — 자원 거버넌스 원칙(어떤 레버가 무엇을 통제하나) + 확정 버그 3개
+
+**날짜**: 2026-06-11
+**상태**: ACCEPTED / 원칙 채택 + 버그 3개 수정 진행 (repo 공개 전 하드닝)
+
+### 배경
+
+"pg_cuvs가 `maintenance_work_mem`을 준수하나?"라는 질문에서 출발해 표준 PostgreSQL 레버
+전반의 준수 여부를 감사하고, 적대적 리뷰 2라운드(PG-시맨틱·운영-SRE·GPU-시스템 렌즈)로 정책 초안을
+검증했다. 두 라운드가 초기 가설("문제되는 host 자원을 표준 PG 레버로 천장 씌우자")을 상당 부분
+반증했고, 그 과정에서 **정책과 무관하게 코드로 확정된 버그 3개**가 드러났다.
+
+### 결정: 자원이 *실제 사는 곳*으로 강제 계층을 고른다
+
+표준 PG 레버는 **PG 자신의 enforcement 기계(fd.c temp 파일, MemoryContext palloc, executor 취소)를
+통과하는 자원만** 강제할 수 있다. pg_cuvs의 핵심 자원(memfd/shm 코퍼스, 데몬 host RAM, GPU VRAM,
+외부 아티팩트)은 전부 그 밖이다. 따라서:
+
+| 자원 | 진짜 enforcement 레버 | cuvs 자체 레버의 역할 |
+|------|----------------------|----------------------|
+| PG 기계 내부 (취소·병렬 grant·플래너·VACUUM) | 표준 PG 레버 — **이미 준수** | 없음, 유지 |
+| host RAM (코퍼스·데몬 배열) | **OS/cgroup** (`MemoryMax=`, `RLIMIT_AS`) | `cuvs.max_build_mem_mb`는 cgroup 벽 닿기 전 깨끗한 ERROR를 내는 soft fail-fast일 뿐(보증 아님). 대안: 코퍼스를 PG `BufFile`로 옮기면 `temp_file_limit`이 *진짜로* 적용 |
+| VRAM (빌드 scratch) | **reactive evict-and-retry** + RMM pool release-threshold cap | `cuvs.max_vram_per_gpu`는 soft admission floor, 예측 천장 아님 |
+| 정확성/복제 (아티팩트) | **백엔드가** `.tids` 헤더에 system_identifier+timeline 스탬프 + plan-time 검증(데몬은 백엔드 판정을 신뢰만) | timeline 불일치→ERROR(fail-closed); 부재→degrade+SQL-level WARNING |
+
+**철회(category error로 확정)**:
+- `maintenance_work_mem`-as-build-ceiling — 의미 불일치(scratch≠full materialization), 기본 64MB면
+  정상 빌드도 ERROR, per-backend라 system-wide 아님, 병렬 워커당 N배.
+- `temp_file_limit`-on-memfd/shm — PG의 `fd.c`가 이 fd들을 절대 못 봄. 노브가 거짓말을 함.
+
+### 확정 버그 3개 (코드 검증 완료, 이번에 수정)
+
+1. **VRAM 회계 누락** — `total_vram_used`(`pg_cuvs_server.c:560-582`)가 unsharded `main_bf_vram_bytes`,
+   sharded `shards[].bf_vram_bytes`를 합산 안 함 → eviction 과약정 → 빌드/검색 OOM. (IVF-PQ는
+   `vram_bytes`와 `ivfpq_vram_bytes`를 둘 다 set하므로 후자를 더하면 이중계상 — 주의.)
+2. **빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드(`cuvs_cagra_build`,
+   수 분)·디스크 I/O 내내 보유 → 그동안 모든 검색/통계/드롭 블록. 뮤텍스가 진짜 필요한 건 VRAM 회계와
+   registry swap뿐. → reservation-counter로 GPU 빌드 구간 언락.
+3. **빌드 OOM evict-retry 부재** — `cuvs_cagra_build` NULL(OOM 구분 불가) 시 즉시 BUILD_FAILED.
+   `estimate_vram_bytes`가 빌드 scratch를 빼므로 사전 `ensure_vram` 통과 후에도 OOM 가능. OOM 신호
+   (`cuvs_last_build_was_oom`, RMM `bad_alloc` 포함) + `inject_build_oom` seam(opcode 20) + 데몬이 OOM 시
+   evict 후 1회 재시도. **수정 완료**.
+
+**부수 발견 — IVF-PQ eviction 크래시(기존 잠복 버그)**: #3 retry를 Tier-1 CI에 올리자 데몬이 SEGV. ASAN
+백트레이스로 근본 원인 확정 — `evict_lru → save_index → cuvs_cagra_serialize(e->handle)`인데 IVF-PQ 엔트리는
+`e->handle==NULL`(인덱스가 `ivfpq_handle`에 있음) → NULL deref. `ivfpq_smoke`가 남긴 IVF-PQ 인덱스가 LRU일 때
+retry의 `evict_lru`가 이를 건드려 터짐. **IVF-PQ 인덱스는 원래부터 안전하게 evict 불가**(maxidx는 CAGRA-only라
+못 잡음; ADR-068 soft-LRU의 사각). 수정: `evict_lru`에 IVF-PQ 분기(아티팩트 durable → save 없이 free +
+reload-on-demand, sharded 패턴) + `save_index` NULL-handle 방어. **ASAN을 Tier-1 데몬 빌드에 상시 편입**(UAF/오버플로 커버).
+
+### 대안 기각
+
+- **데몬을 거버넌스 권위자로(admission control)**: 데몬은 PG 내부(pg_control/timeline)를 못 읽고, 코퍼스는
+  백엔드가 접촉 전 이미 할당하며, system_identifier는 standby에서 primary와 동일(클론). 새 IPC 왕복+lease+
+  TOCTOU 처리가 필요한 무거운 신규 설계 → 이번 미채택, 백로그.
+- **빌드 scratch를 정적 배수(3-10x)로 예측**: intermediate/graph degree·IVF-PQ vs NN-descent·AUTO 불투명,
+  cuVS에 peak 질의 API 없음 → 과거부+과소부 동시. reactive evict-retry가 정답(버그 #3).
+
+### 검증
+
+Tier-1 CPU shim 회귀(installcheck, **PR #54 GREEN 27/27, 데몬 ASAN 빌드**): `vram_accounting`(버그#1),
+`build_lock`(버그#2 — 빌드 정상 + reservation no-leak), `build_oom`(버그#3 — OOM 1회 주입 → evict + retry 성공),
+`build_multi_oom`(#2/#3을 **병렬빌드 `handle_build_multi`**에 적용 — 강제 병렬 + OOM → evict + retry, 데몬 로그로
+`[handle_build_multi] build OOM ... retrying` 확인). 모두 ASAN 무크래시. **#2/#3은 세 빌드 경로 전부 적용**
+(`handle_build`/`build_sharded`/`handle_build_multi`). 빌드 락 **동시성**(starvation 부재)과 `build_sharded`
+멀티GPU는 단일 클라이언트·단일 GPU shim으로 검증 불가 → Tier-2. 대형 항목(cgroup 가이드, scratch-aware admission,
+백엔드 스탬프, corpus→BufFile, daemon host-bytes cap)은 ROADMAP 트리거 백로그.
+
+**Tier-2 검증 (A100, cuVS, 2026-06-11)**: installcheck **30/30** + isolation **3/3** 실 GPU 통과(신규 4종·IVF-PQ
+eviction·병렬빌드 포함; shim reconcile expected가 실 GPU와 일치). **빌드 락 starvation 부재 확정** — 6.97초 GPU
+빌드 중 동시 검색 25회 각 50–110ms(블록 없음). 잔여: `build_sharded` 멀티GPU(2+ GPU 필요, dev VM은 단일 A100).
+
+### 후속
+
+관련: [[ADR-068]](MAX_INDEXES 소프트 LRU — 같은 eviction/회계 경로), [[ADR-065]](VRAM 자기-회계),
+[[ADR-057]](corpus 핸드오프). 보고서: `docs/reports/2026-06-11-resource-governance-audit.md`.

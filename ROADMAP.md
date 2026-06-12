@@ -54,9 +54,23 @@
 
 > **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **다음 순차 작업: 릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조). **릴리스 준비 후 순차: 엄밀 벤치마크 + 코스트모델 보정**(ADR-069, [design/BENCHMARK_PROTOCOL.md](design/BENCHMARK_PROTOCOL.md) — Stage A 물리 실측 → Stage B regret 보정 루프 → 동결 → 필터/증분/Pareto 스위트. 논문 트랙 R1–R5는 별도 일정).
 
+### 자원 거버넌스 하드닝 — 확정 버그 3개 (ADR-070, PR #54)
+
+> 자원 거버넌스 감사 + 적대적 리뷰 2라운드에서 **정책과 무관하게 코드로 확정된 버그 3개**(+IVF-PQ eviction 부수 발견). PR #54에서 전부 출고 — **Tier-1 GREEN 26/26, 데몬 ASAN 빌드**. 큰 거버넌스 항목은 트리거 백로그로 분리.
+
+- **[OK] VRAM 회계 누락** — `total_vram_used`가 unsharded `main_bf_vram_bytes` / sharded `shards[].bf_vram_bytes` 미합산 → eviction 과약정 → OOM. (IVF-PQ `ivfpq_vram_bytes`는 `vram_bytes`와 중복이라 비-합산.) **완료**: `vram_accounting.sql`.
+- **[OK] 빌드 락 starvation** — `handle_build`/`build_sharded`가 `g_index_mutex`를 GPU 빌드 내내 보유 → 검색/통계/드롭 블록. **완료**: reservation-counter(`g_pending_build_vram`)로 GPU 빌드 구간 언락(양 경로); `build_lock.sql`. 동시성(starvation 부재)·`build_sharded` 멀티GPU는 Tier-2.
+- **[OK] 빌드 OOM evict-retry** — OOM 신호(`cuvs_last_build_was_oom`)+`inject_build_oom`(opcode 20)+evict 후 1회 재시도. **완료**: `build_oom.sql`(ASAN 무크래시).
+- **[OK] (부수) IVF-PQ eviction 크래시** — `evict_lru→save_index→cuvs_cagra_serialize(NULL handle)` SEGV(IVF-PQ는 `handle==NULL`). 기존 잠복(IVF-PQ 인덱스 evict 불가); #3 retry가 ASAN으로 노출. **완료**: `evict_lru` IVF-PQ 분기(save 없이 free+reload) + `save_index` NULL 방어 + Tier-1 데몬 ASAN 상시.
+- **[OK] 병렬빌드(handle_build_multi)에 #2/#3 적용** — ADR-058/059 병렬 경로(대형·OOM 빈발)는 단일 경로와 별개라 미적용이었음. **완료**: 동일 reservation/unlock + OOM evict-retry 적용. `build_multi_oom.sql`(강제 병렬 + OOM → evict + retry, 데몬 로그 `[handle_build_multi]` 확인). #2/#3은 이제 세 빌드 경로 전부 커버.
+
+대상: `src/pg_cuvs_server.c` · `src/cuvs_wrapper.{cu,h}` · `src/cuvs_wrapper_shim_cpu.c` · `src/pg_cuvs.c` · `.github/workflows/ci.yml`(ASAN) · `test/sql/{vram_accounting,build_lock,build_oom,build_multi_oom}.sql` | ADR-070
+
 ### 릴리스 준비 — 문서·운영 정비 (순차)
 
 > repo가 PUBLIC이 된 지금, 외부 사용자·기여자·운영자가 **현행 제품을 ADR 발굴 없이** 이해·운용할 수 있어야 한다. 현 문서는 ADR 69개(`DECISIONS.md` 214KB) + `PLAN.md`(1523줄) + 분산 design/docs로 **역사적 근거·작업메모 누적**에 가까워, 현재 제품의 기능·아키텍처·적용 기법·고려사항을 일목요연하게 볼 단일 reference가 없다(README가 유일 개요).
+
+> **입력 자료**: [`docs/levers-and-governance.md`](docs/levers-and-governance.md) — 레버 카탈로그(GUC 34/reloption 11/데몬플래그 9, 소스 추출) + 표준 PG 레버 거버넌스(ADR-070 운영자 버전) + 세션 학습(PR#54) + **문서화 감사 결과(§5: 드리프트·미설명 레버·backport TODO 체크리스트)**. 아래 "문서 정합성/현행화"·"운영 플레이북"·"References"가 이 문서를 승격·소비한다.
 
 - **문서 정합성/현행화 (current-state reference 정비)**
   - `ARCHITECTURE.md`(신규): 현행 컴포넌트(확장 `.so` / sidecar 데몬 / shmem IPC), 데이터·제어 흐름, 인덱스 생애주기(build→serialize→load→evict→reload), VRAM 자기-회계, 멀티-GPU 샤딩, GCS 스냅샷.
@@ -110,8 +124,15 @@
 | **SQL latency split** | 감사 #1. `pg_stat_gpu_search`에 GPU/IPC/recheck 분해 미노출. | 코드(데몬 계측 + IPC + SQL 컬럼) | 명시 요청 시(ADR-044가 외부 측정 완료, SQL 노출 한계가치 낮음) |
 | **delta 누적 성능 저하 관측성** | brute-force 머지가 O(n_delta)라 delta 누적 시 검색 성능 저하. 현재 SQL로 "지금 REINDEX 해야 하나" 판단 기준 없음 — `pg_stat_gpu_search`에 delta 누적 경보 signal 미노출. | 코드(`pg_stat_gpu_search`에 `delta_ratio` 또는 `delta_warn` 컬럼 추가) | delta 누적 운영 문제 실측 시 |
 | **자동 티어링 없음** | VRAM 압박 시 CAGRA → IVF-PQ / HNSW 자동 강등 없음. LRU 축출(3E/3F/3G)은 인덱스를 디스크로 내리지만 포맷 변환은 수동 — 운영자가 직접 `CREATE INDEX USING ivfpq` 또는 `pg_cuvs_build_hnsw()` 재실행 필요. VRAM 초과 시 `안전하게 실패`는 보장하나 `자동 품질 강등`은 미구현. | 코드(VRAM 임계값 도달 시 daemon이 대상 인덱스를 IVF-PQ로 자동 변환 또는 HNSW export 트리거) | VRAM 관리 자동화 명시 수요 시 (3P + 3I 완료가 선결) |
+| **host RAM cgroup 가이드** | ADR-070. memfd/shm 코퍼스·데몬 배열은 PG 회계 밖 → `maintenance_work_mem`/`temp_file_limit`로 강제 불가(category error). 진짜 천장은 OS/cgroup(`systemd MemoryMax=`, `RLIMIT_AS`). | 문서(OPS 플레이북에 cgroup/슬라이스 설정 + RSS 모니터링) | 멀티테넌트 프로덕션 배포 시 |
+| **scratch-aware VRAM admission** | ADR-070. `estimate_vram_bytes`가 CAGRA 빌드 scratch(IVF-PQ intermediate ~3-10x) 미포함 → 사전 admission이 빌드 OOM을 못 막음(버그 #3 reactive retry로 1차 완화). | 코드(intermediate/graph degree 기반 동적 추정 또는 RMM pool cap) | 대규모 빌드 OOM 실측 시 |
+| **백엔드 아티팩트 스탬프(timeline/system_identifier)** | ADR-070. 외부 아티팩트가 WAL/복제 밖 → standby/PITR에서 timeline 발산 시 stale 결과 위험. 데몬은 pg_control/timeline 못 읽음 → 백엔드가 `.tids` 헤더 스탬프 + plan-time 검증해야 fail-closed 가능. | 코드(사이드카 포맷 + 백엔드 검증) | replica/PITR 정합성 요구 시 |
+| **corpus → BufFile 옵션** | ADR-070. 코퍼스를 PG `BufFile` temp 파일로 옮기면 `temp_file_limit`이 *진짜로* 적용(디스크 백킹 트레이드오프). 메모리 제약 환경 대안. | 코드(corpus tier에 BufFile 추가) | host RAM 제약 환경 수요 시 |
+| **daemon host-bytes cap + evict-on-host-pressure** | ADR-070. resident host 배열(`rev_tids`/`rev_item_ids`/`tids` ~20B/vec)이 개수 LRU(`g_max_indexes`)로만 제한 → host RAM은 인덱스 크기 비례 누적. | 코드(host-bytes 카운터 + host 압박 시 eviction) | 데몬 host RSS 누적 실측 시 |
+| ~~**빌드 락 동시성 Tier-2 검증**~~ [OK] | ADR-070. #2 unlock의 starvation-부재(동시 검색 비차단) 검증. | **완료** (A100, 2026-06-11): 6.97s GPU 빌드 중 동시 검색 25회 각 50–110ms(블록 없음). installcheck 30/30 + isolation 3/3. |
+| **`build_sharded` 멀티GPU 검증** | ADR-070. 샤드 빌드의 reservation/eviction은 2+ GPU 필요(dev VM은 단일 A100). | Tier-2 멀티GPU VM | 멀티GPU 배포/회귀 의심 시 |
 
-스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 | `design/OPS_GPU_PLAYBOOK.md`
+스펙: `docs/spec-audit-2026-06-05.md` | ADR-011 / ADR-017 / ADR-070 | `design/OPS_GPU_PLAYBOOK.md`
 
 ### 기타
 

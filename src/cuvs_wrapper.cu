@@ -64,6 +64,13 @@ static DevicePool g_device_pools[CUVS_MAX_GPUS];
 /* test-only: armed by cuvs_set_inject_extend_oom(); self-clears in cuvs_cagra_extend */
 static std::atomic<int> g_inject_extend_oom{0};
 
+/* ADR-070 Bug #3: set when a cuvs_cagra_build[_multi] failure was an OOM
+ * (std::bad_alloc, incl. RMM out_of_memory which derives from it). Queried+cleared
+ * by the daemon via cuvs_last_build_was_oom() to decide whether to evict+retry. */
+static std::atomic<int> g_last_build_oom{0};
+/* test-only: armed by cuvs_set_inject_build_oom(n); each build decrements and fails. */
+static std::atomic<int> g_inject_build_oom{0};
+
 std::unique_ptr<raft::device_resources> acquire_res(int device_id)
 {
     DevicePool &dp = g_device_pools[device_id];
@@ -676,8 +683,15 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
                        int graph_degree, int intermediate_graph_degree,
                        uint32_t build_algo, int device_id)
 {
+    g_last_build_oom.store(0);   /* ADR-070: fresh per build attempt */
     PooledRes _pr(device_id);
     try {
+        /* test-only: simulate a VRAM OOM to exercise the daemon evict+retry path. */
+        if (g_inject_build_oom.load() > 0) {
+            g_inject_build_oom.fetch_sub(1);
+            throw std::bad_alloc();
+        }
+
         raft::device_resources &res = _pr.get();
 
         /* One device matrix for the whole corpus; moved into the impl below so
@@ -725,6 +739,13 @@ cuvs_cagra_build_multi(const float **vecs, const int64_t *n_each, int n_parts,
         res.sync_stream();
 
         return new CuvsCagraIndexImpl(std::move(d_corpus), std::move(idx));
+    } catch (const std::bad_alloc &) {
+        /* ADR-070 Bug #3: OOM (incl. RMM out_of_memory). Flag it so the daemon
+         * evicts an LRU index and retries before failing the build. */
+        fprintf(stderr, "[cuvs_cagra_build_multi] out of memory\n");
+        g_last_build_oom.store(1);
+        _pr.poison();
+        return nullptr;
     } catch (const std::exception &e) {
         fprintf(stderr, "[cuvs_cagra_build_multi] exception: %s\n", e.what());
         _pr.poison();
@@ -1553,6 +1574,18 @@ extern "C" void
 cuvs_set_inject_extend_oom(int enable)
 {
     g_inject_extend_oom.store(enable);
+}
+
+extern "C" int
+cuvs_last_build_was_oom(void)
+{
+    return g_last_build_oom.exchange(0);   /* read and clear */
+}
+
+extern "C" void
+cuvs_set_inject_build_oom(int n_fail)
+{
+    g_inject_build_oom.store(n_fail);
 }
 
 extern "C" int
