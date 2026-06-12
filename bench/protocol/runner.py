@@ -89,10 +89,11 @@ def setup_table(conn, table, corpus, n, dim, batch=50000):
 
 # ── plan guard (issue #56): cuvs must NOT seq-scan ───────────────────────────
 
-def explain_uses_index(conn, table, query_literal, index_substr):
+def explain_uses_index(conn, table, qvec, index_substr):
+    from pgvector import Vector
     with conn.cursor() as cur:
-        cur.execute(f"EXPLAIN SELECT id FROM {table} ORDER BY embedding <-> "
-                    f"'{query_literal}'::vector LIMIT 10")
+        cur.execute(f"EXPLAIN SELECT id FROM {table} ORDER BY embedding <-> %s "
+                    f"LIMIT 10", (Vector(qvec),))
         plan = "\n".join(r[0] for r in cur.fetchall())
     return (index_substr in plan) and ("Seq Scan" not in plan), plan
 
@@ -139,6 +140,13 @@ def vec_literal(v):
 def run_queries(conn, table, queries, kmax, set_sql, index_dir, config,
                 warmup=200, lat_cap=2000):
     import numpy as np
+    from pgvector import Vector
+    # Bind the query vector as a parameter (NOT an inline literal). Inlining a
+    # 1024-d vector as SQL text costs ~1ms of parse per query — a large fraction
+    # of CAGRA's fast path — and is not how apps query. Binding + psycopg's
+    # auto-prepare (after warmup) is the realistic steady state and isolates the
+    # engine cost. The cuvs/hnsw index AMs both support a parameterized order-by.
+    sql = f"SELECT id FROM {table} ORDER BY embedding <-> %s LIMIT {kmax}"
     with conn.cursor() as cur:
         # plan-forcing GUCs are session-level (set once in main); here we only
         # apply the per-sweep knob.
@@ -147,8 +155,7 @@ def run_queries(conn, table, queries, kmax, set_sql, index_dir, config,
         nq = len(queries)
 
         def one(i):
-            cur.execute(f"SELECT id FROM {table} ORDER BY embedding <-> "
-                        f"'{vec_literal(queries[i])}'::vector LIMIT {kmax}")
+            cur.execute(sql, (Vector(queries[i]),))
             return cur.fetchall()
 
         for i in range(min(warmup, nq)):
@@ -323,7 +330,7 @@ def main():
     # ── plan guard for cuvs (issue #56) ──────────────────────────────────────
     if a.config == "forced-cuvs":
         conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
-        ok, plan = explain_uses_index(conn, table, vec_literal(queries[0]), "cagra")
+        ok, plan = explain_uses_index(conn, table, queries[0], "cagra")
         if not ok:
             sys.exit(f"[runner] FAIL: cuvs plan is not using the cagra index "
                      f"(seq-scan fallback — check cuvs.index_dir / daemon). plan:\n{plan}")

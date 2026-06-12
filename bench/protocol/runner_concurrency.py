@@ -155,8 +155,7 @@ def main():
     runner.setup_table(conn, table, a.corpus, n, dim)
     name, index_type = ensure_index(conn, a.config, table, n, a.index_dir)
     if a.config == "forced-cuvs":
-        ok, plan = runner.explain_uses_index(conn, table,
-                                             runner.vec_literal(queries[0]), "cagra")
+        ok, plan = runner.explain_uses_index(conn, table, queries[0], "cagra")
         if not ok:
             sys.exit(f"[concurrency] FAIL: cuvs seq-scan fallback. plan:\n{plan}")
     set_sql, knob, _, met = runner.choose_iso_recall(
