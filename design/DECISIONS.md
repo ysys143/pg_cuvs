@@ -2709,3 +2709,49 @@ CROSSOVER §8)이고 보정엔 촘촘한 교차곡선이 필요한데, 순진하
 관련: ADR-039(BF 자동선택), ADR-044(프로파일링), ADR-061(전략·표적 세그먼트), ADR-063/064(필터
 경로), CROSSOVER §8(코스트모델 재보정 플래그). 트랙: 제품(P0–P5)과 논문(R1–R5) 분리, 상세는
 프로토콜 §14.
+
+## ADR-070 — standalone `bruteforce` AM: no-graph-build exact GPU 검색
+
+**날짜**: 2026-06-12
+**상태**: ACCEPTED / 설계 확정, 구현 미착수 (구현 담당: 로컬/VM 세션, 핸드오프: 이슈 #56)
+
+**문제**: GPU exact brute-force가 **단독 실행 불가**. 현재 BF는 cagra 인덱스의
+`cuvs.search_mode=brute_force` 모드로만 접근 가능 → `CREATE INDEX USING cagra`(비싼 그래프
+빌드)를 강제당한다. 그런데 데몬 BF 검색 경로는 `.vectors`+`.tids` 사이드카만 읽고 `.cagra`
+그래프는 **전혀 보지 않는다**(검증: `pg_cuvs_server.c:985-1049` — `CuvsBfIndex`는 `.vectors`를
+`cuvs_vectors_read`로 lazily 빌드, "brute_force must never evict a base CAGRA index"). 즉 BF에게
+그래프는 순수 dead weight인데 빌드가 강제로 생산한다. 이는 BF의 **시그니처 가치 = no-build**
+(즉시 쿼리·항상 최신·exact·유지보수 0)를 무효화한다. 측정 근거(operational-guide.md): gpu-bf가
+cpu-seq를 60–500× 압도하고, N≲50k에선 cagra보다도 빠르다(exact인데).
+
+**결정**: standalone **`bruteforce` AM** 추가. 빌드는 `.tids`+`.vectors` 사이드카만 생성하고
+`cuvsCagraBuild`(그래프 구축)를 **스킵**한다. 검색·비용 분기·사이드카 I/O는 **기존 BF 경로를
+그대로 재사용**(데몬 검색 코드 무변경). 이로써 BF가 그래프 없이 빌드(=O(N) 복사 수준)되고,
+3-path 결정면({cpu-seq, gpu-bf, gpu-cagra})에서 gpu-bf가 **독립 비용화 가능한 1급 경로**가 된다.
+
+**구현 (로컬, 6 touch-point)**:
+1. AM 등록 — `sql/`: `CREATE ACCESS METHOD bruteforce HANDLER ...` + opclass(`vector_l2_ops` 등).
+2. `ambuild` — 데몬에 "vectors-only build" 요청 → `.tids`+`.vectors`만 persist, 그래프 스킵.
+3. IPC build frame에 `vectors_only` 플래그 1개 추가(`cuvs_ipc.c`).
+4. 데몬 `handle_build` — 플래그 set 시 `cuvsCagraBuild` 분기 스킵, `.tids`+`.vectors`만 영속화
+   (tmp+rename+fsync 경로 재사용, `pg_cuvs_server.c`).
+5. `amcostestimate` — 기존 BF 분기(`STARTUP + ROWS·N`) 재사용. (`CUVS_STARTUP_COST` 보정은 별건.)
+6. `amgettuple`/search — 기존 BF 검색 경로 재사용(데몬 무변경).
+   검증: `make installcheck` 녹색 + GHA `build=true` 회귀.
+
+**합격 기준**: `CREATE INDEX ... USING bruteforce`가 그래프 없이 빌드되고(빌드시간이 동일 N의
+cagra 대비 대폭↓), 검색 recall=1.0, VRAM에 그래프 부재(사이드카만 상주), gpu-bf 쿼리 성능이
+기존 "cagra+search_mode=bf"와 동등.
+
+**대안 기각**: (A) `cagra WITH (build_graph=false)` reloption — 최소 변경이나 의미론 어색("그래프
+없는 cagra 인덱스")이고 플래너가 BF를 독립 경로로 비용화 못함 → 임시방편으로만 가치, 정석 아님.
+(C) 순수 heap-scan custom scan(아티팩트 0, 진짜 no-build) — `.tids` 생성/MVCC·TOAST 매 쿼리
+재마샬링 비용 + seqscan 대체 노드라 hook이 달라 변경 규모 큼 → 후속 백로그.
+
+**정직한 한계**: standalone BF도 `.vectors` 사이드카(원본 코퍼스 N·dim·4B; 1M·1024≈4GB)를
+디스크/VRAM에 상주시킨다 → 큰 N에서 VRAM 압박(`bf_float16`/스트림 BF ADR-064로 완화). 따라서
+이건 "진짜 no-build(아티팩트 0)"가 아니라 **"no-graph-build(O(N) 사이드카만)"**이다. 또한
+load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이 ADR 범위 밖(별도 작업).
+
+관련: ADR-039(BF 자동선택), ADR-064(스트림/OOC BF), ADR-069(벤치 프로토콜),
+[operational-guide.md](operational-guide.md)(측정 근거 — gpu-bf vs cpu-seq/cagra), 이슈 #56(핸드오프).
