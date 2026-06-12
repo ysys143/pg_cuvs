@@ -23,7 +23,9 @@ import seaborn as sns
 
 # config id -> display label / colour
 ENGINES = {"forced-hnsw": ("HNSW", "#e0691a"),
-           "forced-cuvs": ("CAGRA", "#1f6fe0")}
+           "forced-cuvs": ("CAGRA", "#1f6fe0"),
+           "forced-cuvs-bf": ("GPU-BF", "#11a36b"),
+           "forced-cuvs-bf-batch": ("GPU-BF+batch", "#7b2fe0")}
 SUB = "cohere 1024d · k=10 · iso-recall@10=0.95 · same-box A100 · c=1"
 
 

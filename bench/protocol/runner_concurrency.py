@@ -27,7 +27,21 @@ import runner   # noqa: E402  reuse setup_table/build_index/choose_iso_recall/et
 # cap at 64: the VM PG default max_connections (~100) refuses c=128, and the
 # single-daemon throughput ceiling is already visible by c≈8. 4/16 resolve the knee.
 CLIENTS = [1, 4, 8, 16, 32, 64]
-KNOB_GUC = {"forced-hnsw": "hnsw.ef_search", "forced-cuvs": "cuvs.k"}
+# CAGRA (ANN) + two EXACT GPU brute-force variants. BF reuses the cagra index's
+# .vectors sidecar (cuvs.search_mode=brute_force) — no separate build. With
+# bf_batch_wait_us>0 the daemon coalesces concurrent BF requests into ONE GPU
+# pass (Phase 3L): the lever that lets concurrency RAISE GPU throughput instead
+# of just queueing behind the single-stream CAGRA path.
+BF_WAIT_US = int(os.environ.get("PGCUVS_BF_BATCH_WAIT_US", "1000"))
+CUVS_SEARCH = {
+    "forced-cuvs":          (None, None),                # CAGRA ANN (approx)
+    "forced-cuvs-bf":       ("brute_force", 0),          # exact GPU BF, no coalescing
+    "forced-cuvs-bf-batch": ("brute_force", BF_WAIT_US), # exact GPU BF + coalescing
+}
+CUVS_CONFIGS = tuple(CUVS_SEARCH)
+KNOB_GUC = {"forced-hnsw": "hnsw.ef_search",
+            "forced-cuvs": "cuvs.k", "forced-cuvs-bf": "cuvs.k",
+            "forced-cuvs-bf-batch": "cuvs.k"}
 
 
 def index_exists(conn, name):
@@ -37,14 +51,17 @@ def index_exists(conn, name):
 
 
 def ensure_index(conn, config, table, n, index_dir):
-    """Reuse the index from a prior Stage A run if present; else build it."""
-    suffix = {"forced-hnsw": "_hnsw", "forced-cuvs": "_cagra"}.get(config)
-    itype = {"forced-hnsw": "hnsw", "forced-cuvs": "cagra"}.get(config)
+    """Reuse the index if present; else build it. All cuvs variants (CAGRA + BF)
+    share ONE cagra index — BF searches its .vectors sidecar, no separate build."""
+    is_cuvs = config in CUVS_CONFIGS
+    suffix = "_cagra" if is_cuvs else "_hnsw"
+    itype = "cagra" if is_cuvs else "hnsw"
     name = f"{table}{suffix}"
     if index_exists(conn, name):
         runner.log(f"reuse existing index {name}")
         return name, itype
-    return runner.build_index(conn, config, table, n, index_dir)[:2]
+    build_cfg = "forced-cuvs" if is_cuvs else config
+    return runner.build_index(conn, build_cfg, table, n, index_dir)[:2]
 
 
 def load_query_table(conn, queries, dim):
@@ -131,9 +148,11 @@ def main():
     from anbench_common import read_fbin
     cell = runner.parse_cell(a.cell)
     n, dim, k, target = cell["N"], cell["dim"], cell["k"], cell["recall_target"]
-    table = runner.TABLES.get(a.config)
+    is_cuvs = a.config in CUVS_CONFIGS
+    table = runner.TABLES.get(a.config) or ("t_cuvs" if is_cuvs else None)
     if table is None or a.config not in KNOB_GUC:
         raise NotImplementedError(f"concurrency config {a.config} not supported")
+    search_mode, bf_wait = CUVS_SEARCH.get(a.config, (None, None))
 
     gt_path = os.path.join(a.gt_dir, f"gt_runner_{n}.npy")
     if not os.path.exists(gt_path):
@@ -145,29 +164,38 @@ def main():
     import psycopg
     conn = psycopg.connect(dbname=a.dbname, autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    if a.config == "forced-cuvs":
+    if is_cuvs:
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
     conn.execute("SET enable_seqscan = off")
     conn.execute("SET enable_bitmapscan = off")
-    if a.config == "forced-cuvs":
+    if is_cuvs:
         conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
+    if search_mode:                       # BF variants: search the .vectors sidecar
+        conn.execute(f"SET cuvs.search_mode = '{search_mode}'")
+        conn.execute(f"SET cuvs.bf_batch_wait_us = {bf_wait}")
 
     runner.setup_table(conn, table, a.corpus, n, dim)
     name, index_type = ensure_index(conn, a.config, table, n, a.index_dir)
-    if a.config == "forced-cuvs":
+    if is_cuvs:
         ok, plan = runner.explain_uses_index(conn, table, queries[0], "cagra")
         if not ok:
             sys.exit(f"[concurrency] FAIL: cuvs seq-scan fallback. plan:\n{plan}")
+    # BF is exact (recall≈1.0); the knob sweep just picks the cuvs.k count. The
+    # search_mode GUC set above makes choose_iso_recall measure the BF path.
+    sweep_cfg = "forced-cuvs" if is_cuvs else a.config
     set_sql, knob, _, met = runner.choose_iso_recall(
-        conn, table, queries[:2000], gt[:2000], k, target, a.config, a.index_dir)
+        conn, table, queries[:2000], gt[:2000], k, target, sweep_cfg, a.index_dir)
     load_query_table(conn, queries, dim)
     conn.close()
 
     # startup GUCs for every pgbench connection (force the index + iso-recall knob)
     opts = ["-c", "enable_seqscan=off", "-c", "enable_bitmapscan=off",
             "-c", f"{KNOB_GUC[a.config]}={knob}"]
-    if a.config == "forced-cuvs":
+    if is_cuvs:
         opts += ["-c", f"cuvs.index_dir={a.index_dir}"]
+        if search_mode:
+            opts += ["-c", f"cuvs.search_mode={search_mode}",
+                     "-c", f"cuvs.bf_batch_wait_us={bf_wait}"]
     pgoptions = " ".join(opts)
     qsql = (f"\\set qid random(1, {nq})\n"
             f"SELECT id FROM {table} ORDER BY embedding <-> "
@@ -209,7 +237,9 @@ def main():
             p99_us=round(p99, 1), p999_us=round(p999, 1),
             reps=1, agg_method=f"pgbench-{dur}s",
             params_json={"knob": knob, "iso_recall_met": met,
-                         "pgbench_txns": ntx, "clients": c},
+                         "pgbench_txns": ntx, "clients": c,
+                         "search_mode": search_mode or "cagra",
+                         "bf_batch_wait_us": bf_wait or 0},
             notes="" if out.returncode == 0 else f"pgbench rc={out.returncode}",
             **s.as_dict())
         runner.log(f"conc {a.config} N={n} c={c} tps={tps:.0f} "
@@ -227,6 +257,12 @@ def _selfcheck():
     (p50, p95, p99, p999), n = pgbench_pctls(td)
     assert n == 1000 and 1490 < p50 < 1510, (p50, n)
     assert KNOB_GUC["forced-cuvs"] == "cuvs.k"
+    # BF variants: exact GPU search over the cagra .vectors sidecar; the batch
+    # variant carries a non-zero coalescing window, the plain one zero.
+    assert CUVS_SEARCH["forced-cuvs-bf"] == ("brute_force", 0)
+    assert CUVS_SEARCH["forced-cuvs-bf-batch"][0] == "brute_force"
+    assert CUVS_SEARCH["forced-cuvs-bf-batch"][1] == BF_WAIT_US
+    assert all(c in KNOB_GUC for c in CUVS_CONFIGS)
     print("SELFCHECK OK")
 
 
