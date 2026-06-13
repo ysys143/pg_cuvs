@@ -42,6 +42,9 @@
                                      * running top-k merge. cmd.n_vecs carries the per-chunk cap. */
 #define CUVS_OP_INJECT_BUILD_OOM 20 /* ADR-070: arm synthetic OOM for the next N cuvs_cagra_build
                                      * calls (cmd.dim = N; 0 = disarm) to test evict-and-retry. */
+#define CUVS_OP_BUILD_FLAT       21 /* ADR-073: build a standalone `flat` GPU exact brute-force
+                                     * index — persists .tids + .vectors only (no .cagra graph).
+                                     * Same [vectors][tids] corpus payload as CUVS_OP_BUILD. */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -378,6 +381,30 @@ int cuvs_ipc_build(
     uint32_t       graph_degree,             /* 3R; 0 = cuVS default (64) */
     uint32_t       intermediate_graph_degree,/* 3R; 0 = cuVS default (128) */
     uint32_t       build_algo                /* 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
+);
+
+/*
+ * cuvs_ipc_build_flat — ADR-073: send a BUILD_FLAT command to the daemon.
+ *
+ * Identical corpus handoff to cuvs_ipc_build (memfd/shm/heap tiers, [vectors][tids]
+ * contiguous payload), but the daemon persists only .tids + .vectors (no .cagra
+ * graph) and registers a brute-force-only IndexEntry. Flat is always unsharded and
+ * has no graph/HNSW params, so this signature drops shard_count/use_cpu_hnsw and the
+ * 3R graph-build tuning. Returns CUVS_STATUS_OK on success.
+ */
+int cuvs_ipc_build_flat(
+    const char    *socket_path,
+    uint32_t       db_oid,
+    uint32_t       index_oid,
+    const struct CuvsBuildCorpus *corpus, /* tier + fd + shm_name */
+    const float   *heap_vecs,   /* CORPUS_HEAP only; NULL otherwise */
+    const uint64_t *heap_tids,  /* CORPUS_HEAP only; NULL otherwise */
+    int64_t        n_vecs,
+    int            dim,
+    uint32_t       metric,
+    const char    *index_dir,   /* daemon saves .tids + .vectors here */
+    uint32_t       table_oid,   /* heap relation OID */
+    uint32_t       relfilenode  /* heap relfilenode (heap compat identity) */
 );
 
 /*

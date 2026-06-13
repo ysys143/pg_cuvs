@@ -874,6 +874,107 @@ cleanup:
 }
 
 /* ----------------------------------------------------------------
+ * Public API: cuvs_ipc_build_flat (ADR-073)
+ *
+ * Duplicate of cuvs_ipc_build (regression safety — the plan mandates
+ * duplicate-not-refactor for flat) that sends CUVS_OP_BUILD_FLAT. The corpus
+ * staging by tier is identical; only the op code and the (absent) graph params
+ * differ. The daemon's handle_build_flat persists .tids + .vectors and registers
+ * a brute-force-only entry — it never calls cuvs_cagra_build.
+ * ---------------------------------------------------------------- */
+int
+cuvs_ipc_build_flat(
+    const char    *socket_path,
+    uint32_t       db_oid,
+    uint32_t       index_oid,
+    const struct CuvsBuildCorpus *corpus,
+    const float   *heap_vecs,
+    const uint64_t *heap_tids,
+    int64_t        n_vecs,
+    int            dim,
+    uint32_t       metric,
+    const char    *index_dir,
+    uint32_t       table_oid,
+    uint32_t       relfilenode)
+{
+    char shm_key[64] = "";
+    int  legacy_shm_fd = -1;   /* CORPUS_HEAP only: created + unlinked here */
+    int  pass_fd = -1;         /* CORPUS_MEMFD only: passed via SCM_RIGHTS */
+    int  sock = -1;
+    int  rc   = CUVS_STATUS_ERROR;
+    CuvsCmdFrame cmd;
+    char dir_buf[256] = {0};
+    CuvsReplyHeader hdr;
+
+    /* Stage the payload by tier (identical to cuvs_ipc_build). */
+    if (corpus->kind == CORPUS_MEMFD)
+    {
+        pass_fd = corpus->fd;                 /* anonymous; daemon mmaps the fd */
+    }
+    else if (corpus->kind == CORPUS_SHM)
+    {
+        strncpy(shm_key, corpus->shm_name, sizeof(shm_key) - 1);  /* daemon shm_open by name */
+    }
+    else  /* CORPUS_HEAP: copy into a fresh named shm, unlinked at cleanup */
+    {
+        make_shm_key(shm_key, sizeof(shm_key));
+        legacy_shm_fd = shm_write_build_payload(shm_key, heap_vecs, heap_tids, n_vecs, dim);
+        if (legacy_shm_fd < 0) {
+            LOG_ERROR("[cuvs_ipc_build_flat] shm_write FAILED errno=%d (%s)\n",
+                    errno, strerror(errno));
+            goto cleanup;
+        }
+    }
+    LOG_DEBUG("[cuvs_ipc_build_flat] tier=%d shm_key=%s pass_fd=%d socket=%s n_vecs=%lld dim=%d\n",
+        (int)corpus->kind, shm_key, pass_fd, socket_path, (long long)n_vecs, dim);
+
+    sock = uds_connect_ex(socket_path, 600);  /* BUILD can take a while */
+    if (sock < 0) {
+        LOG_ERROR("[cuvs_ipc_build_flat] uds_connect FAILED errno=%d (%s)\n",
+                errno, strerror(errno));
+        rc = CUVS_STATUS_UNAVAILABLE;   /* daemon not reachable */
+        goto cleanup;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.op           = CUVS_OP_BUILD_FLAT;
+    cmd.db_oid       = db_oid;
+    cmd.index_oid    = index_oid;
+    cmd.metric       = metric;
+    cmd.dim          = (uint32_t)dim;
+    cmd.n_vecs       = n_vecs;
+    cmd.table_oid    = table_oid;
+    cmd.relfilenode  = relfilenode;
+    cmd.shard_count  = 1;   /* flat is always unsharded; daemon ignores this */
+    strncpy(cmd.shm_key, shm_key, sizeof(cmd.shm_key) - 1);  /* "" for memfd tier */
+
+    if (send_all(sock, &cmd, sizeof(cmd)) < 0)
+        goto cleanup;
+
+    /* index_dir (fixed 256B) carries the SCM_RIGHTS fd for the memfd tier; for
+     * shm/heap pass_fd is -1 and only the bytes are sent. Daemon recvmsg's both. */
+    if (index_dir)
+        strncpy(dir_buf, index_dir, sizeof(dir_buf) - 1);
+    if (cuvs_fd_send(sock, pass_fd, dir_buf, sizeof(dir_buf)) < 0)
+        goto cleanup;
+
+    if (recv_all(sock, &hdr, sizeof(hdr)) < 0)
+        goto cleanup;
+
+    rc = (int)hdr.status;
+
+cleanup:
+    if (sock >= 0)
+        close(sock);
+    if (legacy_shm_fd >= 0)
+    {
+        close(legacy_shm_fd);
+        shm_unlink(shm_key);
+    }
+    return rc;
+}
+
+/* ----------------------------------------------------------------
  * Public API: cuvs_ipc_build_multi (ADR-059)
  *
  * Like cuvs_ipc_build but references N worker named-shm partials instead of one
