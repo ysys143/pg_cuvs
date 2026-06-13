@@ -2856,9 +2856,55 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 - **방향 2 (PQFlash 포크/어댑터)**: MS DiskANN 리더를 포크해 cuVS 레이아웃을 읽게 함. 기각 — 얻는 건 CPU 검색(GPU 가치 0 = pgvectorscale 영역)인데 **MS DiskANN 포크 + cuVS·DiskANN 두 moving target을 동시 유지**해야 함(둘 중 하나만 포맷 바꿔도 깨짐). 최악의 유지보수 위치.
 - **자체(in-tree) 포크로 방향 3 수행**: 업스트림 PR 거부 시에만 고려. 기본은 업스트림.
 - **즉시 착수**: 기각 — ADR-026 트리거 미충족(세그먼트 비표적·CPU+NVMe 경제성 우위). VRAM 천장 밀기는 IVF-PQ(3P/ADR-049)·streaming BF(ADR-064)로 이미 처리됨.
+- **vchord 공존으로 cold tier 대체** (2026-06-14 검토): DiskANN 라이브러리 대신 VectorChord(RaBitQ, CPU)를 large-N cold tier로 채택하고 공존시키는 안. vchord는 프로덕션 검증(3.2B halfvec, p50 761ms)·50M recall 0.9991·cuVS 블로커 없음·노력 ≈0(추천/공존)으로 단기 리스크가 낮다. 그럼에도 **기각** — (a) AGPL-3.0 전염 + 우리 manifest/fail-closed/GCS-snapshot 거버넌스 **밖**, (b) 별도 확장이라 "self-contained hot+cold 단일 시스템" 제품 서사가 깨짐, (c) GPU 빌드 레버리지가 k-means(=pgpu 영토)로 축소. 서빙은 양쪽 다 CPU+NVMe rerank로 동급이나, **소유권·permissive 라이선스(MS DiskANN MIT + cuVS Apache-2.0)·통합 거버넌스**를 cold tier에서도 유지하는 쪽이 제품 목표에 부합. → cold tier는 우리가 소유한다(DiskANN 라이브러리). 단 vchord를 우리가 GPU-가속하지는 않는다(pgpu가 이미 한 일, ADR 비교는 본 ADR 말미 참조). 대규모 수요자에겐 vchord/pgpu를 공존 선택지로 안내하되 plan of record는 아니다.
 
 **cuVS 업스트림 이슈 매핑** (스파이크 발견 = 이미 트래킹, 전부 OPEN, milestone 없음): #2197 Vamana/DiskANN search on GPU(방향 1) · #1501 Vamana SSD index ↔ diskannpy 호환(방향 3, #905 의존) · #1380 host-dataset build `cudaErrorIllegalAddress` · #905 OPQ codebooks/rotation. (+ #1753/#1943 fp16, #1423 cuvs-bench, #906 disk 포맷 문서). 비고: cuVS가 26.08에서 Vamana 활발(#2214 device permute, 예제 DRAFT #2064) → 우선순위 상향 advocate 적기.
 
 **순위**: 방향 3(업스트림 기여) > 방향 1(advocate) > 방향 2(회피).
 
 관련: ADR-025(50M 벤치·포지셔닝), ADR-026(3B go/no-go·트리거), ADR-061(전략·표적 세그먼트), ADR-049(IVF-PQ), ADR-064(streaming BF), PHASE_3B_SPIKE.md / PHASE_3B_DECISION.md.
+
+**업계 선례 — EDB pgpu / VectorChord** (2026-06-14 비교): pgpu(EnterpriseDB, Rust/pgrx, AGPL-3.0, v2.0.0)는 cuVS **k-means centroid만** GPU로 계산해 vchord external-build에 넘기는 "GPU 빌드 가속기"다 — 검색은 vchord(CPU). 즉 우리 3I/방향 3과 같은 "GPU 빌드 → CPU 서빙" 철학의 상용 선례이나 **인덱스 계열이 IVF로 다르고 Vamana/PQFlash와 무관**하므로 DiskANN 구현 참조 가치는 없고(난관=cuVS #1501 PQFlash serializer), 전략 패턴 검증 의미만 있다. EDB의 다른 GPU 자료(spark-rapids-tutorial)는 OLAP를 외부 Spark+RAPIDS로 오프로드하는 튜토리얼로 벡터 검색과 무관. 요지: **EDB 노선 = GPU build/analytics 오프로드, in-Postgres GPU search 부재** → pg_cuvs의 GPU filtered exact hot tier 자리는 미개척으로 남아 있고, cold tier 소유(본 ADR)는 그와 별개의 통합·라이선스 판단이다.
+
+---
+
+## ADR-073 — GPU exact brute-force 1급화: 상주 `flat` AM (A1) + transient 무인덱스 (B, 후속) + 플래너 라우팅
+
+**날짜**: 2026-06-14
+**상태**: ACCEPTED. **A1(`flat` 상주 AM) 구현·VM 검증 완료**(2026-06-14, A100). B(transient)·라우팅 캘리브레이션은 후속 단계(미착수). ADR-071을 **흡수/supersede**한다.
+
+**문제**: GPU exact brute-force는 cuVS를 가장 잘 드러내는 핵심 기둥(filtered exact BF = CPU 대응물 없는 cuVS-네이티브 차별점)인데, 두 가지로 *2급 시민*에 머물러 있었다. (1) BF가 cagra 인덱스의 `cuvs.search_mode='brute_force'` **옵션**으로만 접근 가능 → 비싼 그래프 빌드를 강제당하고 플래너가 BF를 독립 비용화 못함. (2) ADR-071의 `bruteforce` AM 안은 `CREATE INDEX`로 "무빌드"를 선언하는 **형용모순**.
+
+**결정**: GPU exact BF를 1급으로 승격. 능력은 하나(matmul→L2→topK, exact, recall=1.0)이고 **워크로드가 물질화 방식을 가른다** — 두 체제로 구현한다.
+- **A1 = 상주 `flat` AM (W2: 읽기 多·쓰기 간헐·안정 코퍼스).** `CREATE INDEX … USING flat (… vector_l2_ops) WITH (precision='float16')`. *진짜 평면 벡터 저장소(.vectors)를 지으므로* `flat` 명명이 정직(FAISS IndexFlat식; `bruteforce` 형용모순 회피). 빌드 1회 분할상환·VRAM warm. 신선도는 기존 cagra delta/tombstone 재사용(INSERT→`.delta`, 검색 시 CPU-exact 머지).
+- **B = transient 무인덱스 (W1: 쓰기 폭주·항상최신·ad-hoc 필터).** `SET cuvs.gpu_bruteforce=on`(working name; 기본 off→Tier-2 검증 후 auto). 인덱스 없이 플래너가 vector ORDER BY를 transient GPU-BF CustomScan으로 라우팅. **후속 별도 세션**(설계+적대검증; round-2 FATAL = Sort 수용 + 실행시 파라미터 바인딩으로 회피).
+- **멘탈 모델**: "flat 인덱스 생성 여부 = 유일한 W2/W1 스위치." 사용자는 A1/B를 몰라도 됨.
+
+**라우팅 매트릭스** (플래너 cost 자동, 사용자 개입 0): exact+읽기→**A1** / exact+쓰기→**B** / 근사+대규모 N→**cagra·ivfpq**. A1은 exact지만 O(N) 전수 스캔 → 근사 허용+대규모면 cagra가 *읽기 속도*로 이김. read/write 트레이드오프: **A1은 쓰기에 지불·읽기를 산다**(인덱스 中 최경량: O(N) 복사, 그래프/PQ 없음), **B는 읽기에 지불·쓰기를 산다**(쓰기 비용 0).
+
+**원칙(불가침)**: cagra 경로 **무변경**(회귀 안전). flat의 신규 경로는 cagra `gettuple`/`cost`/`build`를 **복제(duplicate)하지 리팩터하지 않는다** — cagra 것은 `cuvs.search_mode` GUC 종속이라 verbatim 재사용 시 flat에서 NULL handle deref. 회귀 펜스(`brute_force, delta_recall, pending_delta, stream_bf_recall, cagra_streaming, auto_compact`) 변경 전/후 녹색.
+
+**A1 구현 (검증 완료)**:
+- **`pg_cuvs.c`**: `flatamhandler`(cagra 스캔/insert/delete 콜백 재사용) + 전용 `flat_gettuple`(`search_mode=1` 강제, GUC 무관) + `flat_amcostestimate`(exact N-cost 분기 강제, 8 게이트 전부 유지) + `cuvs_build_flat_from_heap`/`flat_ambuild`(vectors-only) + `cuvs_flat_amoptions`(`index_dir`+`precision`, layout-compatible로 `cuvs_resolve_index_dir_rel` 재사용) + DROP 훅(`cuvs_object_access`)에 flat oid 매칭.
+- **`cuvs_ipc.{h,c}`**: `CUVS_OP_BUILD_FLAT`(21) + `cuvs_ipc_build_flat`(`cuvs_ipc_build` 복제, op만 상이).
+- **`pg_cuvs_server.c`**: `IndexEntry.is_flat`(NULL handle + unsharded = 신규 상태); `handle_build_flat`(`.tids`+`.vectors`만 persist, **`finish_build_commit` 미사용**=`.cagra` serialize 회피, 독자 tmp+rename+commit); `load_index` flat 분기(`.cagra`/`.ivfpq` 부재 + `.vectors` 존재 → handle=NULL·is_flat=1·graph VRAM 미예약); `startup_load_indexes` `.vectors` 발견 패스(재시작 복원); 검색 가드.
+- **비용 재보정**: 신규 `CUVS_FLAT_STARTUP_COST=50.0`(공유 `CUVS_STARTUP_COST=1000` **미변경** — "cagra 무변경" 원칙 준수). 핸드오프는 공유 상수 하향을 제안했으나 flat이 독자 cost 함수를 가지므로 전용 상수가 blast radius 0이며 동일 목표 달성(작은 N에서 flat 선택).
+- **`pg_cuvs.control`** `default_version` 0.3.0→**0.4.0**(Task 1 누락분 — 안 하면 `CREATE EXTENSION`이 flat 없는 0.3.0 설치).
+
+**적대검증이 잡은 라이프사이클 FATAL (전부 수정·검증)**:
+1. `handle_search_batch`(`use_bf = … \|\| e->is_flat`) — 없으면 flat batch 검색이 `cuvs_cagra_search_batch(NULL handle)`로 **데몬 전체 크래시**.
+2. `handle_search` — BF 게이트에 `e->is_flat` 추가 + cagra dispatch 앞 NULL-handle 구조적 가드.
+3. `load_index`/`startup_load_indexes` flat 분기 — 없으면 재시작 후 flat **unsearchable**.
+4. **`evict_lru` flat 분기 (세션 중 발견)** — flat 엔트리가 cagra `else`로 떨어지면 `save_index`(handle==NULL → -1 refuse) 호출로 **축출 불가**가 되어 VRAM을 영구 점유. → ivfpq처럼 save 없이 free.
+5. **`handle_drop`에 `free_main_bf_cache` 추가 (세션 중 발견)** — flat의 *유일* GPU 할당(resident BF)이 DROP 시 누수. (cagra의 2차 BF 캐시 누수도 동시 해소; pre-existing IVF-PQ handle 누수는 범위 밖으로 명시.)
+- freshness/recall(delta merge)·필터/WHERE 경로 NULL-safe는 검증 SOUND(수정 불필요).
+
+**기각 대안** (적대적 단련 기록): **A2(유령 인덱스: AM+no-op build+transient amgettuple)** — HOT 비활성(저장 0인데 대가)+상속 cost가 `CUVS_FB_NO_ARTIFACT`로 비활성+transient verb 부재+매쿼리 재마샬, AM 이점은 A1이 동일하게 가짐 → 순비용. **A1 > B > A2.** / **테이블-키 1회-빌드 상주 코퍼스** — INSERT/UPDATE 무에러 누락(round-1 FATAL). / **B pathkey-claim CustomScan** — silent mis-ordering(round-2 FATAL). / **B plan-time Const만** — `<-> $1` 우회→근사 강등(round-2 FATAL). / **gpucache 복제** — PG-Strom master에서 죽은 코드.
+
+**ADR 관계**: **ADR-071 흡수/supersede**(071의 vectors-only AM = 본 A1, `bruteforce`→`flat` rename + B/라우팅 추가). **ADR-039**(search_mode GUC BF): A1/B로 대체되는 deprecation 궤적(`search_mode='brute_force'`는 deprecated 표기). **ADR-049**(AM-per-algo): A1이 동일 하우스 스타일. **ADR-061**(filtered wedge): B가 그 plumbing 실현.
+
+**검증 증거 (Tier-2, A100 `pg-cuvs-dev`/PG16, 2026-06-14)**: `make installcheck` **31/31 GREEN**(flat_smoke + 회귀 펜스 6 전부) + isolation **3/3 GREEN**. flat_smoke 5 assertion 전부 통과: recall@10=1.0 vs seqscan **with `search_mode`=DEFAULT('cagra')**(GUC 무관 증명), `Index Scan using flat_l2` + Sort 노드 없음, INSERT(`id=1001`) delta 머지 가시, `<-> $1` 파라미터 exact, DROP 무크래시. **재시작 내구성** 별도 검증: flat 빌드→데몬 재시작→동일 exact 결과(`5,6,31,4,30` = seqscan GT, `.vectors`에서 재로드). **업그레이드 경로** 0.3.0→0.4.0 `ALTER EXTENSION UPDATE` 동작.
+
+**후속(carry-forward)**: B(transient CustomScan) 설계+적대검증 세션 / 라우팅 cost 캘리브레이션(Tier-2 측정, `cuvs.gpu_bruteforce` off→auto 승격, ADR-069 루프) / B GUC 최종명 + release-prep(모든 flat/B 작업 뒤).
+
+관련: ADR-071(흡수), ADR-039(BF GUC deprecation), ADR-049(AM-per-algo), ADR-061(filtered wedge), ADR-064(streaming BF), ADR-047(delta/tombstone freshness), 플랜 SSOT `snappy-strolling-brook.md`.

@@ -4,7 +4,7 @@
 > modes, GUCs, reloptions, SQL functions, and observability views. How the pieces fit together is
 > in [ARCHITECTURE.md](../ARCHITECTURE.md); the rationale behind each is in
 > [design/DECISIONS.md](../design/DECISIONS.md). Verified against `src/pg_cuvs.c` and
-> `sql/pg_cuvs--0.3.0.sql`.
+> `sql/pg_cuvs--0.4.0.sql` (extension version 0.4.0).
 
 ---
 
@@ -17,8 +17,25 @@ pg_cuvs registers three index AMs. All reuse pgvector's `vector` type and operat
 | AM | Create | Tuning (reloptions) | Served by | Sidecar files |
 |----|--------|---------------------|-----------|---------------|
 | `cagra` | `CREATE INDEX i ON t USING cagra (col vector_l2_ops)` | `graph_degree`, `intermediate_graph_degree`, `build_algo`, `index_dir` | GPU daemon | `.cagra`, `.tids`, (`.vectors`, `.delta`, `.tombstone`, `.stale`, `.shards`, `.sNNN.cagra`, `.relfilenode`) |
+| `flat` | `CREATE INDEX i ON t USING flat (col vector_l2_ops) WITH (precision='float16')` | `precision`, `index_dir` | GPU daemon | `.tids`, `.vectors` (no `.cagra` graph) |
 | `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim` | GPU daemon | `.ivfpq`, `.tids` |
 | `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction` | **pgvector** (CPU) | `.hnsw` (pgvector page format) |
+
+`flat` is the first-class exact GPU brute-force AM (ADR-073, extension v0.4.0). It builds only a
+`.tids` + `.vectors` store — no CAGRA graph — so the build is O(N) copy rather than graph
+construction. Search is always exact (recall=1.0) regardless of `cuvs.search_mode`; the AM
+forces brute-force internally. Freshness uses the same delta/tombstone mechanism as `cagra`
+(INSERTs append to `.delta`, merged at search time). The planner picks `flat` via its own cost
+function (`CUVS_FLAT_STARTUP_COST=50`, vs `CUVS_STARTUP_COST=1000` for cagra), so small-N tables
+route to `flat` correctly. DROP removes `.tids` + `.vectors` and releases VRAM. The index is
+restart-durable: `.vectors` is reloaded on daemon restart. Use `flat` for read-heavy, stable
+corpora where recall=1.0 is required; use `cagra`/`ivfpq` for approximate search at large N.
+
+> **Deprecated:** `SET cuvs.search_mode = 'brute_force'` on a `cagra` index was the previous way
+> to get GPU exact BF. It still works (ADR-039) but is deprecated. `USING flat` is the
+> first-class replacement: independent AM, honest build semantics, dedicated cost routing. The GUC
+> path couples an exact-BF workload to an unnecessary graph build and cannot be independently cost-
+> calibrated by the planner.
 
 `ivfpq` trades recall for 10–100× lower VRAM via product quantization. `pg_cuvs_hnsw` is the GPU
 *build accelerator*: it builds a pgvector HNSW from a CAGRA graph without pgvector's CPU build,
@@ -44,7 +61,7 @@ decoder.
 | `gpu_cagra` | 0 | GPU CAGRA approximate NN (default) |
 | `cpu_hnsw` | 1 | CPU HNSW fallback via `.hnsw` sidecar (`cuvs.cpu_hnsw_fallback`) |
 | `cpu_fallback` | 2 | Generic CPU path (seqscan / pgvector) after a daemon-side gate |
-| `brute_force` | 3 | GPU exact BF over the `.vectors` sidecar (`cuvs.search_mode='brute_force'`) |
+| `brute_force` | 3 | GPU exact BF over the `.vectors` sidecar (`cuvs.search_mode='brute_force'` on a `cagra` index). **Deprecated** — use `USING flat` instead (ADR-073) |
 | `cagra_prefilter` | 4 | CAGRA with GPU BITSET prefilter (3O filtered search) |
 | `ivfpq` | 5 | GPU IVF-PQ (`ivfpq` AM) |
 | `stream_bf` | 6 | Out-of-core filtered BF streamed from `.vectors` (ADR-064) |
@@ -82,7 +99,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 
 | GUC | Type | Default | Range | Set by | Purpose |
 |-----|------|---------|-------|--------|---------|
-| `cuvs.search_mode` | enum | `cagra` | `cagra`, `brute_force` | USERSET | CAGRA ANN vs GPU exact BF |
+| `cuvs.search_mode` | enum | `cagra` | `cagra`, `brute_force` | USERSET | CAGRA ANN vs GPU exact BF on a `cagra` index. `brute_force` value is **deprecated** — use `USING flat` AM instead. A `flat` index always forces exact BF regardless of this GUC |
 | `cuvs.bf_precision` | enum | `float32` | `float32`, `float16` | USERSET | Resident BF index precision; float16 halves VRAM |
 | `cuvs.bf_batch_wait_us` | int | `0` (off) | 0–10000 | USERSET | Daemon BF micro-batch coalescing window (µs) |
 | `cuvs.cpu_hnsw_fallback` | bool | `off` | — | USERSET | Serve from the `.hnsw` sidecar instead of GPU CAGRA |
@@ -154,6 +171,18 @@ daemon-only ones have no session equivalent.
 ---
 
 ## 4. Reloptions
+
+### `flat`
+
+| Reloption | Type | Default | Range / values | Notes |
+|-----------|------|---------|----------------|-------|
+| `precision` | enum | `float32` | `float32`, `float16` | Resident BF index precision. `float16` halves VRAM (N·dim·2 B vs ·4 B); falls back to `cuvs.bf_precision` GUC if not set |
+| `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory; same semantics as `cagra` (ADR-045) |
+
+VRAM sizing: `float32` requires N·dim·4 bytes resident (e.g. 1M×1024 ≈ 4 GB); `float16` halves
+it. If the corpus does not fit in free VRAM at build time the daemon returns a dedicated
+no-fit error ("corpus N·dim·4B exceeds free VRAM; try precision=float16, shard, or use
+cagra/ivfpq") rather than silently failing.
 
 ### `cagra`
 

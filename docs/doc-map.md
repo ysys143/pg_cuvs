@@ -11,8 +11,9 @@ Maintained to reflect the shipping product. Start here.
 | Doc | Answers |
 |-----|---------|
 | [README.md](../README.md) | Overview, install, requirements, quickstart |
-| [ARCHITECTURE.md](../ARCHITECTURE.md) | How it works: components, IPC, index lifecycle, VRAM accounting, sharding, GCS, write path, key techniques, limitations |
-| [docs/reference.md](reference.md) | The surface: index AMs, search modes, GUCs, reloptions, SQL functions, observability views |
+| [ARCHITECTURE.md](../ARCHITECTURE.md) | How it works: components, IPC, index lifecycle (incl. `flat` AM build/search/evict/restart), VRAM accounting, sharding, GCS, write path, key techniques, limitations |
+| [docs/reference.md](reference.md) | The surface: index AMs (`cagra`, `flat`, `ivfpq`, `pg_cuvs_hnsw`), search modes, GUCs, reloptions, SQL functions, observability views |
+| [docs/operational-guide.md](operational-guide.md) | Workload selection guide: flat vs cagra vs ivfpq, measured latency/throughput, crossovers, cost characteristics |
 | [docs/best-practices.md](best-practices.md) | Build-time recommendations (TOAST/PLAIN, index_dir placement, version pinning) |
 | [BENCHMARK.md](../BENCHMARK.md) | Published performance + overhead characterization |
 
@@ -22,7 +23,7 @@ Preserved for provenance. **Not** kept in sync with the current product; read as
 
 | Doc | Role |
 |-----|------|
-| [design/DECISIONS.md](../design/DECISIONS.md) | ADRs — every design decision, alternatives, rejection reasons. The "why" of record |
+| [design/DECISIONS.md](../design/DECISIONS.md) | ADRs — every design decision, alternatives, rejection reasons. The "why" of record. Key recent: **ADR-073** (`flat` AM, supersedes ADR-071), ADR-072 (DiskANN direction), ADR-070 (resource governance) |
 | [design/PLAN.md](../design/PLAN.md) | **Frozen.** Per-phase as-built spec + completion criteria + verification evidence. Its planning role ended when implementation completed |
 | [design/SPEC.md](../design/SPEC.md), [design/STRATEGY_NOTES.md](../design/STRATEGY_NOTES.md), [design/PROJECT_POSITIONING.md](../design/PROJECT_POSITIONING.md) | Earlier requirements / strategy / positioning; superseded by the SSOT docs for current state |
 | [design/BENCHMARK_CROSSOVER.md](../design/BENCHMARK_CROSSOVER.md), [docs/profiling-results.md](profiling-results.md) | Measurement methodology + raw profiling that BENCHMARK.md cites |

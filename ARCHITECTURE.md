@@ -33,7 +33,7 @@ Invariants that shape everything below:
 
 | Component | Process | Source | Owns |
 |-----------|---------|--------|------|
-| Extension `.so` | each PostgreSQL backend | `src/pg_cuvs.c` | Index AM handlers (`cagra`, `ivfpq`, `pg_cuvs_hnsw`), planner cost hook, GUCs, reloptions, SQL functions, object-access (DROP) hook |
+| Extension `.so` | each PostgreSQL backend | `src/pg_cuvs.c` | Index AM handlers (`cagra`, `flat`, `ivfpq`, `pg_cuvs_hnsw`), planner cost hook, GUCs, reloptions, SQL functions, object-access (DROP) hook |
 | Sidecar daemon | standalone `pg_cuvs_server` | `src/pg_cuvs_server.c` | The CUDA context, VRAM-resident index registry, build/search/evict/reload, warmup pool, GCS upload |
 | Compaction bgworker | PostgreSQL background worker | `src/pg_cuvs_compaction.c` | Phase 4C auto-`REINDEX CONCURRENTLY` when delta growth crosses a threshold |
 | IPC client | linked into the backend | `src/cuvs_ipc.c` / `.h` | UDS framing, shm/memfd payload handoff, interruptible waits |
@@ -79,6 +79,41 @@ The build of a single index is measured alone (before any co-resident index) to 
 accounting clean. Parallel builds (ADR-059, `handle_build_multi`) have the leader receive N
 worker partials via named shm and stream them straight to the GPU.
 
+### 3.1a Build (`CREATE INDEX ... USING flat`)
+
+The `flat` AM uses a separate IPC op (`CUVS_OP_BUILD_FLAT`) and a dedicated daemon handler
+(`handle_build_flat`). The flow is identical to cagra up through corpus delivery, then diverges:
+
+```
+backend (cuvs_build_flat_from_heap / flat_ambuild)   daemon (handle_build_flat)
+  scan heap → (vector, TID) pairs
+  serialize corpus (same tiered path as cagra)
+  IPC BUILD_FLAT frame + index_dir ─────────────▶  mmap corpus
+                                                    write .tids  tmp→fsync→rename
+                                                    write .vectors tmp→fsync→rename
+                                                    write commit marker
+                                                    -- NO .cagra, NO cuvsCagraBuild --
+                                                    refresh_main_bf_cache (graph-free)
+                                                    register IndexEntry with is_flat=1,
+                                                      handle=NULL, graph VRAM not reserved
+  reply OK / BUILD_FAILED / PERSIST_FAILED ◀──────  reply
+  on error: ereport(ERROR) → catalog rollback
+```
+
+Key differences from cagra:
+- `finish_build_commit` (which serializes `.cagra`) is **not called**. The flat handler has its
+  own tmp+rename+fsync sequence for `.tids` and `.vectors`.
+- `IndexEntry.is_flat=1` signals a new daemon state: NULL cagra handle + unsharded, not the
+  former "NULL = sharded" assumption. All cagra handle dereferences in `handle_search`,
+  `handle_search_batch`, and `evict_lru` are guarded by `cagra_handle_required(e)` / `e->is_flat`
+  checks to prevent NULL deref.
+- On eviction: flat entries are freed without calling `save_index` (no handle to serialize);
+  they reload from `.vectors` on next use.
+- On daemon restart: `startup_load_indexes` detects `.vectors` present without `.cagra`/`.ivfpq`
+  and registers the entry as `is_flat=1` (restart-durable).
+- DROP: `cuvs_object_access` matches the flat index OID and calls `free_main_bf_cache` to release
+  the resident BF VRAM before removing artifacts.
+
 ### 3.2 Search
 
 ```
@@ -118,7 +153,8 @@ it is visible in `pg_stat_gpu_fallback`, never in the daemon-sourced `pg_stat_gp
   build corpora; parallel builds pass N partial-shm descriptors after the frame.
 - **Operations** (`CUVS_OP_*`): SEARCH, BUILD, STATUS, MARK_STALE, CACHE_STATS, SHARD_STATS,
   DROP_INDEX, EXPORT_ADJACENCY, EXPORT_HNSW_SHM, SEARCH_BATCH, BUILD_IVFPQ, SEARCH_IVFPQ,
-  EXTEND, COMPACT, SEARCH_STREAM_BF, plus test-only VRAM-injection ops.
+  EXTEND, COMPACT, SEARCH_STREAM_BF, **BUILD_FLAT** (op 21, vectors-only build for the `flat`
+  AM — no graph), plus test-only VRAM-injection ops.
 - **Reply status** (`CUVS_STATUS_*`): OK, ERROR, OOM_FALLBACK, NOT_FOUND, UNAVAILABLE,
   BUILD_FAILED, PERSIST_FAILED, DIM_MISMATCH, METRIC_MISMATCH, STALE, NO_VECTORS, CANCELED.
   Each maps to a specific backend reaction (error vs. CPU fallback vs. reload-and-retry).
@@ -138,7 +174,7 @@ states (stale / delta / tombstone). All artifacts live under `index_dir` named
 |--------|-------|-----------|-------|
 | `.cagra` | CAGRA graph (cuVS binary) | build, eviction | the resident index |
 | `.tids` | versioned header (`TIDS` magic, version, n_vecs, dim, metric, body CRC32) + `uint64_t[]` TID map | build | validated on every load; pre-1.0 headerless files are rejected (REINDEX) |
-| `.vectors` | full corpus `float32[n][dim]` (+ `VECS` header) | build (optional) | required by brute-force / stream-BF modes |
+| `.vectors` | full corpus `float32[n][dim]` (+ `VECS` header) | build (optional for `cagra`; **required** for `flat`) | required by `flat` AM, brute-force mode, and stream-BF; `flat` indexes reload from this file on daemon restart |
 | `.delta` | pending inserts: `DELT` header + `(tid, vec[dim])` rows | `aminsert` (append) | lazily loaded into a GPU BF delta cache; generation tied to `.tids` CRC; cleared by REINDEX |
 | `.tombstone` | deleted TIDs: `TOMB` header + records | `ambulkdelete` (append) | snapshot-aware filter at search; cleared by REINDEX |
 | `.stale` | empty marker | `aminsert`/`ambulkdelete` fallback | read by the planner cost hook; cleared by REINDEX |

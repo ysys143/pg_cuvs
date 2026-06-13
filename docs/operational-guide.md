@@ -12,7 +12,8 @@
 |------|------------|--------|-------|-----------------|
 | **cpu-seq** | CPU brute force (PostgreSQL seq scan) | exact | none | yes (default small-N) |
 | **gpu-cagra** | GPU graph ANN (`USING cagra`) | approx | graph (GPU-fast) | yes (the cuvs index) |
-| **gpu-bf** | GPU exact brute force (`cuvs.search_mode=brute_force`) over the cagra `.vectors` sidecar | exact | *(rides on a cagra build — see caveat)* | runtime mode (GUC) |
+| **gpu-bf (flat)** | GPU exact brute force via `USING flat` AM (ADR-073, first-class path, v0.4.0) | exact | `.tids`+`.vectors` only (no graph) | planner cost (independent AM) |
+| **gpu-bf (legacy)** | GPU exact brute force via `cuvs.search_mode=brute_force` on a `cagra` index (**deprecated**) | exact | rides on a cagra build (graph is dead weight for BF) | runtime GUC |
 | **gpu-bf+batch** | gpu-bf + daemon request **coalescing** (`cuvs.bf_batch_wait_us>0`) | exact | same | runtime mode (GUC) |
 | **hnsw (cpu)** | pgvector HNSW / cagra→hnsw CPU export (`pg_cuvs_import_cagra`) | approx | graph | a **different deployment** (CPU-serve), not a per-query option vs cagra |
 
@@ -22,10 +23,38 @@
 
 ## Quick decision guide
 
+### W2 vs W1 vs approximate (choosing an index type)
+
+| Need | Write pattern | Recommended path |
+|------|--------------|-----------------|
+| Exact (recall=1.0), read-heavy, stable corpus | Infrequent inserts/updates | **`USING flat`** — resident exact BF, recall=1.0, O(N) scan, VRAM warm. First-class AM (ADR-073) |
+| Exact (recall=1.0), write-heavy or always-fresh | Frequent inserts, ad-hoc filters | **transient BF** (`cuvs.gpu_bruteforce`, planned/future) — no index, every query scans live heap |
+| Approximate OK, any N | Any | **`USING cagra`** — ~1.5 ms flat, ~1200 QPS, SLA-robust. GPU workhorse |
+| VRAM too small for cagra graph | Any | **`USING ivfpq`** — 10–100x VRAM savings via PQ, approximate |
+| No GPU at query time | Any | **`USING pg_cuvs_hnsw`** — GPU build, CPU serve |
+
+**`flat` cost characteristics:** write cost = delta append on INSERT/UPDATE (cheapest among all
+GPU AMs: O(N) copy, no graph or PQ); periodic compaction merges delta into `.vectors`. Read cost
+= O(N) per query (full `.vectors` scan). For approximate search or very large N where O(N) scan
+exceeds your latency budget, use `cagra`/`ivfpq` instead.
+
+**`flat` VRAM sizing:** N·dim·4 bytes for float32 resident BF (e.g. 1M×1024 ≈ 4 GB). Use
+`WITH (precision='float16')` to halve it. If the corpus exceeds free VRAM at build time the
+daemon emits a dedicated error; options: use `precision='float16'`, shard, or switch to
+`cagra`/`ivfpq`.
+
+> **Note on cost routing:** earlier versions noted that `CUVS_STARTUP_COST=1000` caused the
+> planner to prefer seqscan up to ~23k rows (miscalibrated). The `flat` AM ships its own
+> `CUVS_FLAT_STARTUP_COST=50`, so the planner selects `flat` correctly at small N without
+> touching the shared `cagra` cost constant.
+
+### Within gpu-bf: single-query latency guide
+
 1. **Need exact (recall = 1.0)?**
    - Trivially small table (≲ a few hundred rows): **cpu-seq**.
-   - Otherwise, low/moderate concurrency: **gpu-bf** (flat ~1–2 ms up to ~100k).
-   - Sustained **high** concurrency + can tolerate a few ms extra latency: **gpu-bf+batch**.
+   - Otherwise, low/moderate concurrency: **gpu-bf via `USING flat`** (~1–2 ms up to ~100k).
+   - Sustained **high** concurrency + can tolerate a few ms extra latency: **gpu-bf+batch**
+     (`cuvs.bf_batch_wait_us` on a `flat` or `cagra` index in brute_force mode).
 2. **Approximate OK (recall target < 1.0)?** → **gpu-cagra**: ~1.5 ms latency at *any* N,
    ~1200 QPS, SLA-robust. The GPU workhorse.
 3. **No GPU at query time?** → hnsw (build on GPU via cagra, export to CPU).
@@ -115,10 +144,11 @@ specialization. (Tune the window per workload; `cuvs.bf_float16` halves VRAM / r
 
 - **Single A100-40GB, single GPU.** Crossovers move with CPU cores (hnsw/seq scaling), GPU
   model/count (the ~900–1200 single-stream GPU ceiling), and memory bandwidth. Re-measure per spec.
-- **gpu-bf currently requires a cagra build.** BF only needs the raw vectors (`.vectors`
-  sidecar), but pg_cuvs ships it as a *mode of the cagra index*, so you pay the (GPU-fast but
-  non-zero, VRAM-resident) graph build to use it. A true **no-build standalone BF** — BF's
-  signature value (instant, always-fresh, exact) — is a pending design item (ADR).
+- **`USING flat` is the first-class exact BF path (v0.4.0, ADR-073).** It builds only `.tids`+
+  `.vectors` — no graph — so you pay only the O(N) corpus copy, not a CAGRA graph build.
+  The legacy path (`cuvs.search_mode='brute_force'` on a `cagra` index) still works but is
+  **deprecated**: it couples exact-BF to an unnecessary graph build and cannot be independently
+  cost-calibrated. Use `USING flat` for new deployments.
 - **`.vectors` sidecar = full raw corpus** (N·dim·4 B; 1M·1024 ≈ 4 GB), resident on top of the
   graph. This is the real cost of exact GPU search; `bf_float16` halves it.
 - **Numbers are single-run on one GPU**; ~30% run-to-run variation observed (e.g. cagra@100k
