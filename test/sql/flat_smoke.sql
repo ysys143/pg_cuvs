@@ -1,0 +1,83 @@
+-- flat_smoke.sql — A1 (ADR-073): standalone `flat` GPU exact brute-force AM.
+--
+-- Coverage:
+--   1. CREATE INDEX ... USING flat builds (no graph) and search returns
+--      recall@k=1.0 (sorted top-k distances match the pgvector seqscan ground
+--      truth) for L2.
+--   2. A flat index is ALWAYS exact brute-force — cuvs.search_mode is left at its
+--      DEFAULT ('cagra'), proving flat ignores the GUC (the AM forces BF mode).
+--   3. The planner picks the flat index (Index Scan using flat_l2), with the
+--      ORDER BY satisfied by the AM (no separate Sort node).
+--   4. INSERT after build is visible via the client-side delta merge.
+--   5. Parameterized (<-> $1) queries route to flat and stay exact.
+--
+-- Like brute_force.sql, recall is checked on SORTED top-k distance lists so exact
+-- ties never cause a spurious mismatch. Under the Tier-1 CPU shim brute-force is
+-- exact, so recall=1.0 holds without a GPU.
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable.
+
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- Deterministic 200-vector, 8-dim corpus (same generator as brute_force.sql).
+CREATE TABLE flat_test (id int, embedding vector(8));
+INSERT INTO flat_test
+SELECT g,
+       format('[%s,%s,%s,%s,%s,%s,%s,%s]',
+              (g * 0.013)::numeric(12,6),
+              (g * g * 0.0007)::numeric(12,6),
+              sin(g * 0.10)::numeric(12,6),
+              cos(g * 0.17)::numeric(12,6),
+              ((g % 13) * 0.05)::numeric(12,6),
+              ((g % 7) * 0.08)::numeric(12,6),
+              sin(g * 0.30)::numeric(12,6),
+              cos(g * 0.23)::numeric(12,6))::vector
+FROM generate_series(1, 200) g;
+
+SET client_min_messages = 'warning';
+CREATE INDEX flat_l2 ON flat_test USING flat (embedding vector_l2_ops);
+SET client_min_messages = 'notice';
+
+-- (1)+(2) recall@10 = 1.0 vs seqscan ground truth, with search_mode at DEFAULT.
+SET enable_cuvs = off; SET enable_seqscan = on;
+CREATE TEMP TABLE gt AS
+    SELECT round((embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM flat_test ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET enable_cuvs;
+
+SET enable_seqscan = off;
+CREATE TEMP TABLE fr AS
+    SELECT round((embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]')::numeric, 4) AS d
+    FROM flat_test ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 10;
+RESET enable_seqscan;
+
+SELECT (SELECT array_agg(d ORDER BY d) FROM gt)
+     = (SELECT array_agg(d ORDER BY d) FROM fr) AS flat_recall_ok;
+
+-- (3) the flat index is chosen and satisfies the ORDER BY (no Sort node).
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM flat_test
+    ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 5;
+RESET enable_seqscan;
+
+-- (4) INSERT after build is visible via delta merge (exact dup -> top-1).
+INSERT INTO flat_test VALUES (1001, '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]');
+SET enable_seqscan = off;
+SELECT id FROM flat_test
+    ORDER BY embedding <-> '[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]' LIMIT 1;
+RESET enable_seqscan;
+
+-- (5) parameterized (<-> $1) query routes to flat and is exact.
+SET enable_seqscan = off;
+PREPARE fq(vector) AS
+    SELECT id FROM flat_test ORDER BY embedding <-> $1 LIMIT 1;
+EXECUTE fq('[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]');
+DEALLOCATE fq;
+RESET enable_seqscan;
+
+DROP TABLE flat_test;

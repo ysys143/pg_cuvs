@@ -11,14 +11,16 @@
 
 # ---- PGXS configuration -------------------------------------------------
 EXTENSION      = pg_cuvs
-EXTVERSION     = 0.3.0
+EXTVERSION     = 0.4.0
 DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql \
                  sql/pg_cuvs--0.2.0.sql \
                  sql/pg_cuvs--0.2.0--0.3.0.sql \
-                 sql/pg_cuvs--0.3.0.sql
+                 sql/pg_cuvs--0.3.0.sql \
+                 sql/pg_cuvs--0.3.0--0.4.0.sql \
+                 sql/pg_cuvs--0.4.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat vram_accounting build_lock build_oom build_multi_oom
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat vram_accounting build_lock build_oom build_multi_oom flat_smoke
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
