@@ -2916,6 +2916,8 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 
 **B 검증 증거 (Tier-2, A100/PG16, 2026-06-14)**: `make installcheck` **32/32 GREEN**(transient_bf + 회귀 펜스 7) + isolation **3/3 GREEN**. transient_bf 5 assertion: `gpu_bruteforce=off`→`Seq Scan`(플랜 무변경), `on`→`Custom Scan (CuvsTransientBF)` under Sort + recall@10=1.0 vs seqscan, `<-> $1` prepared→CuvsTransientBF·exact(근사 강등 없음), WHERE 필터 exact(filter-first), 1-byte budget→`ERROR ... (status 2) ... fail-closed`·데몬 생존.
 
-**후속(carry-forward)**: 라우팅 cost 캘리브레이션(Tier-2 측정, `cuvs.gpu_bruteforce` off→auto 승격, ADR-069 루프) / release-prep(모든 flat/B 작업 뒤: BENCHMARK·doc-coherence·ops-playbook·GitHub Pages·org 이전).
+**B 라우팅 캘리브레이션 (ADR-069 루프, 측정 완료 2026-06-14, A100/PG16)**: unfiltered 단일쿼리 top-k에서 B vs **병렬 CPU seqscan** 교차점을 Stage A 실측(`work_mem=4GB`, TIMING OFF, warm median/5; dim 384·768 × N 1k..300k). **결과: 교차점 없음** — B가 전 구간 2–8× 느림(seq/B 최대 0.51 @768/100k, 1.0 미달). 원인: 쿼리당 O(N·dim) 코퍼스 재마샬(detoast→memfd→H2D)+IPC가 지배; GPU 커널은 빠르나 데이터 이동세가 단일쿼리 이득을 상쇄(dim↑일수록 격차 축소, 미교차). **결정(regret-averse)**: `auto`를 plan-time B 경로 추가로 승격하지 **않음** — 전 셀에서 2–8× 느린 엔진 라우팅(regret>0)이 됨. `auto`는 off-behavior 유지(스텁 아님, 실측 검증). B의 진짜 가치(always-fresh W1·filtered wedge·동시성 CPU-offload)는 plan-time cost가 못 보는 **런타임 속성**(ADR-069 "plan-time 정보 부족" 클래스) → 명시적 `on`으로 도달, live `auto`는 런타임 적응 라우터/filtered 교차점 측정의 후속. **코드 변경**: F5 `on`-force 수정만(`on`→startup=0,total=1.0; 종전 N-증가 cost는 작은 N에서 seqscan에 밀려 force 실패). cost 상수 신설 없음(B가 이기는 셀이 없어 미사용).
+
+**후속(carry-forward)**: filtered-path 교차점 측정(B의 filter-first가 CPU exact-filtered 대비 우위 구간) + 런타임 적응 라우팅(동시성/offload 신호) = live `auto`의 전제 / release-prep(모든 flat/B 작업 뒤: BENCHMARK·doc-coherence·ops-playbook·GitHub Pages·org 이전).
 
 관련: ADR-071(흡수), ADR-039(BF GUC deprecation), ADR-049(AM-per-algo), ADR-061(filtered wedge), ADR-064(streaming BF), ADR-047(delta/tombstone freshness), 플랜 SSOT `snappy-strolling-brook.md`.

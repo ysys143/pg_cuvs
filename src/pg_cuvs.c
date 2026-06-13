@@ -6279,9 +6279,14 @@ cuvs_transient_bf_add_path(PlannerInfo *root, RelOptInfo *rel,
     int64            k64;
     int              k;
     CustomPath      *cpath;
-    double           N, pages, total;
 
-    /* GUC: only `on` adds the path in v1 (auto behaves as off until calibration). */
+    /* Only `on` (2) adds the path. `auto` (1) is reserved: the Tier-2 crossover
+     * measurement (ADR-073, A100, 2026-06-14) found NO N where transient BF beats
+     * a parallel CPU seqscan for unfiltered top-k (B is 2-8x slower across
+     * 1k..300k, dim 384/768 — the per-query H2D re-marshal dominates). B's value
+     * (always-fresh W1, filtered wedge, CPU-offload under concurrency) is a runtime
+     * property plan-time cost cannot see, so auto-promotion would be regret-positive.
+     * auto stays off-behavior pending runtime-adaptive routing. */
     if (cuvs_gpu_bruteforce != 2)
         return;
     if (rte->rtekind != RTE_RELATION || rel->reloptkind != RELOPT_BASEREL)
@@ -6354,16 +6359,14 @@ cuvs_transient_bf_add_path(PlannerInfo *root, RelOptInfo *rel,
     cpath->path.parallel_workers = 0;
     cpath->path.rows           = (rel->rows < (double) k) ? rel->rows : (double) k;
 
-    /* Base-rel cost: scan + qual/detoast + H2D/kernel (monotonic in N) + k fetches.
-     * v1 ships off, so this never perturbs existing plans; sane + monotonic only. */
-    N     = (rel->tuples > 0) ? rel->tuples : rel->rows;
-    pages = (rel->pages > 0) ? (double) rel->pages : 1.0;
-    total = pages * seq_page_cost
-          + N * (cpu_tuple_cost + cpu_operator_cost)
-          + N * cpu_operator_cost
-          + (double) k * random_page_cost;
+    /* `on` is an explicit opt-in override ("use GPU BF for no-index vector top-k"
+     * — for always-fresh exactness or CPU-offload under concurrency), so force B:
+     * a tiny constant cost below any seqscan wins regardless of N. A cost growing
+     * with N (the earlier formula) let a cheaper seqscan win at small N, so `on`
+     * failed to force (architect F5). The plan-time latency tradeoff is the user's
+     * to accept under `on`; the regret-averse default lives in `auto` (= off). */
     cpath->path.startup_cost = 0;
-    cpath->path.total_cost   = total;
+    cpath->path.total_cost   = 1.0;
     cpath->flags             = 0;
     cpath->methods           = &cuvs_transient_bf_path_methods;
 
