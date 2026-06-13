@@ -6628,6 +6628,13 @@ cuvs_tbf_exec(CustomScanState *node)
         }
         ExecStoreVirtualTuple(scan);
 
+        /* No CUSTOMPATH_SUPPORT_PROJECTION → the planner places a Result node
+         * above us for projection and leaves ps_ProjInfo NULL (the node's output
+         * type == the scan tuple). Return the populated scan slot directly; only
+         * project when we own a ProjInfo (e.g. an in-node computed tlist). Calling
+         * ExecProject(NULL) segfaults — it did for a bare `SELECT col` plan. */
+        if (node->ss.ps.ps_ProjInfo == NULL)
+            return scan;
         node->ss.ps.ps_ExprContext->ecxt_scantuple = scan;
         return ExecProject(node->ss.ps.ps_ProjInfo);
     }
