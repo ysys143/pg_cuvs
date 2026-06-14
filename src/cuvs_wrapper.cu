@@ -257,6 +257,7 @@ cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
               double *gpu_bf_tput, double *gpu_cagra_lat_us,
               unsigned int *probe_status)
 {
+  try {
     if (cudaSetDevice(device_id) != cudaSuccess)
         return 0;
 
@@ -314,8 +315,15 @@ cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
                     best_ms = ms;
             }
             if (best_ms < 1e29f && best_ms > 0.0f) {
-                *hbm_bw_bpus = (2.0 * (double)BYTES) / ((double)best_ms * 1000.0);  /* bytes/us */
-                *probe_status |= CUVS_HWPROBE_HBM_BW;
+                double bw = (2.0 * (double)BYTES) / ((double)best_ms * 1000.0);  /* bytes/us */
+                /* Plausibility band (~10 GB/s .. 100 TB/s). A contended/garbage
+                 * measurement outside this leaves the DEFAULT + bit clear so the
+                 * planner uses the legacy cost (else a tiny hbm_bw would blow up
+                 * the flat cost and silently drop the path). */
+                if (bw >= 1.0e4 && bw <= 1.0e8) {
+                    *hbm_bw_bpus = bw;
+                    *probe_status |= CUVS_HWPROBE_HBM_BW;
+                }
             }
         }
         if (a) cudaFree(a);
@@ -375,6 +383,12 @@ cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
         }
     }
     return 0;
+  } catch (...) {
+    /* never let a C++ exception (cuVS/RMM bad_alloc, raft::exception, ...) cross
+     * the extern "C" boundary and abort the daemon — the probe is best-effort,
+     * any failure leaves DEFAULTs + bits clear. */
+    return 0;
+  }
 }
 
 /* ----------------------------------------------------------------

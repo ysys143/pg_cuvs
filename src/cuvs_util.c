@@ -377,6 +377,11 @@ cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out)
  * Hardware profile (ADR-075) write/read. Self-contained struct; body_crc32
  * covers all bytes after it (offsetof(probe_status)..end).
  * ---------------------------------------------------------------- */
+/* On-disk wire format is fixed; a field reorder that changes these sizes would
+ * silently break cross-daemon reads. Fail the build instead. */
+_Static_assert(CUVS_HWPROFILE_SZ_V1 == 136, "cuvs_hw_profile v1 wire size drifted");
+_Static_assert(CUVS_HWPROFILE_SZ_V2 == 152, "cuvs_hw_profile v2 wire size drifted");
+
 int
 cuvs_hw_profile_write(FILE *f, CuvsHwProfile *p)
 {

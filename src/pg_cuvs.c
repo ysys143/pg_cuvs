@@ -1646,8 +1646,9 @@ cuvs_pread_all(int fd, off_t off, void *buf, size_t len)
 static int
 cuvs_index_vector_dim(PlannerInfo *root, IndexOptInfo *index)
 {
-    AttrNumber attno;
-    Oid        heaprelid;
+    AttrNumber      attno;
+    Oid             heaprelid;
+    RangeTblEntry  *rte;
 
     if (index == NULL || index->ncolumns < 1 || index->rel == NULL)
         return -1;
@@ -1657,7 +1658,12 @@ cuvs_index_vector_dim(PlannerInfo *root, IndexOptInfo *index)
     attno = index->indexkeys[0];
     if (attno <= 0)                       /* expression index — no plain column */
         return -1;
-    heaprelid = root->simple_rte_array[index->rel->relid]->relid;
+    /* simple_rte_array slots can be NULL for non-base RT entries — guard before
+     * dereferencing (a NULL deref here would crash the planner). */
+    rte = root->simple_rte_array[index->rel->relid];
+    if (rte == NULL)
+        return -1;
+    heaprelid = rte->relid;
     if (!OidIsValid(heaprelid))
         return -1;
     {
@@ -1690,11 +1696,12 @@ cuvs_phys_cost_ready(uint32_t req_bits, int dim, CuvsHwProfile *prof, double *ka
  * IMPORTANT: This runs in the planner on every query — once per candidate
  * index path. It must NOT touch the CUDA runtime: cudaGetDeviceCount() etc.
  * lazily initialize the CUDA context per backend, which costs ~100ms the
- * first time and inflates Planning Time. Six plan-time gates short-circuit the
+ * first time and inflates Planning Time. Eight plan-time gates short-circuit the
  * GPU route without IPC or CUDA: enable_cuvs (GUC), circuit breaker (repeated
  * runtime failures), .stale sidecar (heap writes since build), delete-drift
- * (.tids header vs live-row estimate), socket existence (daemon ready), and
- * artifact existence (no .tids = empty-table build, no GPU artifact). */
+ * (.tids header vs live-row estimate), socket existence (daemon ready),
+ * artifact existence (no .tids = empty-table build, no GPU artifact), delta
+ * unusable, and tombstone unusable (see the gate chain below). */
 static void
 cuvsamcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
                    Cost *indexStartupCost, Cost *indexTotalCost,
@@ -1864,15 +1871,27 @@ flat_amcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
         double        kappa;
         if (n < 1) n = 1;
 
-        if (cuvs_phys_cost_ready(CUVS_HWPROBE_IPC_RTT | CUVS_HWPROBE_HBM_BW |
-                                 CUVS_HWPROBE_CPU_DIST, dim, &prof, &kappa))
+        double startup = 0.0, total = 0.0;
+        bool   physical = cuvs_phys_cost_ready(CUVS_HWPROBE_IPC_RTT | CUVS_HWPROBE_HBM_BW |
+                                               CUVS_HWPROBE_CPU_DIST, dim, &prof, &kappa);
+        if (physical && prof.hbm_bw_bpus > 0.0)
         {
             /* Physical: resident corpus streamed once from HBM per query.
              * startup = κ·ipc_rtt (fixed roundtrip), total += κ·(N·dim·4 / hbm_bw). */
-            double startup = kappa * prof.ipc_rtt_us;
-            double hbm_us  = ((double) n * (double) dim * 4.0) / prof.hbm_bw_bpus;
+            double hbm_us = ((double) n * (double) dim * 4.0) / prof.hbm_bw_bpus;
+            startup = kappa * prof.ipc_rtt_us;
+            total   = startup + kappa * hbm_us;
+            /* A pathological (tiny but in-band) hbm_bw could make total huge/Inf and
+             * silently drop the flat path; fall back to legacy if not finite. */
+            physical = isfinite(startup) && isfinite(total);
+        }
+        else
+            physical = false;
+
+        if (physical)
+        {
             *indexStartupCost = startup;
-            *indexTotalCost   = startup + kappa * hbm_us;
+            *indexTotalCost   = total;
         }
         else
         {
