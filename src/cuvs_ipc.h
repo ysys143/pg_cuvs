@@ -42,6 +42,14 @@
                                      * running top-k merge. cmd.n_vecs carries the per-chunk cap. */
 #define CUVS_OP_INJECT_BUILD_OOM 20 /* ADR-070: arm synthetic OOM for the next N cuvs_cagra_build
                                      * calls (cmd.dim = N; 0 = disarm) to test evict-and-retry. */
+#define CUVS_OP_BUILD_FLAT       21 /* ADR-073: build a standalone `flat` GPU exact brute-force
+                                     * index — persists .tids + .vectors only (no .cagra graph).
+                                     * Same [vectors][tids] corpus payload as CUVS_OP_BUILD. */
+#define CUVS_OP_SEARCH_BF_TRANSIENT 22 /* ADR-073 (B): one-shot GPU exact BF over a per-query corpus
+                                     * supplied by the backend (no resident IndexEntry). Corpus
+                                     * [vectors][tids] handed off via SCM_RIGHTS memfd (filter_shm_key
+                                     * names the SHM-tier fallback); query in shm_key. Non-evicting
+                                     * VRAM admission; returns top-k (tid,distance). */
 
 /* ----------------------------------------------------------------
  * Distance metrics (mirror pgvector operator names)
@@ -297,6 +305,37 @@ int cuvs_ipc_search_stream_bf(
     uint32_t       *latency_us_out
 );
 
+/*
+ * cuvs_ipc_search_bf_transient — ADR-073 (B): one-shot GPU exact brute force over
+ * a per-query corpus the backend supplies (no resident index). The corpus
+ * [float32 vecs n×dim][uint64_t tids n] is staged into a memfd (SCM_RIGHTS) — or
+ * a named shm fallback — and handed to the daemon, which runs cuvs_brute_force_search
+ * once and returns top-k (tid, distance). The daemon admits VRAM non-evictingly:
+ * it NEVER evicts a resident flat/cagra index for a transient corpus.
+ *
+ * Returns CUVS_STATUS_OK on success; CUVS_STATUS_OOM_FALLBACK if the corpus does
+ * not fit the VRAM budget (err_out carries an actionable message); CUVS_STATUS_*
+ * (DIM_MISMATCH, ERROR) otherwise; CUVS_STATUS_UNAVAILABLE if the daemon is down.
+ * The caller treats any non-OK status as a hard error (B has no CPU fallback).
+ */
+int cuvs_ipc_search_bf_transient(
+    const char     *socket_path,
+    uint32_t        db_oid,
+    const float    *corpus_vecs,   /* row-major n×dim float32 */
+    const uint64_t *corpus_tids,   /* n encoded TIDs (block<<16|offset) */
+    int64_t         n,
+    const float    *query_vec,
+    int             dim,
+    int             k,
+    uint32_t        metric,
+    uint64_t       *tids_out,       /* caller-allocated [k] */
+    float          *dist_out,       /* caller-allocated [k] */
+    int            *n_out,
+    uint32_t       *latency_us_out,
+    char           *err_out,        /* daemon error message on failure (may be NULL) */
+    size_t          err_len
+);
+
 int cuvs_ipc_search(
     const char   *socket_path,
     uint32_t      db_oid,
@@ -378,6 +417,30 @@ int cuvs_ipc_build(
     uint32_t       graph_degree,             /* 3R; 0 = cuVS default (64) */
     uint32_t       intermediate_graph_degree,/* 3R; 0 = cuVS default (128) */
     uint32_t       build_algo                /* 3R; CUVS_CAGRA_BUILD_* (0=AUTO) */
+);
+
+/*
+ * cuvs_ipc_build_flat — ADR-073: send a BUILD_FLAT command to the daemon.
+ *
+ * Identical corpus handoff to cuvs_ipc_build (memfd/shm/heap tiers, [vectors][tids]
+ * contiguous payload), but the daemon persists only .tids + .vectors (no .cagra
+ * graph) and registers a brute-force-only IndexEntry. Flat is always unsharded and
+ * has no graph/HNSW params, so this signature drops shard_count/use_cpu_hnsw and the
+ * 3R graph-build tuning. Returns CUVS_STATUS_OK on success.
+ */
+int cuvs_ipc_build_flat(
+    const char    *socket_path,
+    uint32_t       db_oid,
+    uint32_t       index_oid,
+    const struct CuvsBuildCorpus *corpus, /* tier + fd + shm_name */
+    const float   *heap_vecs,   /* CORPUS_HEAP only; NULL otherwise */
+    const uint64_t *heap_tids,  /* CORPUS_HEAP only; NULL otherwise */
+    int64_t        n_vecs,
+    int            dim,
+    uint32_t       metric,
+    const char    *index_dir,   /* daemon saves .tids + .vectors here */
+    uint32_t       table_oid,   /* heap relation OID */
+    uint32_t       relfilenode  /* heap relfilenode (heap compat identity) */
 );
 
 /*

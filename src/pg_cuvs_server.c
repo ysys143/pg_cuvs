@@ -120,6 +120,14 @@ typedef struct IndexEntry {
     int             stale;        /* 1 if heap writes happened since build (REINDEX needed) */
     time_t          stale_since;  /* when first marked stale; 0 if fresh */
 
+    /* ADR-073: this is a standalone `flat` index — GPU exact brute-force only,
+     * NO CAGRA graph. handle == NULL and shard_count == 0 (breaks the old
+     * "handle==NULL => sharded" assumption). Every search MUST take the
+     * brute-force path (main_bf_idx over .vectors); the cagra `handle` is never
+     * dereferenced. Set in handle_build_flat and load_index's flat branch; reset
+     * to 0 by reset_entry_stats for every cagra/ivfpq/sharded (re)init. */
+    int             is_flat;
+
     /* Phase 3B delta cache: resident GPU brute-force index over the pending
      * `.delta` vectors. Lazily (re)built in handle_search when the .delta file
      * appears/changes; freed on eviction. delta_idx==NULL means no GPU delta. */
@@ -205,6 +213,10 @@ reset_entry_stats(IndexEntry *e)
     e->warmup_duration_ms = 0;
     e->download_count     = 0;
     e->cache_miss_count   = 0;
+    /* ADR-073: default to non-flat. Every cagra/ivfpq/sharded (re)init funnels
+     * through reset_entry_stats, so this clears a reused slot's stale is_flat;
+     * the flat build/load paths set is_flat = 1 AFTER calling reset_entry_stats. */
+    e->is_flat            = 0;
 }
 
 /* Record a completed search on an entry. Caller MUST hold g_index_mutex. */
@@ -1542,6 +1554,82 @@ load_index(uint32_t db_oid, uint32_t index_oid)
         /* src == 1: no manifest -> unsharded path below (tids still owned here) */
     }
 
+    /* ADR-073: flat index — .tids + .vectors present, but NO .cagra and NO
+     * .ivfpq. Register brute-force-only (handle == NULL, is_flat = 1). The
+     * resident BF over .vectors is (re)built lazily + non-evictingly on the first
+     * search (refresh_main_bf_cache), so we reserve no graph VRAM here. Detected
+     * before the cagra VRAM make-room so a flat load never over-reserves or evicts
+     * a cagra index for a graph it will not allocate. */
+    {
+        char fcagra[512], fivfpq[512], fvecs[512];
+        index_file_path(fcagra, sizeof(fcagra), g_index_dir, db_oid, index_oid);
+        ivfpq_file_path(fivfpq, sizeof(fivfpq), g_index_dir, db_oid, index_oid);
+        vectors_file_path(fvecs, sizeof(fvecs), g_index_dir, db_oid, index_oid);
+        if (access(fcagra, F_OK) != 0 && access(fivfpq, F_OK) != 0
+            && access(fvecs, F_OK) == 0)
+        {
+            int fgpu = pick_gpu_for_index(0);
+            if (fgpu < 0) fgpu = usable_gpu(0);
+
+            /* Soft cap: free a slot if the registry is full (search-miss reload). */
+            if (g_n_indexes >= g_max_indexes)
+                evict_lru(fgpu);
+            if (g_n_indexes >= g_max_indexes)
+            {
+                free(tids);
+                return -1;
+            }
+
+            IndexEntry *e = &g_indexes[g_n_indexes++];
+            e->db_oid       = db_oid;
+            e->index_oid    = index_oid;
+            e->dim          = dim;
+            e->metric       = metric;
+            e->n_vecs       = n_vecs;
+            e->handle       = NULL;          /* no CAGRA graph — brute-force only */
+            e->ivfpq_handle = NULL;
+            e->ivfpq_n_vecs = 0;
+            e->ivfpq_vram_bytes = 0;
+            e->tids         = tids;          /* ownership transferred */
+            e->rev_tids     = NULL;
+            e->rev_item_ids = NULL;
+            build_rev_tid_map(e);            /* 3O: TID -> item_id reverse map */
+            e->vram_bytes   = 0;             /* BF is lazy; tracked in main_bf_vram_bytes */
+            e->last_search  = time(NULL);
+            e->valid        = 1;
+            e->gpu_device_id = (uint32_t) fgpu;
+            e->shard_count  = 0;
+            e->shards       = NULL;
+            e->inflight     = 0;
+            e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
+            e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+            e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+            e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
+            e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
+            e->hnsw_idx     = NULL;
+            e->n_extended   = 0;
+            e->compact_count = 0;
+            e->last_compact_at = 0;
+            e->warmup_state = WARMUP_HOT;
+            reset_entry_stats(e);
+            e->is_flat      = 1;             /* MUST be after reset_entry_stats */
+            e->last_search_mode = 3;         /* gpu_bf */
+
+            /* Restore staleness from the .stale sidecar (same as cagra). */
+            {
+                char stale_path[512];
+                struct stat st;
+                stale_file_path(stale_path, sizeof(stale_path), g_index_dir, db_oid, index_oid);
+                if (stat(stale_path, &st) == 0) { e->stale = 1; e->stale_since = st.st_mtime; }
+                else { e->stale = 0; e->stale_since = 0; }
+            }
+
+            LOG_INFO("pg_cuvs_server: loaded flat index %u/%u (%lld vecs, BF built lazily)\n",
+                     db_oid, index_oid, (long long) n_vecs);
+            return 0;
+        }
+    }
+
     /* VRAM make-room: evict LRU resident indexes to fit (tiered cache). Same
      * path as build, so a search miss on a non-resident index reloads it by
      * evicting the least-recently-used one. If it still won't fit after full
@@ -1691,6 +1779,27 @@ startup_load_indexes(void)
         closedir(dir);
     }
 
+    /* ADR-073: flat indexes have a "<db>_<idx>.vectors" + ".tids" but NO ".cagra"
+     * and NO ".shards", so both passes above miss them and they would be
+     * unsearchable after a daemon restart. Discover them via the .vectors sidecar.
+     * Dedup against already-loaded entries (a cagra index also writes a .vectors
+     * sidecar; it is already loaded by the .cagra pass, and even if reloaded here
+     * load_index sees its .cagra and does NOT take the flat branch). */
+    dir = opendir(g_index_dir);
+    if (dir)
+    {
+        while ((ent = readdir(dir)) != NULL)
+        {
+            uint32_t db_oid, index_oid;
+            char tail[16] = {0};
+            if (sscanf(ent->d_name, "%u_%u.%15s", &db_oid, &index_oid, tail) == 3
+                && strcmp(tail, "vectors") == 0
+                && !find_index(db_oid, index_oid))
+                load_index(db_oid, index_oid);
+        }
+        closedir(dir);
+    }
+
     /* Phase 3D: second pass — for indexes that have a .relfilenode sidecar
      * but no local .cagra, register as COLD and enqueue background download.
      * The daemon opens its UDS socket before these downloads complete, so
@@ -1833,6 +1942,20 @@ evict_lru(int device_id)
         free(e->rev_tids);     e->rev_tids     = NULL;
         free(e->rev_item_ids); e->rev_item_ids = NULL;
         freed = e->vram_bytes;   /* IVF-PQ sets vram_bytes == ivfpq_vram_bytes */
+    }
+    else if (e->is_flat)
+    {
+        /* ADR-073: flat's .tids + .vectors are durable on disk, so eviction needs
+         * no save — and MUST NOT call save_index (handle == NULL → it refuses,
+         * which would make the flat index un-evictable and pin VRAM). A later
+         * query reloads via load_index's flat branch and rebuilds the resident BF
+         * lazily. The only VRAM a flat entry holds is the resident main_bf_idx. */
+        freed = e->main_bf_vram_bytes;
+        free_delta_cache(e);
+        free_main_bf_cache(e);
+        free(e->tids);
+        free(e->rev_tids);     e->rev_tids     = NULL;
+        free(e->rev_item_ids); e->rev_item_ids = NULL;
     }
     else
     {
@@ -2288,6 +2411,154 @@ handle_search_stream_bf(int client_fd, const CuvsCmdFrame *cmd)
 }
 
 /* ----------------------------------------------------------------
+ * Handle SEARCH_BF_TRANSIENT command (CUVS_OP_SEARCH_BF_TRANSIENT, ADR-073 B)
+ *
+ * One-shot exact GPU brute force over a per-query corpus the backend supplies —
+ * NO resident IndexEntry. The corpus [float32 vecs n×dim][uint64_t tids n] arrives
+ * as an SCM_RIGHTS memfd (or a named shm in filter_shm_key); the query is in
+ * shm_key. VRAM admission is NON-EVICTING: a transient corpus must NEVER evict a
+ * resident flat/cagra index. The short search runs under g_index_mutex so
+ * total_vram_used() is consistent without a reservation counter. Touches no
+ * IndexEntry (no find_index/load_index/record_search_stat).
+ * ---------------------------------------------------------------- */
+static void
+handle_search_bf_transient(int client_fd, const CuvsCmdFrame *cmd)
+{
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    /* Second frame: corpus memfd via SCM_RIGHTS (passed_fd), else shm by name. */
+    char dir_buf[256] = {0};
+    int  passed_fd = -1;
+    if (cuvs_fd_recv(client_fd, dir_buf, sizeof(dir_buf), &passed_fd) < 0)
+    {
+        send_error(client_fd, "recv corpus frame failed");
+        return;
+    }
+
+    if (cmd->n_vecs < 1 || cmd->dim == 0)
+    {
+        if (passed_fd >= 0) close(passed_fd);
+        send_error_code(client_fd, CUVS_STATUS_ERROR, "transient BF needs >= 1 vector");
+        return;
+    }
+    {
+        size_t per_vec = (size_t)cmd->dim * sizeof(float) + sizeof(uint64_t);
+        if ((size_t)cmd->n_vecs > SIZE_MAX / per_vec)
+        {
+            if (passed_fd >= 0) close(passed_fd);
+            send_error_code(client_fd, CUVS_STATUS_ERROR, "transient BF payload overflow");
+            return;
+        }
+    }
+
+    size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
+    size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
+    size_t total     = vec_bytes + tid_bytes;
+
+    /* Map the corpus (memfd tier via SCM_RIGHTS; else named shm). */
+    void *mem;
+    if (passed_fd >= 0)
+    {
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, passed_fd, 0);
+        close(passed_fd);
+    }
+    else
+    {
+        int cfd = shm_open(cmd->filter_shm_key, O_RDONLY, 0);
+        if (cfd < 0) { send_error(client_fd, "corpus shm_open failed"); return; }
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, cfd, 0);
+        close(cfd);
+    }
+    if (mem == MAP_FAILED) { send_error(client_fd, "corpus mmap failed"); return; }
+
+    const float    *vecs = (const float *)mem;
+    const uint64_t *tids = (const uint64_t *)((const char *)mem + vec_bytes);
+
+    /* Map the query shm. */
+    size_t q_bytes = (size_t)cmd->dim * sizeof(float);
+    int qfd = shm_open(cmd->shm_key, O_RDONLY, 0);
+    if (qfd < 0) { munmap(mem, total); send_error(client_fd, "query shm_open failed"); return; }
+    float *query = mmap(NULL, q_bytes, PROT_READ, MAP_SHARED, qfd, 0);
+    close(qfd);
+    if (query == MAP_FAILED) { munmap(mem, total); send_error(client_fd, "query mmap failed"); return; }
+
+    int k  = (int)cmd->k; if (k < 1) k = 1;
+    int sk = (k < (int)cmd->n_vecs) ? k : (int)cmd->n_vecs;
+
+    /* --- VRAM admission (NON-EVICTING). Hold g_index_mutex across the short
+     * search so total_vram_used() stays consistent (no reservation counter). --- */
+    pthread_mutex_lock(&g_index_mutex);
+
+    size_t needed = vec_bytes;   /* corpus uploaded to the GPU as float32 */
+    int    dev    = pick_gpu_for_index(needed);
+    if (dev < 0
+        || (g_max_vram_per_gpu[dev] > 0
+            && total_vram_used(dev) + needed > g_max_vram_per_gpu[dev])
+        || needed > gpu_free_vram_bytes(dev))
+    {
+        pthread_mutex_unlock(&g_index_mutex);
+        munmap(query, q_bytes);
+        munmap(mem, total);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_OOM_FALLBACK;
+        snprintf(hdr.error, sizeof(hdr.error),
+                 "transient BF corpus %zu MB exceeds free GPU VRAM; reduce the WHERE "
+                 "selectivity, build a flat index, or use a cagra/ivfpq index",
+                 needed / (1024 * 1024));
+        LOG_WARN("[handle_search_bf_transient] db=%u %s\n", cmd->db_oid, hdr.error);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
+    CuvsSearchResult *res = malloc((size_t)sk * sizeof(CuvsSearchResult));
+    CuvsResult       *out = malloc((size_t)sk * sizeof(CuvsResult));
+    int rc = (!res || !out)
+           ? -1
+           : cuvs_brute_force_search(vecs, query, cmd->n_vecs, (int)cmd->dim,
+                                     sk, cmd->metric, res, dev);
+
+    pthread_mutex_unlock(&g_index_mutex);
+
+    munmap(query, q_bytes);
+
+    if (rc != 0)
+    {
+        free(res); free(out);
+        munmap(mem, total);
+        send_error(client_fd, "transient BF search failed");
+        return;
+    }
+
+    /* Map corpus rows -> TIDs (tids still mapped). */
+    int pn = 0;
+    for (int j = 0; j < sk; j++)
+    {
+        int64_t row = res[j].item_id;
+        if (row < 0 || row >= cmd->n_vecs)
+            continue;
+        out[pn].tid      = tids[row];
+        out[pn].distance = res[j].distance;
+        pn++;
+    }
+    munmap(mem, total);
+    free(res);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t lat = (uint32_t)((t1.tv_sec - t0.tv_sec) * 1000000 +
+                              (t1.tv_nsec - t0.tv_nsec) / 1000);
+
+    CuvsReplyHeader hdr = {0};
+    hdr.status     = CUVS_STATUS_OK;
+    hdr.n_results  = (uint32_t)pn;
+    hdr.latency_us = lat;
+    send_all(client_fd, &hdr, sizeof(hdr));
+    if (pn > 0)
+        send_all(client_fd, out, (size_t)pn * sizeof(CuvsResult));
+    free(out);
+}
+
+/* ----------------------------------------------------------------
  * Handle SEARCH command
  * ---------------------------------------------------------------- */
 static void
@@ -2453,8 +2724,14 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
      * fail closed with NO_VECTORS so the backend raises a clear "REINDEX to
      * enable brute_force" error rather than silently returning ANN results.
      * Delta is NOT merged here — `.vectors` already covers the full base corpus
-     * exactly. Sharded BF runs in the fanout block below. */
-    if (cmd->search_mode == 1 && e->shard_count < 2)
+     * exactly. Sharded BF runs in the fanout block below.
+     *
+     * ADR-073: a flat index (e->is_flat) FORCES this brute-force path regardless
+     * of cmd->search_mode. flat has handle == NULL, so the cagra dispatch below
+     * would deref NULL; the backend's flat_gettuple already sends search_mode=1,
+     * and this is the daemon-side defense-in-depth that also covers any other
+     * caller (e.g. a batch path that did not set search_mode). */
+    if ((cmd->search_mode == 1 || e->is_flat) && e->shard_count < 2)
     {
         /* Phase 3L-9: micro-batched path. When bf_batch_wait_us>0 and the batch
          * worker is up, hand this request to the worker instead of dispatching
@@ -3110,6 +3387,25 @@ handle_search(int client_fd, const CuvsCmdFrame *cmd)
         return;
     }
 
+    /* ADR-073 defense-in-depth: the cagra dispatch requires a non-NULL graph
+     * handle. A flat index (is_flat, handle==NULL) must never reach here — the
+     * brute-force gate above returns first — but guard structurally so any future
+     * path landing here with handle==NULL fails closed instead of dereferencing. */
+    if (e->handle == NULL)
+    {
+        free(raw);
+        munmap(query, vec_bytes);
+        CuvsReplyHeader hdr = {0};
+        hdr.status = CUVS_STATUS_NO_VECTORS;
+        strncpy(hdr.error,
+                "index has no CAGRA graph (flat/brute-force only)",
+                sizeof(hdr.error) - 1);
+        record_search_stat(e, CUVS_STATUS_NO_VECTORS, 0, hdr.error);
+        pthread_mutex_unlock(&g_index_mutex);
+        send_all(client_fd, &hdr, sizeof(hdr));
+        return;
+    }
+
     LOG_DEBUG("[handle_search] calling cuvs_cagra_search k=%d dim=%u...\n",
             k, cmd->dim);
     int ret = cuvs_cagra_search(e->handle, query, (int)cmd->dim, k, raw, e->gpu_device_id);
@@ -3309,7 +3605,11 @@ handle_search_batch(int client_fd, const CuvsCmdFrame *cmd)
     uint32_t Q      = (uint32_t) cmd->n_vecs;   /* SEARCH_BATCH: Q in n_vecs */
     int      dim    = (int) cmd->dim;
     int      k      = (int) cmd->k;
-    int      use_bf = (cmd->search_mode == 1);
+    /* ADR-073 FATAL fix: a flat index (handle==NULL) MUST use brute-force here.
+     * Without the e->is_flat term a flat batch search falls to the else branch
+     * below — cuvs_cagra_search_batch(e->handle, ...) — and dereferences NULL,
+     * crashing the daemon for every backend. */
+    int      use_bf = (cmd->search_mode == 1 || e->is_flat);
     int      K      = (int) ((int64_t) k < e->n_vecs ? (int64_t) k : e->n_vecs);
 
     if (Q == 0 || K <= 0)
@@ -5242,6 +5542,11 @@ handle_drop(int client_fd, const CuvsCmdFrame *cmd)
     if (e)
     {
         free_delta_cache(e);
+        /* ADR-073: free the resident main BF cache — flat's ONLY GPU allocation
+         * (handle is NULL), and a cagra index's secondary BF cache. NULL-safe.
+         * (Note: e->ivfpq_handle is still not freed here — a pre-existing IVF-PQ
+         * VRAM-on-drop leak, out of scope for ADR-073.) */
+        free_main_bf_cache(e);
         if (e->shard_count >= 2) free_index_shards(e);
         else if (e->handle)      cuvs_cagra_free(e->handle, e->gpu_device_id);
         free(e->tids);
@@ -5594,6 +5899,309 @@ handle_shard_stats(int client_fd, const CuvsCmdFrame *cmd)
     if (n > 0)
         send_all(client_fd, rows, (size_t)n * sizeof(CuvsShardStats));
     free(rows);
+}
+
+/* ----------------------------------------------------------------
+ * ADR-073: handle_build_flat — build a standalone flat (vectors-only) index.
+ *
+ * Persists .tids + .vectors ONLY (no .cagra graph) and registers a brute-force-
+ * only entry (handle == NULL, is_flat = 1). It does NOT call finish_build_commit
+ * (which serializes a CAGRA handle). The corpus handoff mirrors handle_build
+ * (memfd via SCM_RIGHTS, or named shm) because the backend builds the flat corpus
+ * with the same cuvs_corpus tiers. The resident GPU BF over .vectors is built
+ * lazily on the first search (refresh_main_bf_cache). n_vecs >= 1 is allowed
+ * (brute-force needs no neighborhood graph), reconciled with the load validator
+ * (cuvs_tids_read requires n > 0).
+ * ---------------------------------------------------------------- */
+static void
+handle_build_flat(int client_fd, const CuvsCmdFrame *cmd)
+{
+    char index_dir[256] = {0};
+    int  passed_fd = -1;
+    if (cuvs_fd_recv(client_fd, index_dir, sizeof(index_dir), &passed_fd) < 0)
+    {
+        send_error(client_fd, "recv index_dir failed");
+        return;
+    }
+
+    if (cmd->n_vecs < 1 || cmd->dim == 0)
+    {
+        if (passed_fd >= 0) close(passed_fd);
+        send_error(client_fd, "flat build needs at least 1 vector");
+        return;
+    }
+    {
+        size_t per_vec = (size_t)cmd->dim * sizeof(float) + sizeof(uint64_t);
+        if ((size_t)cmd->n_vecs > SIZE_MAX / per_vec)
+        {
+            if (passed_fd >= 0) close(passed_fd);
+            send_error(client_fd, "build payload size overflow");
+            return;
+        }
+    }
+
+    size_t vec_bytes = (size_t)cmd->n_vecs * cmd->dim * sizeof(float);
+    size_t tid_bytes = (size_t)cmd->n_vecs * sizeof(uint64_t);
+    size_t total     = vec_bytes + tid_bytes;
+
+    /* Corpus handoff (memfd tier via SCM_RIGHTS, else named shm) — same as
+     * handle_build. */
+    void *mem;
+    if (passed_fd >= 0)
+    {
+        LOG_INFO("[handle_build_flat] corpus via memfd(SCM_RIGHTS) fd=%d total=%zu\n",
+                 passed_fd, total);
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, passed_fd, 0);
+        close(passed_fd);
+    }
+    else
+    {
+        LOG_INFO("[handle_build_flat] corpus via shm_open(%s)\n", cmd->shm_key);
+        int shm_fd = shm_open(cmd->shm_key, O_RDONLY, 0);
+        if (shm_fd < 0)
+        {
+            send_error(client_fd, "shm_open failed");
+            return;
+        }
+        mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
+        close(shm_fd);
+    }
+    if (mem == MAP_FAILED)
+    {
+        send_error(client_fd, "mmap failed");
+        return;
+    }
+
+    const float    *vecs    = (const float *)mem;
+    const uint64_t *tids_in = (const uint64_t *)((const char *)mem + vec_bytes);
+
+    /* ADR-073 VRAM no-fit gate: the resident BF over .vectors needs N*dim*bytes of
+     * VRAM at search time (non-evicting). If the corpus cannot fit ANY GPU's
+     * configured budget even as float16, fail the build with a DISTINCT, actionable
+     * message — far clearer than letting every later search fail with the generic
+     * "sidecar missing or stale". A float32-only overflow is a non-fatal advisory.
+     * Budget-only check (config, not live free VRAM); dynamic shortfalls still
+     * surface at search time via refresh_main_bf_cache. */
+    {
+        size_t need_f32 = vec_bytes;
+        size_t need_f16 = vec_bytes / 2;
+        size_t max_budget = 0;
+        int    unlimited = 0;
+        int    ng = n_usable_gpus();
+        for (int i = 0; i < ng; i++)
+        {
+            size_t b = g_max_vram_per_gpu[usable_gpu(i)];
+            if (b == 0) { unlimited = 1; break; }   /* an unlimited GPU can hold it */
+            if (b > max_budget) max_budget = b;
+        }
+        if (!unlimited && max_budget > 0 && need_f16 > max_budget)
+        {
+            munmap(mem, total);
+            CuvsReplyHeader hdr = {0};
+            hdr.status = CUVS_STATUS_OOM_FALLBACK;
+            snprintf(hdr.error, sizeof(hdr.error),
+                     "flat corpus %zu MB (float16 %zu MB) exceeds the GPU VRAM budget "
+                     "(%zu MB); shard the table or use a cagra/ivfpq index",
+                     need_f32 / (1024*1024), need_f16 / (1024*1024),
+                     max_budget / (1024*1024));
+            LOG_WARN("[handle_build_flat] %u/%u %s\n", cmd->db_oid, cmd->index_oid, hdr.error);
+            send_all(client_fd, &hdr, sizeof(hdr));
+            return;
+        }
+        if (!unlimited && max_budget > 0 && need_f32 > max_budget)
+            LOG_WARN("[handle_build_flat] %u/%u corpus %zu MB exceeds VRAM budget as "
+                     "float32; use WITH (precision='float16') for brute-force search\n",
+                     cmd->db_oid, cmd->index_oid, need_f32 / (1024*1024));
+    }
+
+    /* --- Disk persistence: .tids + .vectors (tmp + rename). Our own commit,
+     * NOT finish_build_commit (which serializes a .cagra graph). --- */
+    const char *save_dir = (index_dir[0] != '\0') ? index_dir : g_index_dir;
+    mkdir(save_dir, 0700);
+
+    uint64_t *new_tids = malloc(tid_bytes);
+    if (!new_tids)
+    {
+        munmap(mem, total);
+        send_error_code(client_fd, CUVS_STATUS_BUILD_FAILED, "malloc tids failed");
+        return;
+    }
+    memcpy(new_tids, tids_in, tid_bytes);
+
+    /* Generation token: this build's .tids body CRC, embedded in .vectors so the
+     * loader rejects a torn (stale) sidecar after a crash. */
+    uint32_t tids_gen = cuvs_crc32(new_tids, (size_t)cmd->n_vecs * sizeof(uint64_t));
+
+    char tids_final[512], tids_tmp[576];
+    char vecs_final[512], vecs_tmp[576];
+    tids_file_path(tids_final, sizeof(tids_final), save_dir, cmd->db_oid, cmd->index_oid);
+    vectors_file_path(vecs_final, sizeof(vecs_final), save_dir, cmd->db_oid, cmd->index_oid);
+    snprintf(tids_tmp, sizeof(tids_tmp), "%s.tmp", tids_final);
+    snprintf(vecs_tmp, sizeof(vecs_tmp), "%s.tmp", vecs_final);
+
+    /* .vectors (float32 body + generation token) while the corpus is still mapped. */
+    {
+        FILE *vf = fopen(vecs_tmp, "wb");
+        int vok = (vf != NULL);
+        if (vok && cuvs_vectors_write(vf, cmd->n_vecs, cmd->dim, cmd->metric, tids_gen, vecs) != 0)
+            vok = 0;
+        if (vok && fflush(vf) != 0) vok = 0;
+        if (vok && fsync(fileno(vf)) != 0) vok = 0;
+        if (vf && fclose(vf) != 0) vok = 0;
+        if (!vok)
+        {
+            unlink(vecs_tmp);
+            free(new_tids);
+            munmap(mem, total);
+            send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "flat .vectors persist failed");
+            return;
+        }
+    }
+    munmap(mem, total);
+
+    if (write_tids_atomic(tids_tmp, cmd->n_vecs, cmd->dim, cmd->metric, new_tids) != 0)
+    {
+        unlink(vecs_tmp);
+        free(new_tids);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "flat .tids persist failed");
+        return;
+    }
+
+    /* Commit: rename .vectors then .tids. On a failure, unlink both so a partial
+     * (e.g. .vectors but no .tids) never registers — load_index needs .tids. */
+    if (rename(vecs_tmp, vecs_final) != 0)
+    {
+        unlink(vecs_tmp); unlink(tids_tmp);
+        free(new_tids);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "flat .vectors rename failed");
+        return;
+    }
+    if (rename(tids_tmp, tids_final) != 0)
+    {
+        unlink(tids_tmp); unlink(vecs_final);
+        free(new_tids);
+        send_error_code(client_fd, CUVS_STATUS_PERSIST_FAILED, "flat .tids rename failed");
+        return;
+    }
+    {
+        int dir_fd = open(save_dir, O_RDONLY);
+        if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    }
+
+    /* Remove any stale CAGRA / IVF-PQ / .shards / .stale artifacts for this OID so
+     * load_index unambiguously takes the flat branch. */
+    {
+        char p[512];
+        index_file_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid);   unlink(p);
+        ivfpq_file_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid);   unlink(p);
+        stale_file_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid);   unlink(p);
+        shards_manifest_path(p, sizeof(p), save_dir, cmd->db_oid, cmd->index_oid); unlink(p);
+    }
+
+    /* Register (or replace) in the hot registry — handle == NULL, is_flat = 1. */
+    pthread_mutex_lock(&g_index_mutex);
+    {
+        int fgpu = pick_gpu_for_index(0);
+        if (fgpu < 0) fgpu = usable_gpu(0);
+        IndexEntry *existing = find_index(cmd->db_oid, cmd->index_oid);
+        if (existing)
+        {
+            if (existing->handle)       cuvs_cagra_free(existing->handle, existing->gpu_device_id);
+            if (existing->ivfpq_handle) cuvs_ivfpq_free(existing->ivfpq_handle, existing->gpu_device_id);
+            free(existing->tids);
+            free_delta_cache(existing);
+            free_main_bf_cache(existing);
+            if (existing->hnsw_idx) { cuvs_hnsw_free(existing->hnsw_idx); existing->hnsw_idx = NULL; }
+            existing->handle         = NULL;
+            existing->ivfpq_handle   = NULL;
+            existing->ivfpq_n_vecs   = 0;
+            existing->ivfpq_vram_bytes = 0;
+            existing->tids           = new_tids;
+            existing->dim            = cmd->dim;
+            existing->metric         = cmd->metric;
+            existing->n_vecs         = cmd->n_vecs;
+            existing->vram_bytes     = 0;
+            existing->shard_count    = 0;
+            existing->shards         = NULL;
+            existing->inflight       = 0;
+            existing->gpu_device_id  = (uint32_t) fgpu;
+            existing->last_search    = time(NULL);
+            existing->valid          = 1;
+            existing->stale          = 0;
+            existing->stale_since    = 0;
+            existing->n_extended     = 0;
+            existing->compact_count  = 0;
+            existing->last_compact_at = 0;
+            existing->warmup_state   = WARMUP_HOT;
+            existing->last_search_mode = 3; /* gpu_bf */
+            free(existing->rev_tids);     existing->rev_tids     = NULL;
+            free(existing->rev_item_ids); existing->rev_item_ids = NULL;
+            build_rev_tid_map(existing);
+            reset_entry_stats(existing);
+            existing->is_flat        = 1;   /* MUST be after reset_entry_stats */
+        }
+        else
+        {
+            if (g_n_indexes >= g_max_indexes)
+                evict_lru(fgpu);
+            if (g_n_indexes >= g_max_indexes)
+            {
+                /* Soft cap: artifacts durable on disk; reload on demand. */
+                LOG_WARN("[handle_build_flat] registry full; %u/%u persisted, reload on demand\n",
+                         cmd->db_oid, cmd->index_oid);
+                free(new_tids);
+                pthread_mutex_unlock(&g_index_mutex);
+                CuvsReplyHeader hdr_ok = {0};
+                hdr_ok.status = CUVS_STATUS_OK;
+                send_all(client_fd, &hdr_ok, sizeof(hdr_ok));
+                return;
+            }
+            IndexEntry *e = &g_indexes[g_n_indexes++];
+            e->db_oid          = cmd->db_oid;
+            e->index_oid       = cmd->index_oid;
+            e->dim             = cmd->dim;
+            e->metric          = cmd->metric;
+            e->n_vecs          = cmd->n_vecs;
+            e->handle          = NULL;
+            e->ivfpq_handle    = NULL;
+            e->ivfpq_n_vecs    = 0;
+            e->ivfpq_vram_bytes = 0;
+            e->tids            = new_tids;
+            e->rev_tids        = NULL;
+            e->rev_item_ids    = NULL;
+            build_rev_tid_map(e);
+            e->vram_bytes      = 0;
+            e->last_search     = time(NULL);
+            e->valid           = 1;
+            e->stale           = 0;
+            e->stale_since     = 0;
+            e->shard_count     = 0;
+            e->shards          = NULL;
+            e->inflight        = 0;
+            e->gpu_device_id   = (uint32_t) fgpu;
+            e->delta_idx = NULL; e->delta_tids = NULL; e->n_delta = 0;
+            e->delta_generation = 0; e->delta_mtime = 0; e->delta_vram_bytes = 0;
+            e->delta_vecs_host = NULL; e->delta_n_cached = 0;
+            e->main_bf_idx = NULL; e->main_bf_n = 0; e->main_bf_vram_bytes = 0;
+            e->main_bf_mtime = 0; e->main_bf_generation = 0; e->bf_precision = 0;
+            e->hnsw_idx        = NULL;
+            e->n_extended      = 0;
+            e->compact_count   = 0;
+            e->last_compact_at = 0;
+            e->warmup_state    = WARMUP_HOT;
+            e->last_search_mode = 3; /* gpu_bf */
+            reset_entry_stats(e);
+            e->is_flat         = 1;   /* MUST be after reset_entry_stats */
+        }
+    }
+    pthread_mutex_unlock(&g_index_mutex);
+
+    LOG_INFO("pg_cuvs_server: built flat index %u/%u (%lld vecs, %zu MB on disk)\n",
+             cmd->db_oid, cmd->index_oid, (long long)cmd->n_vecs, vec_bytes / (1024*1024));
+
+    CuvsReplyHeader ok = {0};
+    ok.status = CUVS_STATUS_OK;
+    send_all(client_fd, &ok, sizeof(ok));
 }
 
 /* ----------------------------------------------------------------
@@ -6463,6 +7071,9 @@ connection_thread(void *arg)
         case CUVS_OP_BUILD_IVFPQ:
             handle_build_ivfpq(client_fd, &cmd);
             break;
+        case CUVS_OP_BUILD_FLAT:
+            handle_build_flat(client_fd, &cmd);   /* ADR-073 */
+            break;
         case CUVS_OP_SEARCH_IVFPQ:
             handle_search_ivfpq(client_fd, &cmd);
             break;
@@ -6489,6 +7100,9 @@ connection_thread(void *arg)
             break;
         case CUVS_OP_SEARCH_STREAM_BF:
             handle_search_stream_bf(client_fd, &cmd);
+            break;
+        case CUVS_OP_SEARCH_BF_TRANSIENT:
+            handle_search_bf_transient(client_fd, &cmd);
             break;
         default:
             send_error(client_fd, "unknown op");
@@ -6767,6 +7381,167 @@ graceful_shutdown(void)
 }
 
 /* ----------------------------------------------------------------
+ * ADR-075 Phase 1: probe hardware constants once at boot and write the GLOBAL
+ * cuvs_hw_profile (CRC) + cuvs_daemon_identity (text) sidecars atomically. The
+ * planner reads these cheaply; failure is non-fatal (planner falls back to
+ * compiled DEFAULTs). NOT consumed by any cost decision yet (Phase 2).
+ * ---------------------------------------------------------------- */
+/* ADR-075 Phase 2: host-side coefficient probes (no CUDA). Both best-effort and
+ * return -1 on failure so the caller leaves the field at DEFAULT with its bit
+ * clear (→ planner falls back to the legacy cost path for that coefficient). */
+
+/* Local AF_UNIX round-trip latency floor (microseconds) — the IPC cost a
+ * backend<->daemon request pays before any work. */
+static double
+probe_ipc_rtt_us(void)
+{
+    int    sv[2];
+    char   b = 0;
+    double best = 1e30;
+    int    i;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+        return -1.0;
+    /* warm */
+    if (write(sv[0], &b, 1) == 1 && read(sv[1], &b, 1) == 1 &&
+        write(sv[1], &b, 1) == 1 && read(sv[0], &b, 1) == 1) { /* ok */ }
+    for (i = 0; i < 50; i++)
+    {
+        struct timespec t0, t1;
+        double us;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (write(sv[0], &b, 1) != 1 || read(sv[1], &b, 1) != 1 ||
+            write(sv[1], &b, 1) != 1 || read(sv[0], &b, 1) != 1) { best = 1e30; break; }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        us = (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+        if (us > 0.0 && us < best) best = us;
+    }
+    close(sv[0]); close(sv[1]);
+    return (best < 1e29) ? best : -1.0;
+}
+
+/* CPU L2-distance throughput, (vectors*dim) per microsecond — the anchor that
+ * converts GPU microseconds into PG cost units. Clamped to a plausible band;
+ * outside it returns -1 (probe distrusted → DEFAULT/legacy). */
+static double
+probe_cpu_dist_tput(void)
+{
+    const int64_t   n = 100000; const int dim = 128;
+    float          *corpus = (float *) malloc((size_t) n * dim * sizeof(float));
+    float           q[128];
+    struct timespec t0, t1;
+    volatile double sink = 0.0;
+    double          us, tput;
+    int64_t         i; int j;
+
+    if (!corpus)
+        return -1.0;
+    for (i = 0; i < n * dim; i++)
+        corpus[i] = (float) ((uint64_t) i * 2654435761u % 1000) / 1000.0f;
+    for (j = 0; j < dim; j++) q[j] = 0.1f;
+
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (i = 0; i < n; i++)
+    {
+        const float *v = corpus + i * dim;
+        double s = 0.0;
+        for (j = 0; j < dim; j++) { double d = (double) v[j] - q[j]; s += d * d; }
+        sink += s;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    (void) sink;
+    free(corpus);
+
+    us = (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+    if (us <= 0.0)
+        return -1.0;
+    tput = (double) n * dim / us;            /* (vec*dim)/us */
+    if (tput < 1.0 || tput > 1.0e6)          /* implausible → distrust */
+        return -1.0;
+    return tput;
+}
+
+static void
+write_hw_profile(void)
+{
+    int           dev = (g_n_allowed_gpus > 0) ? g_allowed_gpus[0] : 0;
+    CuvsHwProfile p;
+    char          final[512], tmp[576];
+    FILE         *f;
+
+    mkdir(g_index_dir, 0700);   /* may not exist yet if no index built */
+
+    memset(&p, 0, sizeof(p));
+    if (dev >= 0 && dev < g_n_gpus)
+    {
+        strncpy(p.gpu_name, g_gpus[dev].name, sizeof(p.gpu_name) - 1);
+        p.total_vram_bytes = (int64_t) g_gpus[dev].total_vram_bytes;
+    }
+    p.n_gpus      = (uint32_t) g_n_gpus;
+    p.measured_at = (int64_t) time(NULL);
+    /* Conservative DEFAULTs (shared with the planner fallback); probes overwrite. */
+    p.link_bw_bpus    = CUVS_HWP_DEFAULT_LINK_BW;
+    p.hbm_bw_bpus     = CUVS_HWP_DEFAULT_HBM_BW;
+    p.gpu_bf_tput     = CUVS_HWP_DEFAULT_BF_TPUT;
+    p.ipc_rtt_us      = CUVS_HWP_DEFAULT_IPC_RTT;
+    p.cpu_dist_tput   = CUVS_HWP_DEFAULT_CPU_DIST;   /* v2; probed in Stage 3 */
+    p.gpu_cagra_lat_us = CUVS_HWP_DEFAULT_CAGRA_LAT; /* v2; probed in Stage 3 */
+    p.probe_status    = 0;
+
+    cuvs_probe_hw(dev, &p.link_bw_bpus, &p.hbm_bw_bpus, &p.gpu_bf_tput,
+                  &p.gpu_cagra_lat_us, &p.probe_status);
+
+    /* Host-side coefficients (no CUDA): IPC RTT floor + CPU distance throughput. */
+    {
+        double rtt  = probe_ipc_rtt_us();
+        double cput = probe_cpu_dist_tput();
+        if (rtt  > 0.0) { p.ipc_rtt_us    = rtt;  p.probe_status |= CUVS_HWPROBE_IPC_RTT; }
+        if (cput > 0.0) { p.cpu_dist_tput = cput; p.probe_status |= CUVS_HWPROBE_CPU_DIST; }
+    }
+
+    /* atomic profile write */
+    snprintf(final, sizeof(final), "%s/cuvs_hw_profile", g_index_dir);
+    snprintf(tmp,   sizeof(tmp),   "%s.tmp", final);
+    f = fopen(tmp, "wb");
+    if (f)
+    {
+        int ok = (cuvs_hw_profile_write(f, &p) == 0);
+        if (ok && fflush(f) != 0) ok = 0;
+        if (ok && fsync(fileno(f)) != 0) ok = 0;
+        if (fclose(f) != 0) ok = 0;
+        if (ok && rename(tmp, final) != 0) ok = 0;
+        if (!ok) { unlink(tmp); LOG_WARN("pg_cuvs_server: hw_profile write failed errno=%d\n", errno); }
+    }
+    else
+        LOG_WARN("pg_cuvs_server: hw_profile fopen(%s) failed errno=%d\n", tmp, errno);
+
+    /* atomic daemon-identity write (text: gpu_name / pid / boot epoch) */
+    snprintf(final, sizeof(final), "%s/cuvs_daemon_identity", g_index_dir);
+    snprintf(tmp,   sizeof(tmp),   "%s.tmp", final);
+    f = fopen(tmp, "w");
+    if (f)
+    {
+        int ok = (fprintf(f, "%s\n%d\n%lld\n", p.gpu_name, (int) getpid(),
+                          (long long) p.measured_at) > 0);
+        if (ok && fflush(f) != 0) ok = 0;
+        if (ok && fsync(fileno(f)) != 0) ok = 0;
+        if (fclose(f) != 0) ok = 0;
+        if (ok && rename(tmp, final) != 0) ok = 0;
+        if (!ok) unlink(tmp);
+    }
+
+    {
+        int dir_fd = open(g_index_dir, O_RDONLY);
+        if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
+    }
+
+    LOG_INFO("pg_cuvs_server: hw_profile gpu='%s' link_bw=%.0f hbm_bw=%.0f bf_tput=%.0f "
+             "cpu_dist=%.0f cagra_lat=%.1f ipc_rtt=%.1f probe_status=0x%x\n",
+             p.gpu_name, p.link_bw_bpus, p.hbm_bw_bpus, p.gpu_bf_tput,
+             p.cpu_dist_tput, p.gpu_cagra_lat_us, p.ipc_rtt_us, p.probe_status);
+}
+
+/* ----------------------------------------------------------------
  * main
  * ---------------------------------------------------------------- */
 int
@@ -6879,6 +7654,9 @@ main(int argc, char **argv)
         return 1;
     }
     LOG_INFO("index registry capacity: %d (--max-indexes)\n", g_max_indexes);
+
+    /* ADR-075 Phase 1: probe hardware + write the global cost-model profile. */
+    write_hw_profile();
 
     /* Initialize per-device VRAM budgets.
      *

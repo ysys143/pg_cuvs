@@ -14,10 +14,11 @@
 | 3E/3F/3G | Multi-GPU sharding (placement, parallel fanout, auto shard count, DROP cleanup, snapshot, delta cache, eviction) |
 | 3I | GPU Build Accelerator — CAGRA→pgvector HNSW export (`pg_cuvs_build_hnsw`), CPU HNSW fallback, GPU-less dump/restore |
 | 3K | `CREATE INDEX ... USING pg_cuvs_hnsw` DDL 전환 + `source` optional(heap에서 ephemeral CAGRA 빌드) + metric 선검증. `pg_cuvs_build_hnsw()` deprecate. installcheck GREEN (ADR-038/041) |
-| 3L | GPU brute force 검색 모드 (`.vectors` sidecar, `search_mode`/`bf_precision` GUC, micro-batching, sharded BF). installcheck GREEN, recall@10=1.0 (ADR-039) |
+| 3L | GPU brute force 검색 모드 (`.vectors` sidecar, `search_mode`/`bf_precision` GUC, micro-batching, sharded BF). installcheck GREEN, recall@10=1.0 (ADR-039). **deprecated path**: `cuvs.search_mode='brute_force'`는 `USING flat` AM으로 대체됨 (ADR-073) |
+| **flat AM (A1)** | **GPU exact brute-force 1급 AM** — `CREATE INDEX … USING flat (… vector_l2_ops) WITH (precision='float16')`. `.tids`+`.vectors`만 빌드(그래프 없음), recall=1.0, GUC 무관, 재시작 내구성. extension 0.4.0. installcheck **31/31 GREEN** + isolation **3/3 GREEN** + 재시작 내구성 검증(A100, 2026-06-14). `CUVS_FLAT_STARTUP_COST=50` 전용 비용. ADR-073; **ADR-071 흡수/supersede** |
 | 3M | 배치 검색 API (`CUVS_OP_SEARCH_BATCH`, `pg_cuvs_batch_search` SRF, CAGRA/BF/sharded 지원). installcheck GREEN, Q×K top-k 일치 (ADR-040) |
 | 3H-full | 운영 runbook 4종 추가 (capacity-planning, replica-bootstrap, release-upgrade, benchmark-runbook) + 기존 3H-light. TBD: streaming 물리복제 / cross-version upgrade 검증 |
-| 3B | DiskANN/NVMe cold tier — **NO-GO** (cuVS 26.04 PQFlash 미완성, 재검토 조건: 1B+ 수요 또는 cuVS stable; 재개 시 구현 방향 ADR-072) |
+| 3B | DiskANN/NVMe cold tier — **NO-GO** (cuVS 26.04 PQFlash 미완성, 재검토 조건: 1B+ 수요 또는 cuVS stable; 재개 시 구현 방향 ADR-072 — cold tier는 vchord 공존이 아니라 DiskANN 라이브러리로 자체 소유) |
 | 하드닝 | `index_dir` reloption — cross-session seqscan 폴백 근절. 인덱스가 빌드 디렉터리를 `pg_class.reloptions`에 self-describe (reloption > 세션 GUC > `$PGDATA` 3단계). installcheck GREEN, no-GUC 연결에서 Index Scan 실증 (ADR-045) |
 | 하드닝 | orphan artifact GC (`pg_cuvs_gc_orphans(do_delete)`) — 데몬-down DROP / DROP DATABASE / 재시작 좀비 재로드로 인한 VRAM+디스크 누수 근절. backend가 `index_dir`을 `pg_index`/`pg_database`와 대조(daemon은 sidecar라 카탈로그 불가). dry-run 기본. installcheck GREEN(gc_orphans) + 데몬-down e2e 검증. ADR-009 정정 반영 (ADR-046) |
 | 4-preflight | 연산 지역성 프로파일링 완료 (A100/PG16, N=1M dim=1024). 검색 GPU:IPC≈2:1(GPU-bound), 빌드 GPU 82%/backend 18%, export buffer-mgr 39%, TOAST vs PLAIN 8%. 측정 근거로 4A 하향. `docs/profiling-results.md` (ADR-044) |
@@ -39,6 +40,14 @@
 
 | Phase | 내용 | 트랙 |
 |-------|------|------|
+| **flat B (transient)** | `cuvs.gpu_bruteforce` GUC(off/auto/on, 기본 off) — 인덱스 없이 vector ORDER BY를 transient GPU-BF CustomScan(`CuvsTransientBF`)으로 라우팅(W1: 쓰기 폭주·항상최신·ad-hoc 필터). Sort 수용 + 실행시 파라미터 바인딩. op 22(`CUVS_OP_SEARCH_BF_TRANSIENT`). **VM 검증 완료**: installcheck **32/32 GREEN** + isolation **3/3 GREEN**(A100, 2026-06-14). ADR-073 | **완료** |
+| **flat B 라우팅 캘리브레이션** | **측정 완료**(A100, 2026-06-14, ADR-069 루프): unfiltered top-k에서 B vs **병렬 CPU seqscan** **교차점 없음**(B 전 구간 2–8× 느림, seq/B≤0.51; 쿼리당 O(N·dim) 코퍼스 재마샬 지배). **결정**: `auto` plan-time 승격 안 함(regret-averse) — B는 명시적 `on` 전용; F5 `on`-force 수정만 적용. live `auto`는 런타임 적응 라우팅/filtered 교차점 측정의 후속(ADR-073) | **완료** |
+| **flat 성능 특성화 + 포지셔닝 수정 (ADR-074)** | **측정 완료**(A100, 2026-06-14, 100k×768): A1 상주 read **1.09ms (CPU 559ms 대비 ~500x)**; 분해상 **거리계산≈0(L2 memory-bound)**, 비용은 **TOAST detoast ~535ms**가 지배(CPU·B 공통). **transient B는 잉여** — 읽기 GPU 이득 0(memory-bound + 매쿼리 H2D), 쓰기 0=pgvector-무인덱스와 중복. **A1 쓰기 ~13x**(행당 데몬 IPC extend; +HOT 비활성·compaction·delta cap·VRAM 천장). **포지셔닝**: 읽기多→A1(GPU 상주) / 쓰기多→pgvector 무인덱스(CPU) / B=신규투자 중단·거취 보류. **MVCC**: A1 visibility 안전(gettuple TID+`xs_recheck` → executor 스냅샷 recheck; tombstone=VACUUM xmin horizon) | **완료(측정)** |
+| **flat isolation 스펙 (flat 변종)** | **완료**(A100, 2026-06-14): cagra 3 스펙의 `USING flat` 변종 추가 → A1 MVCC 직접 검증, **installcheck-isolation 6/6 GREEN**(flat이 cagra와 동일 MVCC-correct). 부수 발견: `pg_cuvs_compact`는 cagra 전용(flat은 REINDEX로 compaction) (ADR-074) | **완료** |
+| **B 거취 — experimental 강등 (결정)** | **결정됨**(ADR-074): 삭제 ❌ → experimental(코드 보존·`auto` off·`on` 전용). **하드웨어-의존** — PCIe-attached GPU에선 잉여(pgvector 동급), 통합메모리(GH200 NVLink-C2C ~900GB/s / MI300A APU)에선 W1 1급(매쿼리 H2D 페널티 붕괴 → 빌드 없이 CPU 이김). 재평가 트리거 = 통합메모리 HW 확보; 자동 스위치 = 하드웨어-포터블 cost | **결정** |
+| **코스트 모델 v2 — 물리 분해 + 하드웨어-포터블 계수 (ADR-075)** | **Phase 1+2 구현·VM 검증 완료**(`feat/hw-profile`, ADR-075 Phase 2 구현절). Phase 1: 데몬 startup probe(`link_bw`/`hbm_bw`/`gpu_bf_tput`/`ipc_rtt` + v2 `cpu_dist_tput`/`gpu_cagra_lat_us`) → CRC sidecar(v2, 정체성 태그) → 플래너 싸게 read + `pg_cuvs_hw_profile()`. Phase 2: cagra/flat 비용을 κ=`cpu_operator_cost·cpu_dist_tput/dim` 앵커로 물리화(probe 비트 게이트; 미측정/Tier-1/`cuvs.enable_phys_cost=off`는 레거시 바이트 동일). A100 검증: dim8 N=10000에서 레거시는 seqscan·물리는 cagra(배포별 교차점 교정), N=2000 anti-flip. **남음(트리거)**: transient B 물리공식 활성 + `auto`(통합메모리 GH200/MI300A) | Phase1+2 done / B-auto 트리거 |
+| **filtered 교차점 + 런타임 적응 라우팅** | live `auto`의 전제: filtered wedge(B의 filter-first vs CPU exact-filtered) 교차점 측정 + 동시성/offload 런타임 신호. ADR-075 코스트 v2 위에서 (ADR-074/ADR-069/ADR-075) | 트리거 |
+| **release-prep** | 벤치마크 공개·문서 정합성·운영 플레이북 완성. **flat/B 작업 전부 완료 후 맨 마지막** | 순차 (flat 전체 선결) |
 | circuit breaker 전역화 · SQL latency split | 운영 하드닝 잔여 (fallback 관측성은 PR #43 완료) | 트리거 |
 | ~~MAX_INDEXES 상향/동적화 + 런타임-축출 auto-reload~~ [OK] | 다중 테넌트 파티션 온라인-스케일 선결. 측정·근거 ADR-061 / STRATEGY_NOTES §G | **완료** (ADR-068): 레지스트리를 *하드월*→*소프트 LRU 캡*으로 전환 — `--max-indexes`(기본 1024, was 64, calloc) + `load_index` 슬롯-확보 eviction(auto-reload 배선) + build 경로 graceful defer. `gpu-test-maxidx`: cap 4에 10테넌트 빌드 ERROR 0 + 전 테넌트 쿼리 GPU reload(evict=16/reload=10). installcheck 26/26 |
 | 3N | OFFSET-aware K 자동 조정 (ORM pagination 호환) | 트리거 (ORM 요구) |
@@ -52,7 +61,7 @@
 
 ### 릴리스 후 기능 (순차)
 
-> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **다음 순차 작업: 릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조). **릴리스 준비 후 순차: 엄밀 벤치마크 + 코스트모델 보정**(ADR-069, [design/BENCHMARK_PROTOCOL.md](design/BENCHMARK_PROTOCOL.md) — Stage A 물리 실측 → Stage B regret 보정 루프 → 동결 → 필터/증분/Pareto 스위트. 논문 트랙 R1–R5는 별도 일정).
+> **3A Pending Delta는 완료**(완료 표 참조). streaming write(INSERT/UPDATE/DELETE) 후 REINDEX 없이 GPU+delta 병합으로 정합한 top-k를 반환한다. 3L `CuvsBfIndex`를 3A-2 GPU delta cache가 재사용. 상세 스펙·검증은 [design/PLAN.md — Phase 3A](design/PLAN.md), 결정은 ADR-047. **4A(빌드 오버헤드)·3R(빌드 파라미터 reloption)도 완료**(완료 표 참조; 4A=ADR-057/058/059, 3R=ADR-052), **3S(취소 전파)도 완료**(ADR-053), **D(exact filtered BF)도 완료**(ADR-063, 잔여 4항목 포함), **3O(CAGRA-first BITSET prefilter)도 완료**(ADR-048, PR #36/#37), **3Q(CAGRA Streaming Updates)도 완료**(ADR-051, installcheck 21/21), **4C(Background Compaction)도 완료**(ADR-050, installcheck 22/22 + isolation 3/3), **3C/3D(GCS snapshot + replica async warmup)도 완료·인증**(ADR-013/ADR-066, 실 GCS round-trip `make gpu-test-objstore`, installcheck 25/25 + isolation 3/3) — 기능 순차 경로 완료. **repo 공개 전 운영 하드닝 3종(fallback 관측성=PR #43 · VRAM budget 강제=ADR-065 해소 · OOM 후 재사용=PR #42)도 완료**. **MAX_INDEXES 하드월도 해소**(ADR-068, PR #45 — 소프트 LRU 캡 `--max-indexes` 기본 1024 + 슬롯-확보 auto-reload; PR #50 Tier-1 evict/reload 가드). **CI 2-tier도 구현·검증 완료**(ADR-067, PR #46–48/#50 — Tier 1 매 PR 자동 + Tier 2 UI 버튼 실 A100 26/26). README도 현재화 완료(Install/Requirements/Compatibility/Quickstart/Usage). 라이선스는 **PostgreSQL License**로 확정. **flat A1(`USING flat`)은 VM 검증 완료**(installcheck 31/31 + isolation 3/3 + 재시작 내구성, ADR-073, 2026-06-14). **flat B(transient)도 VM 검증 완료**(installcheck 32/32 + isolation 3/3, ADR-073, 2026-06-14; GUC `cuvs.gpu_bruteforce`(off/auto/on), CustomScan `CuvsTransientBF`, op 22). **B 라우팅 캘리브레이션도 측정 완료**(A100, ADR-069 루프): unfiltered top-k에서 B는 병렬 CPU seqscan 대비 교차점 없음(2–8× 느림) → `auto` plan-time 승격 안 함(regret-averse), B는 명시적 `on` 전용. **flat 성능 특성화·포지셔닝 수정도 완료**(ADR-074): A1 상주 read 1.09ms(CPU 559ms 대비 ~500x), 병목은 TOAST detoast(~535ms, 거리계산≈0=memory-bound), **transient B는 pgvector-무인덱스와 중복(잉여)**, A1 쓰기 ~13x. 포지셔닝 = 읽기多→A1·쓰기多→pgvector-무인덱스·B 보류. MVCC visibility 안전(단 flat isolation 스펙 미검증 → 후속). **다음 순차 작업: flat isolation 스펙 → B 거취 결정 → 릴리스 준비**. **릴리스 준비 — `BENCHMARK.md` 공개 · 문서 정합성/현행화 · 운영 플레이북 완성**(아래 "릴리스 준비 — 문서·운영 정비" 절; "에코시스템 진입 계획" 전제조건 참조). **릴리스 준비 후 순차: 엄밀 벤치마크 + 코스트모델 보정**(ADR-069, [design/BENCHMARK_PROTOCOL.md](design/BENCHMARK_PROTOCOL.md) — Stage A 물리 실측 → Stage B regret 보정 루프 → 동결 → 필터/증분/Pareto 스위트. 논문 트랙 R1–R5는 별도 일정).
 
 ### 자원 거버넌스 하드닝 — 확정 버그 3개 (ADR-070, PR #54)
 
@@ -107,6 +116,16 @@
 ## 트리거 기반 백로그 (번호 없음 — 조건 충족 시 승격)
 
 순차 경로(릴리스 후 기능)와 섞지 않는다. 각 항목은 트리거가 충족될 때 순차 트랙으로 승격한다.
+
+### 코스트 모델 v2 — Phase 3 (transient B 물리화 + `auto`) — 장비 블록
+
+> **블록(2026-06-15)**: Phase 1+2는 구현·VM 검증 완료(`feat/hw-profile`, ADR-075 Phase 2 구현절 — cagra/flat 물리 비용 + κ 앵커 + probe-bit 게이트). Phase 3는 **하드웨어 부재로 보류**. PCIe-attached A100에서는 transient B가 잉여(ADR-074: 매쿼리 H2D로 pgvector-무인덱스와 중복)라 `auto` 승격이 regret-positive — 진짜 이득은 **통합메모리(GH200 NVLink-C2C ~900GB/s / MI300A APU)**에서만 발생(매쿼리 H2D 페널티 붕괴).
+
+- **트리거**: 통합메모리급 GPU 확보.
+- **작업**: (1) `cuvs_transient_bf_add_path`의 `on` 강제 1.0를 유지하되 `auto`(1) 경로에 물리 공식 배선 — `κ·(ipc_rtt + bytes(N)/link_bw + N·dim/gpu_bf_tput) + cpu_operator_cost·N`(detoast는 PG 단위, probe 불필요). (2) `link_bw` 밴드로 `auto` 게이트(통합메모리에서만 B 승격). (3) `bf_tput` probe를 검색-전용(업로드 제외)으로 정밀화 — 현재 end-to-end라 transient용으로 과대. (4) filtered wedge 교차점 + 런타임 적응 신호(아래 행과 연계).
+- **검증**: 통합메모리 HW에서 B-vs-CPU-seqscan 교차점 실측 → `routing_golden_measured`에 B-flip 케이스 추가, regret-averse 확인.
+
+스펙: ADR-075(Phase 2 구현절·Phase 3 설계), ADR-074(B 거취), ADR-073(transient B).
 
 ### 분산 운영 — 3C/3D (완료·인증 — 완료 표 참조)
 

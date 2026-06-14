@@ -4,7 +4,7 @@
 > modes, GUCs, reloptions, SQL functions, and observability views. How the pieces fit together is
 > in [ARCHITECTURE.md](../ARCHITECTURE.md); the rationale behind each is in
 > [design/DECISIONS.md](../design/DECISIONS.md). Verified against `src/pg_cuvs.c` and
-> `sql/pg_cuvs--0.3.0.sql`.
+> `sql/pg_cuvs--0.5.0.sql` (extension version 0.5.0).
 
 ---
 
@@ -17,8 +17,67 @@ pg_cuvs registers three index AMs. All reuse pgvector's `vector` type and operat
 | AM | Create | Tuning (reloptions) | Served by | Sidecar files |
 |----|--------|---------------------|-----------|---------------|
 | `cagra` | `CREATE INDEX i ON t USING cagra (col vector_l2_ops)` | `graph_degree`, `intermediate_graph_degree`, `build_algo`, `index_dir` | GPU daemon | `.cagra`, `.tids`, (`.vectors`, `.delta`, `.tombstone`, `.stale`, `.shards`, `.sNNN.cagra`, `.relfilenode`) |
+| `flat` | `CREATE INDEX i ON t USING flat (col vector_l2_ops) WITH (precision='float16')` | `precision`, `index_dir` | GPU daemon | `.tids`, `.vectors` (no `.cagra` graph) |
 | `ivfpq` | `CREATE INDEX i ON t USING ivfpq (col vector_l2_ops)` | `n_lists`, `pq_bits`, `pq_dim` | GPU daemon | `.ivfpq`, `.tids` |
 | `pg_cuvs_hnsw` | `CREATE INDEX i ON t USING pg_cuvs_hnsw (col vector_l2_ops) WITH (source='my_cagra', mode='nsw')` | `source`, `mode`, `m`, `ef_construction` | **pgvector** (CPU) | `.hnsw` (pgvector page format) |
+
+`flat` is the first-class exact GPU brute-force AM (ADR-073, extension v0.4.0). It builds only a
+`.tids` + `.vectors` store — no CAGRA graph — so the build is O(N) copy rather than graph
+construction. Search is always exact (recall=1.0) regardless of `cuvs.search_mode`; the AM
+forces brute-force internally. Freshness uses the same delta/tombstone mechanism as `cagra`
+(INSERTs append to `.delta`, merged at search time). The planner picks `flat` via its own cost
+function: when the hardware profile is fully probed and `cuvs.enable_phys_cost` is on, cost is the
+ADR-075 physical model (§ Cost model & hardware profile); otherwise it falls back to the legacy
+constants (`CUVS_FLAT_STARTUP_COST=50`, vs `CUVS_STARTUP_COST=1000` for cagra). Either way small-N
+tables route to `flat` correctly. DROP removes `.tids` + `.vectors` and releases VRAM. The index is
+restart-durable: `.vectors` is reloaded on daemon restart. Use `flat` for read-heavy, stable
+corpora where recall=1.0 is required; use `cagra`/`ivfpq` for approximate search at large N.
+
+> **Deprecated:** `SET cuvs.search_mode = 'brute_force'` on a `cagra` index was the previous way
+> to get GPU exact BF. It still works (ADR-039) but is deprecated. `USING flat` is the
+> first-class replacement: independent AM, honest build semantics, dedicated cost routing. The GUC
+> path couples an exact-BF workload to an unnecessary graph build and cannot be independently cost-
+> calibrated by the planner.
+
+### Transient no-index GPU brute-force (`cuvs.gpu_bruteforce`)
+
+When `cuvs.gpu_bruteforce = on`, the planner routes a no-index single-table
+`ORDER BY veccol <-> q LIMIT k` query to a transient GPU exact brute-force Custom Scan node named
+`CuvsTransientBF` — no index required. This is the W1 counterpart to `USING flat` (W2 resident
+index): use it when write velocity or always-fresh semantics make maintaining a flat index
+impractical.
+
+Key properties:
+- **Exact** (recall@k = 1.0) and **always fresh** — scans the live heap under the query snapshot
+  every call; no delta or tombstone logic needed.
+- **Filter-first**: WHERE clauses are applied before the GPU handoff, not post-filtered.
+- **Exec-time parameter binding**: `ORDER BY col <-> $1 LIMIT k` parametrized queries are NOT
+  downgraded to approximate search.
+- **Fires only for the bounded shape**: single base relation (no join), no OFFSET, no GROUP
+  BY/DISTINCT/HAVING/window, a plan-time Const LIMIT in 1..100000, single distance ORDER BY key.
+  Any other shape falls back to seqscan. The planner keeps `Limit → Sort → CustomScan` (no
+  pathkeys claimed).
+- **Host cap** (`cuvs.gpu_bruteforce_max_mb`, default 2048): if the per-query corpus materialized
+  on the host exceeds this limit, the query fails closed with a clear ERROR rather than silently
+  falling back.
+- **Non-evicting VRAM admission**: the daemon never evicts a resident `flat` or `cagra` index to
+  make room for a transient corpus. If the corpus exceeds the VRAM budget the daemon returns
+  `OOM_FALLBACK` and the backend raises an ERROR; no crash.
+- **Write cost zero** (no index to maintain). Read cost is paid per query: heap scan + detoast +
+  H2D transfer every call. For read-heavy stable corpora, `USING flat` (W2) is more efficient.
+
+Mental model: "flat index present → use it (A1/W2); no index + `gpu_bruteforce=on` → B (W1)."
+
+Verified Tier-2 on A100/PG16 (2026-06-14): `make installcheck` 32/32 GREEN + isolation 3/3 GREEN.
+
+```sql
+SET cuvs.gpu_bruteforce = on;
+-- No index needed; a plain ORDER BY query uses CuvsTransientBF:
+SELECT ctid, embedding <-> '[1,2,3]' AS dist
+FROM items
+ORDER BY embedding <-> '[1,2,3]'
+LIMIT 10;
+```
 
 `ivfpq` trades recall for 10–100× lower VRAM via product quantization. `pg_cuvs_hnsw` is the GPU
 *build accelerator*: it builds a pgvector HNSW from a CAGRA graph without pgvector's CPU build,
@@ -28,6 +87,29 @@ the deprecated function form `pg_cuvs_build_hnsw()` in §5.
 > Cosine opclass note: for `pg_cuvs_hnsw` the cosine opclass mirrors pgvector exactly — proc 1 is
 > the negative inner product and proc 2 is `vector_norm` (pgvector normalizes at build and ranks by
 > inner product), not `cosine_distance`.
+
+### Cost model & hardware profile (ADR-075)
+
+The planner decides between a GPU index (`cagra`/`flat`) and a CPU seqscan by **cost**. Two regimes:
+
+- **Physical (default, when probed)** — the daemon measures the deployment's hardware at boot
+  (CPU↔GPU `link_bw`, `hbm_bw`, GPU brute-force throughput, IPC round-trip, CPU distance
+  throughput, CAGRA per-query latency) and writes a CRC'd profile sidecar. The planner reads it
+  cheaply (no CUDA/IPC) and costs GPU paths in real PG cost-units via the anchor
+  `κ = cpu_operator_cost · cpu_dist_tput / dim`: `cagra ≈ κ·(ipc_rtt + cagra_latency)`,
+  `flat ≈ κ·ipc_rtt + κ·(N·dim·4 / hbm_bw)`. The GPU-vs-seqscan crossover is therefore located by
+  the deployment's hardware and the query's dimension, not a baked constant.
+- **Legacy fallback (byte-identical to pre-0.5.0)** — when `cuvs.enable_phys_cost = off`, the
+  profile is missing/partial/corrupt, or the build is the Tier-1 CPU shim (which leaves the GPU
+  coefficients unprobed — only the host-side `ipc_rtt`/`cpu_dist` bits get set, so the required GPU
+  probe bits are never satisfied), the planner uses the legacy heuristic constants (`CUVS_STARTUP_COST=1000`, `CUVS_FLAT_STARTUP_COST=50`,
+  k-dominant). Routing is unchanged from prior versions in this regime.
+
+Inspect the active profile with `pg_cuvs_hw_profile()` (§5): `source = measured` confirms the
+physical regime; `probe_status` shows which coefficients were measured; `matches_running_daemon`
+flags a stale profile after a GPU swap / migration. The transient-BF (`auto`) path is **not** yet
+cost-driven — `cuvs.gpu_bruteforce = auto` stays off-behavior pending unified-memory hardware
+(ADR-075 Phase 3).
 
 ---
 
@@ -44,7 +126,7 @@ decoder.
 | `gpu_cagra` | 0 | GPU CAGRA approximate NN (default) |
 | `cpu_hnsw` | 1 | CPU HNSW fallback via `.hnsw` sidecar (`cuvs.cpu_hnsw_fallback`) |
 | `cpu_fallback` | 2 | Generic CPU path (seqscan / pgvector) after a daemon-side gate |
-| `brute_force` | 3 | GPU exact BF over the `.vectors` sidecar (`cuvs.search_mode='brute_force'`) |
+| `brute_force` | 3 | GPU exact BF over the `.vectors` sidecar (`cuvs.search_mode='brute_force'` on a `cagra` index). **Deprecated** — use `USING flat` instead (ADR-073) |
 | `cagra_prefilter` | 4 | CAGRA with GPU BITSET prefilter (3O filtered search) |
 | `ivfpq` | 5 | GPU IVF-PQ (`ivfpq` AM) |
 | `stream_bf` | 6 | Out-of-core filtered BF streamed from `.vectors` (ADR-064) |
@@ -65,6 +147,7 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 | GUC | Type | Default | Range | Set by | Purpose |
 |-----|------|---------|-------|--------|---------|
 | `enable_cuvs` | bool | `on` | — | USERSET | Master switch for the GPU path; off routes everything to CPU |
+| `cuvs.enable_phys_cost` | bool | `on` | — | USERSET | Use the ADR-075 physical (hardware-anchored) cost model for `cagra`/`flat` when the profile is fully probed. Off (or unprobed/Tier-1) → legacy heuristic constants, byte-identical routing. See § Cost model & hardware profile |
 | `cuvs.debug` | bool | `off` | — | USERSET | Emit a per-search NOTICE with daemon latency + metric (for EXPLAIN VERBOSE) |
 | `cuvs.socket_path` | string | `/tmp/.s.pg_cuvs` | — | SUSET | UDS path to the daemon |
 | `cuvs.index_dir` | string | `$PGDATA/cuvs_indexes` | — | SUSET | Artifact directory (empty = resolved at runtime) |
@@ -82,7 +165,9 @@ Defaults and ranges are from source. "Set by" is the minimum role/scope: `USERSE
 
 | GUC | Type | Default | Range | Set by | Purpose |
 |-----|------|---------|-------|--------|---------|
-| `cuvs.search_mode` | enum | `cagra` | `cagra`, `brute_force` | USERSET | CAGRA ANN vs GPU exact BF |
+| `cuvs.search_mode` | enum | `cagra` | `cagra`, `brute_force` | USERSET | CAGRA ANN vs GPU exact BF on a `cagra` index. `brute_force` value is **deprecated** — use `USING flat` AM instead. A `flat` index always forces exact BF regardless of this GUC |
+| `cuvs.gpu_bruteforce` | enum | `off` | `off`, `auto`, `on` | USERSET | **EXPERIMENTAL, hardware-dependent (ADR-074).** Route a no-index single-table vector top-k query to the transient GPU BF CustomScan (`CuvsTransientBF`). On a **PCIe-attached GPU it does NOT beat CPU pgvector** (memory-bound + per-query H2D) — not recommended; use `USING flat` (read-heavy) or plain pgvector no-index (write-heavy). It becomes a first-class W1 path only on **unified-memory hardware** (Grace Hopper / MI300A) where the H2D penalty collapses. `auto` behaves as `off` (reserved until hardware-portable cost auto-enables it where it wins); `on` forces the path for qualifying single-table top-k shapes (ADR-073/ADR-074) |
+| `cuvs.gpu_bruteforce_max_mb` | int | `2048` | 1–INT_MAX | USERSET | Host-side hard cap (MiB) on the per-query corpus materialized before the GPU handoff. Queries whose corpus exceeds this limit fail closed with an ERROR |
 | `cuvs.bf_precision` | enum | `float32` | `float32`, `float16` | USERSET | Resident BF index precision; float16 halves VRAM |
 | `cuvs.bf_batch_wait_us` | int | `0` (off) | 0–10000 | USERSET | Daemon BF micro-batch coalescing window (µs) |
 | `cuvs.cpu_hnsw_fallback` | bool | `off` | — | USERSET | Serve from the `.hnsw` sidecar instead of GPU CAGRA |
@@ -155,6 +240,18 @@ daemon-only ones have no session equivalent.
 
 ## 4. Reloptions
 
+### `flat`
+
+| Reloption | Type | Default | Range / values | Notes |
+|-----------|------|---------|----------------|-------|
+| `precision` | enum | `float32` | `float32`, `float16` | Resident BF index precision. `float16` halves VRAM (N·dim·2 B vs ·4 B); falls back to `cuvs.bf_precision` GUC if not set |
+| `index_dir` | string | (uses `cuvs.index_dir`) | path | Per-index artifact directory; same semantics as `cagra` (ADR-045) |
+
+VRAM sizing: `float32` requires N·dim·4 bytes resident (e.g. 1M×1024 ≈ 4 GB); `float16` halves
+it. If the corpus does not fit in free VRAM at build time the daemon returns a dedicated
+no-fit error ("corpus N·dim·4B exceeds free VRAM; try precision=float16, shard, or use
+cagra/ivfpq") rather than silently failing.
+
 ### `cagra`
 
 | Reloption | Type | Default | Range / values | Notes |
@@ -199,6 +296,7 @@ daemon-only ones have no session equivalent.
 | `cuvs_filtered_knn(index regclass, query vector, filter_tids tid[], k int)` | TABLE (ctid tid, distance float4) | Type-safe `tid[]` overload (accepts `ctid` directly) |
 | `pg_cuvs_gc_orphans(do_delete bool DEFAULT false)` | SETOF (db_oid oid, index_oid oid, reason text, action text) | Reconcile `index_dir` vs catalog; dry-run by default (ADR-046) |
 | `pg_cuvs_last_search_latency_us()` / `_n_results()` / `_k()` / `_index()` / `_metric()` | int / int / int / oid / text | Process-local stats for the most recent scan in this backend; NULL if none |
+| `pg_cuvs_hw_profile()` | SETOF (gpu_name text, n_gpus int, total_vram_bytes bigint, link_bw_bytes_per_us float8, hbm_bw_bytes_per_us float8, gpu_bf_tput float8, ipc_rtt_us float8, measured_at_epoch bigint, probe_status int, source text, matches_running_daemon bool, cpu_dist_tput float8, gpu_cagra_lat_us float8) | The measured (or DEFAULT) hardware profile the daemon wrote at boot, consumed by the ADR-075 cost model. `source` = `measured` \| `default`; `probe_status` is a bitmask of which coefficients were measured; `matches_running_daemon` = false flags a stale profile (GPU swap / migration). Read-only, no CUDA/IPC |
 
 ### Internal / unsupported
 

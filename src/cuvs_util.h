@@ -185,6 +185,75 @@ int cuvs_vectors_write_multi(FILE *f, const int64_t *n_each, int n_parts,
 int cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out);
 
 /* ----------------------------------------------------------------
+ * Versioned, checksummed hardware profile (ADR-075 cost-model v2, Phase 1).
+ *
+ * GLOBAL (one per deployment, not per-index) sidecar `<index_dir>/cuvs_hw_profile`
+ * written once by the daemon at boot after GPU detection. Holds measured PHYSICAL
+ * constants (bandwidths/latencies) that the cost model will consume per deployment
+ * so coefficients are not baked to one machine. Self-contained: all data is in the
+ * struct (no separate body), so body_crc32 covers all bytes AFTER it (probe_status
+ * onward). LITTLE-ENDIAN ONLY, x86-64 daemon. The planner reads + validates this
+ * cheaply at plan time (no CUDA/IPC); any mismatch -> caller uses compiled DEFAULTs.
+ * ---------------------------------------------------------------- */
+#define CUVS_HWPROFILE_MAGIC   0x46505748u   /* 'HWPF' little-endian */
+/* v1: link_bw/hbm_bw/gpu_bf_tput/ipc_rtt (136 bytes).
+ * v2: + cpu_dist_tput + gpu_cagra_lat_us (152 bytes) for the physical cost model
+ *     (ADR-075 Phase 2). The reader accepts v1 (older daemon) and zero-fills the
+ *     v2 tail with DEFAULTs + clear bits, so the planner falls back to legacy. */
+#define CUVS_HWPROFILE_VERSION 2u
+
+/* probe_status bits: set = field measured on this hardware; clear = compiled DEFAULT. */
+#define CUVS_HWPROBE_LINK_BW   0x1u
+#define CUVS_HWPROBE_HBM_BW    0x2u
+#define CUVS_HWPROBE_BF_TPUT   0x4u
+#define CUVS_HWPROBE_IPC_RTT   0x8u
+#define CUVS_HWPROBE_CPU_DIST  0x10u  /* v2: CPU L2-distance throughput measured */
+#define CUVS_HWPROBE_CAGRA_LAT 0x20u  /* v2: CAGRA per-query graph-search latency measured */
+
+typedef struct CuvsHwProfile {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t body_crc32;       /* crc32 over all bytes AFTER this field (probe_status..end) */
+    /* --- crc-covered body starts here --- */
+    uint32_t probe_status;     /* CUVS_HWPROBE_* bits */
+    char     gpu_name[64];     /* primary GPU name (CuvsGpuDeviceInfo.name); env/identity tag */
+    uint32_t n_gpus;
+    uint32_t reserved;         /* must be 0 */
+    int64_t  total_vram_bytes; /* primary GPU total VRAM */
+    int64_t  measured_at;      /* epoch seconds at probe time */
+    double   link_bw_bpus;     /* CPU<->GPU H2D bandwidth, bytes per microsecond */
+    double   hbm_bw_bpus;      /* GPU device memory bandwidth, bytes per microsecond */
+    double   gpu_bf_tput;      /* brute-force throughput, (vectors*dim) per microsecond */
+    double   ipc_rtt_us;       /* loopback IPC round-trip, microseconds */
+    /* --- v2 tail (ADR-075 Phase 2); v1 readers/files treat these as DEFAULT --- */
+    double   cpu_dist_tput;    /* CPU L2-distance throughput, (vectors*dim) per microsecond */
+    double   gpu_cagra_lat_us; /* CAGRA per-query graph-search latency floor, microseconds */
+} CuvsHwProfile;               /* fixed-size POD, naturally aligned, LE-only */
+
+/* Byte sizes of each on-disk version (for the version-conditional read). */
+#define CUVS_HWPROFILE_SZ_V1   (offsetof(CuvsHwProfile, cpu_dist_tput))
+#define CUVS_HWPROFILE_SZ_V2   (sizeof(CuvsHwProfile))
+
+/* Stamp magic/version + body_crc32 on *p (body fields already filled) and fwrite
+ * it. Returns 0 / -1. Caller does fflush/fsync/rename. */
+int cuvs_hw_profile_write(FILE *f, CuvsHwProfile *p);
+
+/* Read + validate a cuvs_hw_profile from an open FILE*. Validates magic, version,
+ * reserved==0, and body crc32. On success returns 0 and fills *out; on any
+ * failure returns -1 (caller falls back to compiled DEFAULT coefficients). */
+int cuvs_hw_profile_read(FILE *f, CuvsHwProfile *out);
+
+/* Conservative DEFAULT coefficients used when no measured profile is present.
+ * Shared by the daemon (pre-probe seed) and the planner (fallback) so 'default'
+ * behavior is consistent. bytes-per-microsecond unless noted. */
+#define CUVS_HWP_DEFAULT_LINK_BW   12000.0      /* ~12 GB/s (PCIe floor) */
+#define CUVS_HWP_DEFAULT_HBM_BW    1000000.0    /* ~1 TB/s floor */
+#define CUVS_HWP_DEFAULT_BF_TPUT   1000.0       /* (vectors*dim) per microsecond */
+#define CUVS_HWP_DEFAULT_IPC_RTT   500.0        /* microseconds */
+#define CUVS_HWP_DEFAULT_CPU_DIST  200.0        /* CPU (vectors*dim) per microsecond */
+#define CUVS_HWP_DEFAULT_CAGRA_LAT 1000.0       /* CAGRA graph-search latency, microseconds */
+
+/* ----------------------------------------------------------------
  * Versioned, checksummed .shards manifest (Phase 3F multi-GPU sharding).
  *
  * Marks a logical CAGRA index as split into N standalone CAGRA shard

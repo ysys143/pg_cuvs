@@ -20,6 +20,20 @@ typedef struct CuvsGpuDeviceInfo {
  * Returns the number of GPUs found (0 if none). */
 int cuvs_detect_gpus(CuvsGpuDeviceInfo *out, int max_devices);
 
+/* ADR-075 Phase 1: measure physical hardware constants on `device_id`.
+ *   link_bw_bpus  -- CPU->GPU H2D bandwidth, bytes per microsecond
+ *   hbm_bw_bpus   -- GPU device-memory bandwidth, bytes per microsecond
+ *   gpu_bf_tput      -- brute-force throughput, (vectors*dim) per microsecond
+ *   gpu_cagra_lat_us -- CAGRA per-query graph-search latency floor, microseconds
+ * Best-effort: each output is OVERWRITTEN only if its probe succeeds, with the
+ * matching CUVS_HWPROBE_* bit OR'd into *probe_status (defined in cuvs_util.h);
+ * on any CUDA failure that field is left untouched (caller keeps its DEFAULT) and
+ * the bit stays clear. Never aborts; returns 0. The CPU-shim build stubs this to
+ * a no-op so every coefficient falls back to DEFAULT. */
+int cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
+                  double *gpu_bf_tput, double *gpu_cagra_lat_us,
+                  unsigned int *probe_status);
+
 /* Result from GPU search: top-K (item_id, distance) pairs. */
 typedef struct CuvsSearchResult {
     int64_t  item_id;

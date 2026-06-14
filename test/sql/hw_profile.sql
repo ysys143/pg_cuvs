@@ -1,0 +1,23 @@
+-- hw_profile.sql — ADR-075 Phase 1: the daemon writes a hardware profile at boot
+-- and pg_cuvs_hw_profile() exposes it. Tier-portable: under the Tier-1 CPU shim the
+-- daemon still writes a valid profile (DEFAULT coefficients, probe_status=0); under
+-- Tier-2 A100 the probes fill measured coefficients. So we assert structure, not
+-- machine-specific values: a valid profile present, positive coefficients, and the
+-- profile matching the running daemon. NOT consumed by routing (Phase 2).
+--
+-- REQUIRES: pg_cuvs_server running (writes the profile at boot); cuvs.index_dir =
+-- the daemon's --index-dir so the backend reads the same sidecar.
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+SELECT source = 'measured'            AS profile_present,
+       n_gpus >= 1                    AS has_gpu,
+       link_bw_bytes_per_us > 0       AS link_bw_pos,
+       hbm_bw_bytes_per_us  > 0       AS hbm_bw_pos,
+       gpu_bf_tput          > 0       AS bf_tput_pos,
+       ipc_rtt_us           > 0       AS ipc_pos,
+       cpu_dist_tput        > 0       AS cpu_dist_pos,
+       gpu_cagra_lat_us     > 0       AS cagra_lat_pos,
+       matches_running_daemon         AS matches
+FROM pg_cuvs_hw_profile();

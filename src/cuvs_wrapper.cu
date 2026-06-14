@@ -12,6 +12,7 @@
 
 #include "cuvs_wrapper.h"
 #include "cuvs_ipc.h"   /* CUVS_METRIC_* (PG-free, CUDA-free defines) */
+#include "cuvs_util.h"  /* ADR-075: CUVS_HWPROBE_* bits (PG-free, CUDA-free) */
 
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>  /* serialize/deserialize merged here in cuVS 25.x+ */
@@ -28,6 +29,7 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <chrono>   /* ADR-075: host wall-clock for the BF throughput probe */
 #include <fstream>
 #include <stdexcept>
 #include <mutex>
@@ -244,6 +246,149 @@ cuvs_gpu_available(void)
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
     return (err == cudaSuccess && device_count > 0) ? 1 : 0;
+}
+
+/* ----------------------------------------------------------------
+ * ADR-075 Phase 1: physical hardware-constant probe (cost-model v2).
+ * Best-effort; each field written + bit set only on success.
+ * ---------------------------------------------------------------- */
+extern "C" int
+cuvs_probe_hw(int device_id, double *link_bw_bpus, double *hbm_bw_bpus,
+              double *gpu_bf_tput, double *gpu_cagra_lat_us,
+              unsigned int *probe_status)
+{
+  try {
+    if (cudaSetDevice(device_id) != cudaSuccess)
+        return 0;
+
+    const size_t BYTES = 64u * 1024u * 1024u;   /* 64 MB transfer probe */
+    const int    ITERS = 5;
+
+    cudaEvent_t t0, t1;
+    if (cudaEventCreate(&t0) != cudaSuccess)
+        return 0;
+    if (cudaEventCreate(&t1) != cudaSuccess) { cudaEventDestroy(t0); return 0; }
+
+    /* --- link_bw: pinned-host -> device H2D (min of ITERS) --- */
+    {
+        void *h = nullptr, *d = nullptr;
+        if (cudaMallocHost(&h, BYTES) == cudaSuccess &&
+            cudaMalloc(&d, BYTES) == cudaSuccess)
+        {
+            memset(h, 0, BYTES);
+            cudaMemcpy(d, h, BYTES, cudaMemcpyHostToDevice);   /* warm up */
+            float best_ms = 1e30f;
+            for (int i = 0; i < ITERS; i++) {
+                cudaEventRecord(t0);
+                cudaMemcpy(d, h, BYTES, cudaMemcpyHostToDevice);
+                cudaEventRecord(t1);
+                if (cudaEventSynchronize(t1) != cudaSuccess) { best_ms = 1e30f; break; }
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, t0, t1) == cudaSuccess && ms > 0.0f && ms < best_ms)
+                    best_ms = ms;
+            }
+            if (best_ms < 1e29f && best_ms > 0.0f) {
+                *link_bw_bpus = (double)BYTES / ((double)best_ms * 1000.0);  /* bytes/us */
+                *probe_status |= CUVS_HWPROBE_LINK_BW;
+            }
+        }
+        if (d) cudaFree(d);
+        if (h) cudaFreeHost(h);
+    }
+
+    /* --- hbm_bw: device -> device (2*BYTES traffic = read+write) --- */
+    {
+        void *a = nullptr, *b = nullptr;
+        if (cudaMalloc(&a, BYTES) == cudaSuccess &&
+            cudaMalloc(&b, BYTES) == cudaSuccess)
+        {
+            cudaMemset(a, 0, BYTES);
+            cudaMemcpy(b, a, BYTES, cudaMemcpyDeviceToDevice);   /* warm up */
+            float best_ms = 1e30f;
+            for (int i = 0; i < ITERS; i++) {
+                cudaEventRecord(t0);
+                cudaMemcpy(b, a, BYTES, cudaMemcpyDeviceToDevice);
+                cudaEventRecord(t1);
+                if (cudaEventSynchronize(t1) != cudaSuccess) { best_ms = 1e30f; break; }
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, t0, t1) == cudaSuccess && ms > 0.0f && ms < best_ms)
+                    best_ms = ms;
+            }
+            if (best_ms < 1e29f && best_ms > 0.0f) {
+                double bw = (2.0 * (double)BYTES) / ((double)best_ms * 1000.0);  /* bytes/us */
+                /* Plausibility band (~10 GB/s .. 100 TB/s). A contended/garbage
+                 * measurement outside this leaves the DEFAULT + bit clear so the
+                 * planner uses the legacy cost (else a tiny hbm_bw would blow up
+                 * the flat cost and silently drop the path). */
+                if (bw >= 1.0e4 && bw <= 1.0e8) {
+                    *hbm_bw_bpus = bw;
+                    *probe_status |= CUVS_HWPROBE_HBM_BW;
+                }
+            }
+        }
+        if (a) cudaFree(a);
+        if (b) cudaFree(b);
+    }
+
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+
+    /* --- gpu_bf_tput: time a synthetic resident BF (reuses the real entry) --- */
+    {
+        const int64_t n = 20000; const int dim = 128; const int k = 10;
+        std::vector<float> corpus((size_t)n * dim, 0.5f);
+        std::vector<float> query(dim, 0.5f);
+        std::vector<CuvsSearchResult> res(k);
+        auto s0 = std::chrono::steady_clock::now();
+        int rc = cuvs_brute_force_search(corpus.data(), query.data(), n, dim, k,
+                                         CUVS_METRIC_L2, res.data(), device_id);
+        auto s1 = std::chrono::steady_clock::now();
+        if (rc == 0) {
+            double us = std::chrono::duration<double, std::micro>(s1 - s0).count();
+            if (us > 0.0) {
+                *gpu_bf_tput = ((double)n * (double)dim) / us;   /* (vec*dim)/us */
+                *probe_status |= CUVS_HWPROBE_BF_TPUT;
+            }
+        }
+    }
+
+    /* --- gpu_cagra_lat_us: build a small CAGRA index, time a single-query search
+     * (the per-query graph-search latency floor; ~N-independent). Warm once so the
+     * timed runs do not pay first-query kernel load. Best-effort. --- */
+    {
+        const int64_t n = 10000; const int dim = 128; const int k = 10;
+        std::vector<float> corpus((size_t)n * dim), query(dim, 0.1f);
+        for (size_t i = 0; i < corpus.size(); i++)
+            corpus[i] = (float)((i * 2654435761u) % 1000) / 1000.0f;
+        std::vector<CuvsSearchResult> res(k);
+        CuvsCagraIndex idx = cuvs_cagra_build(corpus.data(), n, dim, CUVS_METRIC_L2,
+                                              0, 0, CUVS_CAGRA_BUILD_AUTO, device_id);
+        if (idx) {
+            (void) cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id); /* warm */
+            double best_us = 1e30;
+            for (int i = 0; i < 5; i++) {
+                auto c0 = std::chrono::steady_clock::now();
+                int rc = cuvs_cagra_search(idx, query.data(), dim, k, res.data(), device_id);
+                auto c1 = std::chrono::steady_clock::now();
+                if (rc == 0) {
+                    double us = std::chrono::duration<double, std::micro>(c1 - c0).count();
+                    if (us > 0.0 && us < best_us) best_us = us;
+                }
+            }
+            if (best_us < 1e29) {
+                *gpu_cagra_lat_us = best_us;
+                *probe_status |= CUVS_HWPROBE_CAGRA_LAT;
+            }
+            cuvs_cagra_free(idx, device_id);
+        }
+    }
+    return 0;
+  } catch (...) {
+    /* never let a C++ exception (cuVS/RMM bad_alloc, raft::exception, ...) cross
+     * the extern "C" boundary and abort the daemon — the probe is best-effort,
+     * any failure leaves DEFAULTs + bits clear. */
+    return 0;
+  }
 }
 
 /* ----------------------------------------------------------------

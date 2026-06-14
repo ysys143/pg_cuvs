@@ -1,0 +1,110 @@
+-- routing_golden_measured.sql — ADR-075 Phase 2 fence (Tier-2, measured part).
+--
+-- The cost-MAGNITUDE routing decisions (no enable_* toggle) — the ones the
+-- physical, hardware-anchored cost model actually moves. Tier-2 ONLY (real GPU +
+-- measured hardware profile): the chosen path depends on the deployment's
+-- measured coefficients, so it is not Tier-portable and lives in
+-- REGRESS_TIER2_ONLY. The toggle-forced, magnitude-independent cases are in
+-- routing_golden.sql.
+--
+-- The physical model locates the cagra-vs-seqscan crossover by cost instead of a
+-- baked constant, and must NOT bias it toward the GPU:
+--   * small N (2000): a tiny CPU seqscan+sort is cheaper than cagra's fixed GPU
+--     per-query latency floor (κ·(ipc_rtt + gpu_cagra_lat_us)) → seqscan WINS
+--     under BOTH the physical and the legacy model (anti-flip — the model does
+--     not force the GPU to win where it shouldn't).
+--   * N=10000: here the models DISAGREE — the legacy constant (startup 1000)
+--     still picks seqscan, but the hardware-anchored physical cost (κ-scaled
+--     ~hundreds, cagra ~N-independent) correctly picks cagra: on this GPU the
+--     real per-query latency already beats a 10k-row CPU scan. THIS is the
+--     crossover the baked constant got wrong per deployment. (Verified: with
+--     cuvs.enable_phys_cost=off the same query reverts to seqscan.)
+-- flat stays flat (resident HBM stream, low fixed cost); the no-index default
+-- stays seqscan.
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir = the daemon's --index-dir.
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS vector;
+NOTICE:  extension "vector" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+NOTICE:  extension "pg_cuvs" already exists, skipping
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+CREATE FUNCTION plan_scan(q text) RETURNS text AS $$
+DECLARE line text;
+BEGIN
+  FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF line LIKE '%CuvsTransientBF%'            THEN RETURN 'transient_bf'; END IF;
+    IF line LIKE '%Index Scan using rg_cagra%'  THEN RETURN 'cagra';        END IF;
+    IF line LIKE '%Index Scan using rg_flat%'   THEN RETURN 'flat';         END IF;
+    IF line LIKE '%Seq Scan%'                   THEN RETURN 'seqscan';      END IF;
+  END LOOP;
+  RETURN 'other';
+END$$ LANGUAGE plpgsql;
+-- Deterministic 8-dim generator (same as routing_golden.sql), parameterized by N.
+CREATE FUNCTION rg_fill(tbl regclass, nrows int) RETURNS void AS $$
+BEGIN
+  EXECUTE format($f$
+    INSERT INTO %s
+    SELECT g,
+           format('[%%s,%%s,%%s,%%s,%%s,%%s,%%s,%%s]',
+                  sin(g * 0.013)::numeric(12,6), cos(g * 0.0007)::numeric(12,6),
+                  sin(g * 0.10)::numeric(12,6), cos(g * 0.17)::numeric(12,6),
+                  ((g %% 13) * 0.05)::numeric(12,6), ((g %% 7) * 0.08)::numeric(12,6),
+                  sin(g * 0.30)::numeric(12,6), cos(g * 0.23)::numeric(12,6))::vector
+    FROM generate_series(1, %s) g$f$, tbl, nrows);
+END$$ LANGUAGE plpgsql;
+CREATE TABLE rg_small (id int, embedding vector(8));   -- N=2000  → anti-flip (both seqscan)
+CREATE TABLE rg_large (id int, embedding vector(8));   -- N=10000 → physical flips to cagra (legacy: seqscan)
+CREATE TABLE rg_flat_tbl (id int, embedding vector(8));
+CREATE TABLE rg_noidx_tbl (id int, embedding vector(8));
+SELECT rg_fill('rg_small', 2000);
+ rg_fill 
+---------
+ 
+(1 row)
+
+SELECT rg_fill('rg_large', 10000);
+ rg_fill 
+---------
+ 
+(1 row)
+
+SELECT rg_fill('rg_flat_tbl', 2000);
+ rg_fill 
+---------
+ 
+(1 row)
+
+SELECT rg_fill('rg_noidx_tbl', 2000);
+ rg_fill 
+---------
+ 
+(1 row)
+
+CREATE INDEX rg_cagra    ON rg_small USING cagra (embedding vector_l2_ops);
+CREATE INDEX rg_cagra_lg ON rg_large USING cagra (embedding vector_l2_ops);
+CREATE INDEX rg_flat     ON rg_flat_tbl USING flat (embedding vector_l2_ops);
+ANALYZE rg_small;
+ANALYZE rg_large;
+ANALYZE rg_flat_tbl;
+ANALYZE rg_noidx_tbl;
+-- ============================================================ Cost-driven routing
+SELECT
+  -- (1) cagra present, N=2000: seqscan wins (GPU latency floor > tiny CPU scan) —
+  -- same under legacy and physical (anti-flip).
+  plan_scan('SELECT id FROM rg_small ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5')  AS cagra_small_n,
+  -- (2) cagra present, N=10000: physical picks cagra where the LEGACY constant
+  -- would pick seqscan — the per-deployment crossover the constant got wrong.
+  plan_scan('SELECT id FROM rg_large ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5')  AS cagra_large_n,
+  -- (3) flat present, small N: flat wins (resident HBM stream).
+  plan_scan('SELECT id FROM rg_flat_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5')  AS flat_present,
+  -- (4) no index, GPU BF off (default): plain Seq Scan + Sort.
+  plan_scan('SELECT id FROM rg_noidx_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5')  AS noidx_off;
+ cagra_small_n | cagra_large_n | flat_present | noidx_off 
+---------------+---------------+--------------+-----------
+ seqscan       | cagra         | flat         | seqscan
+(1 row)
+
+DROP FUNCTION plan_scan(text);
+DROP FUNCTION rg_fill(regclass, int);
+DROP TABLE rg_small, rg_large, rg_flat_tbl, rg_noidx_tbl;

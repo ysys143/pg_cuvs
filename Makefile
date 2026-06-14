@@ -11,28 +11,32 @@
 
 # ---- PGXS configuration -------------------------------------------------
 EXTENSION      = pg_cuvs
-EXTVERSION     = 0.3.0
+EXTVERSION     = 0.5.0
 DATA           = sql/pg_cuvs--0.1.0.sql \
                  sql/pg_cuvs--0.1.0--0.2.0.sql \
                  sql/pg_cuvs--0.2.0.sql \
                  sql/pg_cuvs--0.2.0--0.3.0.sql \
-                 sql/pg_cuvs--0.3.0.sql
+                 sql/pg_cuvs--0.3.0.sql \
+                 sql/pg_cuvs--0.3.0--0.4.0.sql \
+                 sql/pg_cuvs--0.4.0.sql \
+                 sql/pg_cuvs--0.4.0--0.5.0.sql \
+                 sql/pg_cuvs--0.5.0.sql
 MODULE_big     = pg_cuvs
-REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat vram_accounting build_lock build_oom build_multi_oom
+REGRESS        = smoke cpu_fallback edge_cases cpu_hnsw_fallback build_hnsw build_hnsw_edge pg_cuvs_hnsw metrics brute_force pg_cuvs_batch reloption_dir gc_orphans release_hardening pending_delta delta_recall build_params drop_subxact partition_prune filter_comparison ivfpq_smoke cagra_streaming auto_compact extend_vram_fallback extend_cuda_oom stream_bf_recall fallback_stat vram_accounting build_lock build_oom build_multi_oom flat_smoke transient_bf hw_profile routing_golden routing_golden_measured
 REGRESS_OPTS   = --inputdir=test --outputdir=test
 
 # Tier-1 CI (CPU-reference shim, PGCUVS_CPU_SHIM=1) runs a SUBSET of REGRESS.
 # Excluded = tests the shim cannot/should not reproduce on CPU:
 #   build_hnsw/build_hnsw_edge/pg_cuvs_hnsw — CAGRA->pgvector HNSW *graph export*
 #     (real graph structure; a Tier-2 / real-GPU concern).
-REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge pg_cuvs_hnsw
+REGRESS_TIER2_ONLY = build_hnsw build_hnsw_edge pg_cuvs_hnsw routing_golden_measured
 REGRESS_TIER1      = $(filter-out $(REGRESS_TIER2_ONLY),$(REGRESS))
 
 # Isolation tests (pg_isolation_regress) for concurrent-session correctness that
 # pg_regress cannot express: snapshot-aware tombstone filtering and write/query
 # interleaving. Specs live in test/specs/*.spec, expected in test/expected/*.out.
 # The daemon + GPU must be up, same as REGRESS.
-ISOLATION      = delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete
+ISOLATION      = delta_tombstone_snapshot delta_interleaving reindex_concurrent_delete flat_tombstone_snapshot flat_delta_interleaving flat_reindex_concurrent_delete
 ISOLATION_OPTS = --inputdir=test --outputdir=test
 
 # C source files + the CUDA-compiled wrapper (built below by nvcc).

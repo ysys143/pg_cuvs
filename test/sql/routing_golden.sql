@@ -1,0 +1,79 @@
+-- routing_golden.sql — ADR-075 Phase 2 regression fence (Tier-portable part).
+--
+-- Captures the planner's routing decision for vector top-k for the cases whose
+-- winner is FORCED by an enable_* / GUC toggle, so the label is independent of
+-- exact cost magnitudes — identical on the Tier-1 CPU shim and the Tier-2 A100,
+-- and unchanged by the physical cost model (which only moves cost-magnitude
+-- decisions). Those magnitude-dependent cases live in routing_golden_measured.sql
+-- (Tier-2 only), where the hardware-anchored crossover is asserted.
+--
+-- REQUIRES: pg_cuvs_server running (cagra index build + routing gates);
+-- cuvs.index_dir = the daemon's --index-dir.
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- Canonical label of the chosen scan for a vector top-k query. The cagra index
+-- is named rg_cagra so the plan's "Index Scan using <name>" is matched by AM
+-- unambiguously (the plan shows the index NAME, not the AM).
+CREATE FUNCTION plan_scan(q text) RETURNS text AS $$
+DECLARE line text;
+BEGIN
+  FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    IF line LIKE '%CuvsTransientBF%'            THEN RETURN 'transient_bf'; END IF;
+    IF line LIKE '%Index Scan using rg_cagra%'  THEN RETURN 'cagra';        END IF;
+    IF line LIKE '%Seq Scan%'                   THEN RETURN 'seqscan';      END IF;
+  END LOOP;
+  RETURN 'other';
+END$$ LANGUAGE plpgsql;
+
+-- Deterministic 2000-vector, 8-dim corpus (same generator as transient_bf.sql).
+CREATE TABLE rg_cagra_tbl (id int, embedding vector(8));
+INSERT INTO rg_cagra_tbl
+SELECT g,
+       format('[%s,%s,%s,%s,%s,%s,%s,%s]',
+              (g * 0.013)::numeric(12,6),
+              (g * g * 0.0007)::numeric(12,6),
+              sin(g * 0.10)::numeric(12,6),
+              cos(g * 0.17)::numeric(12,6),
+              ((g % 13) * 0.05)::numeric(12,6),
+              ((g % 7) * 0.08)::numeric(12,6),
+              sin(g * 0.30)::numeric(12,6),
+              cos(g * 0.23)::numeric(12,6))::vector
+FROM generate_series(1, 2000) g;
+
+-- A no-index copy for the transient-BF case.
+CREATE TABLE rg_noidx_tbl (LIKE rg_cagra_tbl);
+INSERT INTO rg_noidx_tbl SELECT * FROM rg_cagra_tbl;
+
+CREATE INDEX rg_cagra ON rg_cagra_tbl USING cagra (embedding vector_l2_ops);
+ANALYZE rg_cagra_tbl;
+ANALYZE rg_noidx_tbl;
+
+-- ============================================================ Forced routing
+-- (1b) cagra index IS available and chosen when the seqscan alternative is
+-- removed — proves the cagra path exists regardless of the cost crossover.
+SET enable_seqscan = off;
+SELECT plan_scan('SELECT id FROM rg_cagra_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5') AS cagra_forced;
+RESET enable_seqscan;
+
+-- (4) no index, GPU BF on: transient-BF CustomScan fires.
+SET cuvs.gpu_bruteforce = on;
+SET enable_seqscan = off;
+SELECT plan_scan('SELECT id FROM rg_noidx_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5') AS noidx_on;
+RESET cuvs.gpu_bruteforce;
+RESET enable_seqscan;
+
+-- (5) cagra present but its index path disabled: the planner falls back to a
+-- Seq Scan + Sort for the same ORDER BY (proves seqscan is a valid alternative
+-- the cost model can route to — the mechanism the physical model exploits by
+-- cost when the index path is the more expensive one).
+SET enable_indexscan = off;
+SELECT plan_scan('SELECT id FROM rg_cagra_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5') AS cagra_idx_disabled;
+RESET enable_indexscan;
+
+DROP FUNCTION plan_scan(text);
+DROP TABLE rg_cagra_tbl, rg_noidx_tbl;

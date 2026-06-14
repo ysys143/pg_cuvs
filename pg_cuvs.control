@@ -1,5 +1,5 @@
 comment = 'GPU-accelerated vector search for PostgreSQL via NVIDIA cuVS'
-default_version = '0.3.0'
+default_version = '0.5.0'
 module_pathname = '$libdir/pg_cuvs'
 relocatable = false
 requires = 'vector'

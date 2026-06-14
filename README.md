@@ -73,7 +73,9 @@ If the GPU service dies, PostgreSQL **gracefully degrades** to CPU-based pgvecto
 
 | Index | Storage | Use Case |
 |-------|---------|----------|
-| `USING cagra` | GPU VRAM | Low latency, hot data, fits in GPU VRAM |
+| `USING cagra` | GPU VRAM | Approximate NN, low latency (~1.5 ms), hot data, fits in GPU VRAM |
+| `USING flat` | GPU VRAM (`.vectors` only, no graph) | Exact GPU brute-force (recall=1.0), read-heavy/stable corpora; first-class BF AM (v0.4.0, ADR-073) |
+| `USING ivfpq` | GPU VRAM (compressed) | Approximate NN, 10–100x VRAM savings vs cagra via product quantization |
 | `USING pg_cuvs_hnsw` (built from heap, or reuses a `USING cagra` source) | GPU build / CPU serve | Fast GPU build (13x vs pgvector), then served by pgvector HNSW on CPU |
 
 > **DiskANN/NVMe cold tier** (Phase 3B): spike completed, no-go for now — cuVS PQFlash
@@ -104,6 +106,7 @@ Small tables route to CPU; large tables route to GPU automatically.
 | Feature | Status | Verified on |
 |---------|--------|-------------|
 | CAGRA GPU search | Production-tested | A100 VM, MIG, multi-GPU |
+| Exact GPU brute-force (`USING flat`, v0.4.0) | Production-tested | A100 VM, installcheck 31/31, recall=1.0, restart-durable (ADR-073) |
 | GPU Build Accelerator (`USING pg_cuvs_hnsw`) | Production-tested | VM E2E, 1M×384, recall=1.0 |
 | Multi-GPU sharding (`shard_count`) | Production-tested | 2×A100, shard_count=1/2 |
 | MIG (Multi-Instance GPU) | Verified | No code change; `CUDA_VISIBLE_DEVICES=MIG-uuid` |
@@ -119,7 +122,7 @@ Implemented on GCP (NVIDIA A100-40GB × 2, PostgreSQL 16), VM E2E verified:
 - [x] CAGRA index build + GPU search via cuVS `cuvs::neighbors::cagra`
 - [x] pgvector `vector` type as native input; operator classes for L2 (`<->`), Cosine (`<=>`), Inner Product (`<#>`)
 - [x] Index Access Method handler (`cuvsamhandler`) registered with PostgreSQL planner
-- [x] Cost model with `startup_cost=1000` (models CUDA context + transfer overhead)
+- [x] Hardware-anchored cost model (ADR-075): the daemon probes the deployment's GPU/CPU/IPC at boot and the planner costs GPU vs seqscan in real units (`κ = cpu_operator_cost·cpu_dist_tput/dim`); falls back to the legacy `startup_cost=1000` constants when unprobed or `cuvs.enable_phys_cost=off`
 - [x] `enable_cuvs`, `cuvs.cpu_hnsw_fallback` GUCs for runtime GPU toggle and CPU fallback
 - [x] `pg_stat_gpu_search` view: per-index GPU stats (build time, search count, p50/p95 latency, recall)
 - [x] `CREATE INDEX ... USING pg_cuvs_hnsw`: GPU CAGRA → pgvector HNSW DDL (Phase 3K). `source` optional — built from the heap (ephemeral CAGRA, auto-dropped) or reused from a `USING cagra` index; served by pgvector
@@ -247,10 +250,15 @@ CREATE TABLE items (id bigint, embedding vector(1536));
 CREATE INDEX ON items USING cagra (embedding vector_l2_ops);
 SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
 
--- GPU brute-force exact search (Phase 3L)
-SET cuvs.search_mode = 'brute_force';  -- GPU exact search, recall@10 = 1.0
-SET cuvs.bf_precision = 'float16';     -- float16 mode: VRAM half, recall preserved
+-- GPU exact brute-force search via flat AM (v0.4.0, first-class path, ADR-073)
+-- recall=1.0 regardless of cuvs.search_mode; no graph build.
+CREATE INDEX ON items USING flat (embedding vector_l2_ops) WITH (precision='float16');
 SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
+
+-- Legacy exact BF via cagra index (deprecated — use USING flat instead)
+-- SET cuvs.search_mode = 'brute_force';
+-- SET cuvs.bf_precision = 'float16';
+-- SELECT id FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
 
 -- Batch search (Phase 3M) — Q queries in one GPU dispatch
 SELECT query_idx, id, distance

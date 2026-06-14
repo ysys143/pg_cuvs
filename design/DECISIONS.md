@@ -2856,9 +2856,182 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 - **방향 2 (PQFlash 포크/어댑터)**: MS DiskANN 리더를 포크해 cuVS 레이아웃을 읽게 함. 기각 — 얻는 건 CPU 검색(GPU 가치 0 = pgvectorscale 영역)인데 **MS DiskANN 포크 + cuVS·DiskANN 두 moving target을 동시 유지**해야 함(둘 중 하나만 포맷 바꿔도 깨짐). 최악의 유지보수 위치.
 - **자체(in-tree) 포크로 방향 3 수행**: 업스트림 PR 거부 시에만 고려. 기본은 업스트림.
 - **즉시 착수**: 기각 — ADR-026 트리거 미충족(세그먼트 비표적·CPU+NVMe 경제성 우위). VRAM 천장 밀기는 IVF-PQ(3P/ADR-049)·streaming BF(ADR-064)로 이미 처리됨.
+- **vchord 공존으로 cold tier 대체** (2026-06-14 검토): DiskANN 라이브러리 대신 VectorChord(RaBitQ, CPU)를 large-N cold tier로 채택하고 공존시키는 안. vchord는 프로덕션 검증(3.2B halfvec, p50 761ms)·50M recall 0.9991·cuVS 블로커 없음·노력 ≈0(추천/공존)으로 단기 리스크가 낮다. 그럼에도 **기각** — (a) AGPL-3.0 전염 + 우리 manifest/fail-closed/GCS-snapshot 거버넌스 **밖**, (b) 별도 확장이라 "self-contained hot+cold 단일 시스템" 제품 서사가 깨짐, (c) GPU 빌드 레버리지가 k-means(=pgpu 영토)로 축소. 서빙은 양쪽 다 CPU+NVMe rerank로 동급이나, **소유권·permissive 라이선스(MS DiskANN MIT + cuVS Apache-2.0)·통합 거버넌스**를 cold tier에서도 유지하는 쪽이 제품 목표에 부합. → cold tier는 우리가 소유한다(DiskANN 라이브러리). 단 vchord를 우리가 GPU-가속하지는 않는다(pgpu가 이미 한 일, ADR 비교는 본 ADR 말미 참조). 대규모 수요자에겐 vchord/pgpu를 공존 선택지로 안내하되 plan of record는 아니다.
 
 **cuVS 업스트림 이슈 매핑** (스파이크 발견 = 이미 트래킹, 전부 OPEN, milestone 없음): #2197 Vamana/DiskANN search on GPU(방향 1) · #1501 Vamana SSD index ↔ diskannpy 호환(방향 3, #905 의존) · #1380 host-dataset build `cudaErrorIllegalAddress` · #905 OPQ codebooks/rotation. (+ #1753/#1943 fp16, #1423 cuvs-bench, #906 disk 포맷 문서). 비고: cuVS가 26.08에서 Vamana 활발(#2214 device permute, 예제 DRAFT #2064) → 우선순위 상향 advocate 적기.
 
 **순위**: 방향 3(업스트림 기여) > 방향 1(advocate) > 방향 2(회피).
 
 관련: ADR-025(50M 벤치·포지셔닝), ADR-026(3B go/no-go·트리거), ADR-061(전략·표적 세그먼트), ADR-049(IVF-PQ), ADR-064(streaming BF), PHASE_3B_SPIKE.md / PHASE_3B_DECISION.md.
+
+**업계 선례 — EDB pgpu / VectorChord** (2026-06-14 비교): pgpu(EnterpriseDB, Rust/pgrx, AGPL-3.0, v2.0.0)는 cuVS **k-means centroid만** GPU로 계산해 vchord external-build에 넘기는 "GPU 빌드 가속기"다 — 검색은 vchord(CPU). 즉 우리 3I/방향 3과 같은 "GPU 빌드 → CPU 서빙" 철학의 상용 선례이나 **인덱스 계열이 IVF로 다르고 Vamana/PQFlash와 무관**하므로 DiskANN 구현 참조 가치는 없고(난관=cuVS #1501 PQFlash serializer), 전략 패턴 검증 의미만 있다. EDB의 다른 GPU 자료(spark-rapids-tutorial)는 OLAP를 외부 Spark+RAPIDS로 오프로드하는 튜토리얼로 벡터 검색과 무관. 요지: **EDB 노선 = GPU build/analytics 오프로드, in-Postgres GPU search 부재** → pg_cuvs의 GPU filtered exact hot tier 자리는 미개척으로 남아 있고, cold tier 소유(본 ADR)는 그와 별개의 통합·라이선스 판단이다.
+
+---
+
+## ADR-073 — GPU exact brute-force 1급화: 상주 `flat` AM (A1) + transient 무인덱스 (B, 후속) + 플래너 라우팅
+
+**날짜**: 2026-06-14
+**상태**: ACCEPTED. **A1(`flat` 상주 AM) + B(transient 무인덱스 CustomScan) 구현·VM 검증 완료**(2026-06-14, A100). 라우팅 cost 캘리브레이션(`cuvs.gpu_bruteforce` off→auto 승격)은 후속 단계. ADR-071을 **흡수/supersede**한다.
+
+**문제**: GPU exact brute-force는 cuVS를 가장 잘 드러내는 핵심 기둥(filtered exact BF = CPU 대응물 없는 cuVS-네이티브 차별점)인데, 두 가지로 *2급 시민*에 머물러 있었다. (1) BF가 cagra 인덱스의 `cuvs.search_mode='brute_force'` **옵션**으로만 접근 가능 → 비싼 그래프 빌드를 강제당하고 플래너가 BF를 독립 비용화 못함. (2) ADR-071의 `bruteforce` AM 안은 `CREATE INDEX`로 "무빌드"를 선언하는 **형용모순**.
+
+**결정**: GPU exact BF를 1급으로 승격. 능력은 하나(matmul→L2→topK, exact, recall=1.0)이고 **워크로드가 물질화 방식을 가른다** — 두 체제로 구현한다.
+- **A1 = 상주 `flat` AM (W2: 읽기 多·쓰기 간헐·안정 코퍼스).** `CREATE INDEX … USING flat (… vector_l2_ops) WITH (precision='float16')`. *진짜 평면 벡터 저장소(.vectors)를 지으므로* `flat` 명명이 정직(FAISS IndexFlat식; `bruteforce` 형용모순 회피). 빌드 1회 분할상환·VRAM warm. 신선도는 기존 cagra delta/tombstone 재사용(INSERT→`.delta`, 검색 시 CPU-exact 머지).
+- **B = transient 무인덱스 (W1: 쓰기 폭주·항상최신·ad-hoc 필터).** `SET cuvs.gpu_bruteforce=on`(기본 off→Tier-2 캘리브레이션 후 auto). 인덱스 없이 플래너가 vector ORDER BY를 transient GPU-BF CustomScan(`CuvsTransientBF`)으로 라우팅. **구현·검증 완료**(round-2 FATAL = Sort 수용(pathkey 미주장) + 실행시 파라미터 바인딩으로 회피).
+- **멘탈 모델**: "flat 인덱스 생성 여부 = 유일한 W2/W1 스위치." 사용자는 A1/B를 몰라도 됨.
+
+**라우팅 매트릭스** (플래너 cost 자동, 사용자 개입 0): exact+읽기→**A1** / exact+쓰기→**B** / 근사+대규모 N→**cagra·ivfpq**. A1은 exact지만 O(N) 전수 스캔 → 근사 허용+대규모면 cagra가 *읽기 속도*로 이김. read/write 트레이드오프: **A1은 쓰기에 지불·읽기를 산다**(인덱스 中 최경량: O(N) 복사, 그래프/PQ 없음), **B는 읽기에 지불·쓰기를 산다**(쓰기 비용 0).
+
+**원칙(불가침)**: cagra 경로 **무변경**(회귀 안전). flat의 신규 경로는 cagra `gettuple`/`cost`/`build`를 **복제(duplicate)하지 리팩터하지 않는다** — cagra 것은 `cuvs.search_mode` GUC 종속이라 verbatim 재사용 시 flat에서 NULL handle deref. 회귀 펜스(`brute_force, delta_recall, pending_delta, stream_bf_recall, cagra_streaming, auto_compact`) 변경 전/후 녹색.
+
+**A1 구현 (검증 완료)**:
+- **`pg_cuvs.c`**: `flatamhandler`(cagra 스캔/insert/delete 콜백 재사용) + 전용 `flat_gettuple`(`search_mode=1` 강제, GUC 무관) + `flat_amcostestimate`(exact N-cost 분기 강제, 8 게이트 전부 유지) + `cuvs_build_flat_from_heap`/`flat_ambuild`(vectors-only) + `cuvs_flat_amoptions`(`index_dir`+`precision`, layout-compatible로 `cuvs_resolve_index_dir_rel` 재사용) + DROP 훅(`cuvs_object_access`)에 flat oid 매칭.
+- **`cuvs_ipc.{h,c}`**: `CUVS_OP_BUILD_FLAT`(21) + `cuvs_ipc_build_flat`(`cuvs_ipc_build` 복제, op만 상이).
+- **`pg_cuvs_server.c`**: `IndexEntry.is_flat`(NULL handle + unsharded = 신규 상태); `handle_build_flat`(`.tids`+`.vectors`만 persist, **`finish_build_commit` 미사용**=`.cagra` serialize 회피, 독자 tmp+rename+commit); `load_index` flat 분기(`.cagra`/`.ivfpq` 부재 + `.vectors` 존재 → handle=NULL·is_flat=1·graph VRAM 미예약); `startup_load_indexes` `.vectors` 발견 패스(재시작 복원); 검색 가드.
+- **비용 재보정**: 신규 `CUVS_FLAT_STARTUP_COST=50.0`(공유 `CUVS_STARTUP_COST=1000` **미변경** — "cagra 무변경" 원칙 준수). 핸드오프는 공유 상수 하향을 제안했으나 flat이 독자 cost 함수를 가지므로 전용 상수가 blast radius 0이며 동일 목표 달성(작은 N에서 flat 선택).
+- **`pg_cuvs.control`** `default_version` 0.3.0→**0.4.0**(Task 1 누락분 — 안 하면 `CREATE EXTENSION`이 flat 없는 0.3.0 설치).
+
+**적대검증이 잡은 라이프사이클 FATAL (전부 수정·검증)**:
+1. `handle_search_batch`(`use_bf = … \|\| e->is_flat`) — 없으면 flat batch 검색이 `cuvs_cagra_search_batch(NULL handle)`로 **데몬 전체 크래시**.
+2. `handle_search` — BF 게이트에 `e->is_flat` 추가 + cagra dispatch 앞 NULL-handle 구조적 가드.
+3. `load_index`/`startup_load_indexes` flat 분기 — 없으면 재시작 후 flat **unsearchable**.
+4. **`evict_lru` flat 분기 (세션 중 발견)** — flat 엔트리가 cagra `else`로 떨어지면 `save_index`(handle==NULL → -1 refuse) 호출로 **축출 불가**가 되어 VRAM을 영구 점유. → ivfpq처럼 save 없이 free.
+5. **`handle_drop`에 `free_main_bf_cache` 추가 (세션 중 발견)** — flat의 *유일* GPU 할당(resident BF)이 DROP 시 누수. (cagra의 2차 BF 캐시 누수도 동시 해소; pre-existing IVF-PQ handle 누수는 범위 밖으로 명시.)
+- freshness/recall(delta merge)·필터/WHERE 경로 NULL-safe는 검증 SOUND(수정 불필요).
+
+**기각 대안** (적대적 단련 기록): **A2(유령 인덱스: AM+no-op build+transient amgettuple)** — HOT 비활성(저장 0인데 대가)+상속 cost가 `CUVS_FB_NO_ARTIFACT`로 비활성+transient verb 부재+매쿼리 재마샬, AM 이점은 A1이 동일하게 가짐 → 순비용. **A1 > B > A2.** / **테이블-키 1회-빌드 상주 코퍼스** — INSERT/UPDATE 무에러 누락(round-1 FATAL). / **B pathkey-claim CustomScan** — silent mis-ordering(round-2 FATAL). / **B plan-time Const만** — `<-> $1` 우회→근사 강등(round-2 FATAL). / **gpucache 복제** — PG-Strom master에서 죽은 코드.
+
+**ADR 관계**: **ADR-071 흡수/supersede**(071의 vectors-only AM = 본 A1, `bruteforce`→`flat` rename + B/라우팅 추가). **ADR-039**(search_mode GUC BF): A1/B로 대체되는 deprecation 궤적(`search_mode='brute_force'`는 deprecated 표기). **ADR-049**(AM-per-algo): A1이 동일 하우스 스타일. **ADR-061**(filtered wedge): B가 그 plumbing 실현.
+
+**검증 증거 (Tier-2, A100 `pg-cuvs-dev`/PG16, 2026-06-14)**: `make installcheck` **31/31 GREEN**(flat_smoke + 회귀 펜스 6 전부) + isolation **3/3 GREEN**. flat_smoke 5 assertion 전부 통과: recall@10=1.0 vs seqscan **with `search_mode`=DEFAULT('cagra')**(GUC 무관 증명), `Index Scan using flat_l2` + Sort 노드 없음, INSERT(`id=1001`) delta 머지 가시, `<-> $1` 파라미터 exact, DROP 무크래시. **재시작 내구성** 별도 검증: flat 빌드→데몬 재시작→동일 exact 결과(`5,6,31,4,30` = seqscan GT, `.vectors`에서 재로드). **업그레이드 경로** 0.3.0→0.4.0 `ALTER EXTENSION UPDATE` 동작.
+
+---
+
+**B 구현 (검증 완료, 2026-06-14)** — transient 무인덱스 GPU exact BF CustomScan:
+- **`pg_cuvs.c`**: `set_rel_pathlist_hook`을 `cuvs_dwedge_add_path`(ADR-063, **동작 보존**) + `cuvs_transient_bf_add_path`(B)로 분리 — D-wedge의 "CAGRA 인덱스 필요 + WHERE 필요" early-return이 B(무인덱스·WHERE 선택적)를 막던 모순 해소. B는 **무인덱스 단일테이블 top-k에서만 발화**(FATAL-k 가드: 단일 base rel·조인/OFFSET/GROUP·DISTINCT·WINDOW·HAVING 없음·Const LIMIT 1..100000·단일 거리 ORDER BY 키 — LIMIT k가 rel을 증명적으로 bound하는 유일 shape). **pathkey 미주장(Sort 수용)**. 쿼리벡터 Expr은 `custom_exprs`에 저장→실행시 `ExecInitExpr`/`ExecEvalExpr` 바인딩(`$1` 근사 cagra 강등 회피). CustomScan은 `estate->es_snapshot`으로 힙 스캔(filter-first·NULL 벡터 skip)→leak-safe huge 코퍼스 컨텍스트(host 하드캡)→transient verb→top-k TID 페치. `parallel_safe=false`. metric은 `pg_amop`(amoppurpose='o') 스캔으로 거리연산자→opfamily→이름 매핑(`<->`는 btree 정렬연산자가 아니라 `get_ordering_op_properties` 부적합 — 구현 중 발견·수정). 신규 GUC `cuvs.gpu_bruteforce`(off/auto/on, 기본 off; auto는 v1에서 off로 동작) + `cuvs.gpu_bruteforce_max_mb`(host 코퍼스 하드캡, 기본 2GiB).
+- **`cuvs_ipc.{h,c}`**: `CUVS_OP_SEARCH_BF_TRANSIENT`(22) + `cuvs_ipc_search_bf_transient` — 코퍼스 `[vecs][tids]`를 memfd(SCM_RIGHTS)/shm로 핸드오프(빌드 핸드오프 `CuvsBuildCorpus` 재사용), 쿼리는 별도 shm, 응답=header+`CuvsResult[]`. 비-OK는 fatal(B는 CPU fallback 없음); 데몬 에러메시지 반환. 코퍼스는 응답 후 close(shm 티어 데몬이 이름으로 open하는 레이스 회피).
+- **`pg_cuvs_server.c`**: `handle_search_bf_transient` — 코퍼스+쿼리 mmap, **비축출(non-evicting) VRAM admission**(`g_index_mutex` 하 `total_vram_used()+needed > budget` OR `needed > free` → `OOM_FALLBACK`; **resident flat/cagra 인덱스 절대 축출 안 함** — `ensure_vram`/`evict_lru` 미사용), `cuvs_brute_force_search`, row→tid 매핑, **IndexEntry 무접촉**(find_index/load_index/record_search_stat 미호출).
+
+**B 적대검증이 코드 전에 잡은 FATAL** (architect+critic 2-reviewer): (1) **FATAL-k** — `root->parse->limitCount`는 조인 inner-side/OFFSET/agg에서 해당 rel을 bound하지 않음(silent under-return) → 단일테이블 shape로 제한. (2) **FATAL-Expr** — 쿼리 Expr을 `custom_private`에 두면 setrefs/copyObject/parallel에서 깨짐 → `custom_exprs`로. (3) **C1 비축출** — `ensure_vram`(evict_lru) 재사용 시 one-shot 코퍼스가 resident 인덱스 축출(회귀) → 전용 비축출 체크. (4) **C2 훅 분리** — D-wedge early-return이 B 차단. (5) `parallel_safe=false`·`es_snapshot` 일관성(D-wedge의 이중 `GetTransactionSnapshot()` skew 회피)·호스트 OOM 하드캡·NULL 벡터 skip·결과버퍼 k-사이징.
+
+**B 검증 증거 (Tier-2, A100/PG16, 2026-06-14)**: `make installcheck` **32/32 GREEN**(transient_bf + 회귀 펜스 7) + isolation **3/3 GREEN**. transient_bf 5 assertion: `gpu_bruteforce=off`→`Seq Scan`(플랜 무변경), `on`→`Custom Scan (CuvsTransientBF)` under Sort + recall@10=1.0 vs seqscan, `<-> $1` prepared→CuvsTransientBF·exact(근사 강등 없음), WHERE 필터 exact(filter-first), 1-byte budget→`ERROR ... (status 2) ... fail-closed`·데몬 생존.
+
+**B 라우팅 캘리브레이션 (ADR-069 루프, 측정 완료 2026-06-14, A100/PG16)**: unfiltered 단일쿼리 top-k에서 B vs **병렬 CPU seqscan** 교차점을 Stage A 실측(`work_mem=4GB`, TIMING OFF, warm median/5; dim 384·768 × N 1k..300k). **결과: 교차점 없음** — B가 전 구간 2–8× 느림(seq/B 최대 0.51 @768/100k, 1.0 미달). 원인: 쿼리당 O(N·dim) 코퍼스 재마샬(detoast→memfd→H2D)+IPC가 지배; GPU 커널은 빠르나 데이터 이동세가 단일쿼리 이득을 상쇄(dim↑일수록 격차 축소, 미교차). **결정(regret-averse)**: `auto`를 plan-time B 경로 추가로 승격하지 **않음** — 전 셀에서 2–8× 느린 엔진 라우팅(regret>0)이 됨. `auto`는 off-behavior 유지(스텁 아님, 실측 검증). B의 진짜 가치(always-fresh W1·filtered wedge·동시성 CPU-offload)는 plan-time cost가 못 보는 **런타임 속성**(ADR-069 "plan-time 정보 부족" 클래스) → 명시적 `on`으로 도달, live `auto`는 런타임 적응 라우터/filtered 교차점 측정의 후속. **코드 변경**: F5 `on`-force 수정만(`on`→startup=0,total=1.0; 종전 N-증가 cost는 작은 N에서 seqscan에 밀려 force 실패). cost 상수 신설 없음(B가 이기는 셀이 없어 미사용).
+
+**후속(carry-forward)**: filtered-path 교차점 측정(B의 filter-first가 CPU exact-filtered 대비 우위 구간) + 런타임 적응 라우팅(동시성/offload 신호) = live `auto`의 전제 / release-prep(모든 flat/B 작업 뒤: BENCHMARK·doc-coherence·ops-playbook·GitHub Pages·org 이전).
+
+관련: ADR-071(흡수), ADR-039(BF GUC deprecation), ADR-049(AM-per-algo), ADR-061(filtered wedge), ADR-064(streaming BF), ADR-047(delta/tombstone freshness), 플랜 SSOT `snappy-strolling-brook.md`.
+
+---
+
+## ADR-074 (잠정, 번호 머지 시 확정) — GPU exact BF 실측 특성화 + 두-체제 포지셔닝 수정: A1=GPU 값, B(transient)=잉여, 쓰기-heavy=pgvector-무인덱스
+
+**날짜**: 2026-06-14
+**상태**: ACCEPTED (측정 기반). ADR-073의 **W1/W2 가치 전제를 실측으로 수정**한다. **B(transient)는 experimental로 강등** — 하드웨어-의존(PCIe-attached GPU에선 잉여, 통합메모리에선 1급; 아래 "B 거취" 참조), 신규 투자 중단·코드 보존. ADR-073의 A1·MVCC·라우팅 결정은 유효.
+
+**문제**: ADR-073은 두 체제(A1 상주 + B transient)를 설계하며 "B가 W1(쓰기-heavy)에서 GPU 속도 이득을 준다"를 가정했으나, **빌드 전에 그 가치 가설을 측정하지 않았다**(적대검증은 정확성/FATAL에만 집중). 라우팅 캘리브레이션 중 실측으로 가설을 검증.
+
+**측정 (A100/PG16, 100k×768, top-10; 분해는 단일스레드)**:
+- **A1 상주 read = 1.09ms** (CPU seqscan 559ms 대비 ~500x). W2 검증.
+- **분해**: 힙 스캔만 10ms / detoast(계산 X, `vector_dims`) 544ms / detoast+L2거리 540ms → **거리계산 ≈ 0ms.** L2는 ~0.75 flop/byte로 **memory-bound**(CPU·GPU 공통). 비용은 전부 **데이터 이동**이고, **TOAST detoast ~535ms가 지배**(CPU·transient-B 공통 바닥).
+- **transient B read = 1103ms** = 백엔드 1014(detoast ~570 + **회피가능 복사 ~434**: per-row 코퍼스 memcpy + `repalloc_huge` 성장 + 코퍼스→memfd 이중복사) + 데몬 89(**pageable H2D ~3.5GB/s** = PCIe peak의 ~1/7, mmap'd memfd가 미-pin + RMM-pool 부재 per-query cudaMalloc). 즉 **B ≈ CPU(읽기 GPU 이득 0)**; 최적화해도 detoast가 양쪽을 지배 + GPU는 H2D를 더 내므로 **잘해야 무승부**(선형 비용 → 비율 N-무관, 큰 N도 미교차).
+- **A1 write = 1.77ms/row vs no-index 0.13ms = ~13x** (행당 데몬 IPC `cuvs_ipc_extend` + delta append; cagra 3Q extend 경로 상속). 동반: HOT 비활성(벡터 컬럼 UPDATE)·compaction 재빌드(전체 N 재detoast+H2D)·delta cap 초과→CPU 리라우트·VRAM 천장. (초기 "1.1x"는 빈 테이블 빌드로 aminsert가 단락된 오측정이었음 — 비-empty 빌드로 정정.)
+- **detoast vs 연산 분해 (TOAST vs STORAGE PLAIN, 100k×768)**: TOASTed = 스캔 11ms / +detoast 537ms / +L2 539ms → **detoast ≈ 526ms가 벽**, 거리계산은 묻혀 +2ms. PLAIN(인라인, TOAST 없음) = heap 읽기 ~126ms / +L2 147ms → **거리계산 ≈ +20ms**. 즉 "연산이 공짜"는 부정확 — L2 곱셈-덧셈(~2.3억 FLOP)은 **실재 ~20ms**지만 **memory-bound**(0.75 flop/byte; 데이터 읽기 ~126ms가 연산을 가림). **STORAGE PLAIN이 CPU kNN을 539→147ms(3.7x)로 단축**(dim≤~768 인라인; heap 부풀음 트레이드오프). 그러나 transient GPU는 PLAIN으로도 CPU와 **무승부**(heap 읽기 ~130ms + H2D ~12ms ≈ CPU 147ms — 둘 다 매쿼리 데이터 읽기에 묶임). A1 상주(1ms)는 PLAIN-CPU 대비도 ~147x: HBM(2TB/s)에서 연산하기 때문 → **GPU kNN 승리는 상주뿐, 컬럼나/PLAIN은 CPU·transient 절대시간만 낮춤**.
+
+**결정 (포지셔닝 수정)**:
+- **읽기 多 → A1 (GPU 상주)**: 1ms. 데이터 이동을 빌드 1회로 분할상환 → GPU가 이기는 **유일한 길**. ✓
+- **쓰기 多 → pgvector 무인덱스 (CPU)**: 쓰기 0비용, 읽기 detoast-bound. A1의 13x 쓰기 비용이 실재하므로(ADR-073 "쓰기에 지불" 직관 확인) 쓰기-heavy엔 A1 부적합.
+- **B (transient GPU) = PCIe에선 잉여, 그러나 하드웨어-의존**: PCIe-attached GPU에선 A1(읽기)과 pgvector-무인덱스(쓰기) 사이의 잉여(읽기 GPU 이득 0 = memory-bound + 매쿼리 H2D, 쓰기 0 = pgvector 동급). 거취는 아래 "B 거취" 참조.
+
+**B 거취 (결정)**: **삭제 ❌ → experimental 강등 ✅** (코드 보존·`auto` off·`on` 전용).
+- **이유 = 하드웨어-의존**: B가 지는 유일한 이유는 **PCIe 병목(H2D ~25GB/s)**. 통합메모리 하드웨어 — **NVIDIA Grace Hopper GH200**(NVLink-C2C ~900GB/s 캐시 일관, PCIe의 ~36배) / **AMD MI300A APU**(통합 HBM) — 에선 매쿼리 데이터이동 페널티가 붕괴(우리 데몬 89ms→~0.3-0.7ms 추정)해 transient B가 **빌드 없이 GPU 속도로 CPU를 실제로 이김**. 즉 ADR-073의 W1(쓰기-heavy) niche는 통합메모리에서 실재화 — 설계가 틀린 게 아니라 **PCIe 기준 시기상조**.
+- **재평가 트리거**: GH200/MI300A 등 통합메모리·고대역 일관 인터커넥트 하드웨어 확보 시. (현 A100 GCP VM은 PCIe — B off가 정답.)
+- **자동 스위치 = 하드웨어-포터블 cost**(carry-forward): 배포의 CPU↔GPU 유효 대역폭을 측정해 HBM급이면 B 켜고 PCIe급이면 끔 → B를 "맞는 하드웨어에서만" 자동 활성화. 이게 `auto`를 부활시키는 올바른 메커니즘.
+- 읽기-heavy는 통합메모리에서도 **A1 > B**(상주가 매쿼리 이동 0); B의 집은 어디까지나 W1.
+- **근본 원인**: GPU 속도 = 데이터 이동 분할상환 = 상주(빌드). "no-build인데 GPU 빠름"은 형용모순. PG-Strom이 빠른 건 컬럼나/Arrow로 row-by-row TOAST를 회피하기 때문.
+
+**MVCC 안전성 (A1)**: gettuple은 **TID만 반환 + `scan->xs_recheck=true`**(pg_cuvs.c:3489) → executor가 쿼리 스냅샷으로 힙 visibility recheck(`index_getnext_slot`→`table_index_fetch_tuple`). GPU 코퍼스/delta/tombstone은 **후보 생성기**일 뿐 — 미커밋 INSERT 누출·DELETE 가시성·snapshot 경계 전부 recheck에서 차단 → **visibility 위반 없음**. tombstone은 ambulkdelete=**VACUUM**(전역 xmin horizon 아래=모두에게 dead)만 찍어 안전. recall(가시 행 누락)은 stale/drift 게이트(max_delta_rows·max_stale_fraction·delete-drift)가 CPU-exact 리라우트로 보호. **검증 틈 — 닫힘(2026-06-14)**: isolation 3 스펙이 `USING cagra`만이었으나, flat 변종 3종(`flat_tombstone_snapshot`/`flat_delta_interleaving`/`flat_reindex_concurrent_delete`)을 추가해 A100에서 직접 검증 — **installcheck-isolation 6/6 GREEN**, flat이 cagra와 동일하게 MVCC-correct(오래된 RR 스냅샷은 삭제행 유지·새 스냅샷은 필터, 미커밋 insert 불가시→커밋 후 가시, REINDEX 후 ghost 없음). **부수 발견**: `pg_cuvs_compact`는 cagra 전용(`handle_compact`가 `e->handle` 요구, flat은 NULL) — flat은 in-place compact 없이 **REINDEX로 재빌드 compaction**(flat 변종 스펙은 compact 단계 생략).
+
+**완화 레버(미측정)**: `ALTER TABLE … SET STORAGE PLAIN`(dim≤~768은 8KB 페이지 인라인) → TOAST 회피로 detoast 바닥 제거 가능 → CPU/transient 절대시간 급감. A1 상주가 정공법.
+
+**기각/수정**: ADR-073의 "B = W1 GPU 가치" 전제 기각(실측 잉여). A1·플래너 라우팅·MVCC 설계는 유지. B 코드는 보존하되 `auto` off, `on` 전용(ADR-073 캘리브레이션 결정과 일관).
+
+**후속(carry-forward)**: ~~flat isolation 스펙 3종 추가~~(완료 2026-06-14, 6/6 GREEN) / ~~B 최종 거취 결정~~(결정됨: **experimental 강등**, 하드웨어-의존, 통합메모리 재평가) / (선택) STORAGE PLAIN 실측(detoast 벽 제거로 CPU kNN 3.7x; 단 GPU 승리는 여전히 상주) / (B 유지 시) daemon pinned-H2D + RMM-pool + 백엔드 마샬링 복사 제거 / filtered 교차점 + 런타임 적응 라우팅 + **하드웨어-포터블 cost**(VM 스펙 고정 금지, 배포 장비별 계수) = live `auto`의 전제 / (참고) `pg_cuvs_compact` flat 미지원 — 깨끗한 no-op vs REINDEX 안내 문서화.
+
+**교훈**: 정확성(FATAL)은 빌드 전 적대검증했으나 **"빠른가"라는 가치 가설은 빌드 후에야 측정**했다. 작은 spike(재스캔+GPU vs CPU)를 빌드 전에 했으면 B의 잉여성을 일찍 잡았다. → 성능 가치 가설도 빌드 전 측정을 절차로.
+
+관련: ADR-073(수정 대상), ADR-069(cost-correction loop), ADR-047(delta/tombstone MVCC), ADR-061(filtered wedge), ADR-044(프로파일링).
+
+---
+
+## ADR-075 (잠정, 번호 머지 시 확정) — 벡터 라우팅 코스트 모델: 데이터-이동 물리 분해 + 하드웨어-포터블 계수
+
+**날짜**: 2026-06-14
+**상태**: ACCEPTED (설계). 구현은 **게으르게** — v1은 보수적 DEFAULT 상수, v2(물리 probe)는 트리거 시(B 통합메모리 auto / 실측 오보정). ADR-074 특성화 + ADR-069 cost-loop 위에 세움.
+
+**문제**: 현 코스트는 행 수 휴리스틱(`CUVS_STARTUP_COST=1000`·`FLAT_STARTUP=50`·seqscan `~0.189·N`)인데, ADR-074 측정이 보여준 실제 동인은 전부 **데이터 이동**(detoast·H2D·상주·memory-bound 연산)이다. 두 결함: (1) **detoast-blind** — PG 네이티브 seqscan cost에 detoast 항이 없어 cagra/flat-vs-seqscan 교차점이 dim/저장에 따라 틀림(768-dim TOAST면 seqscan을 cagra 위로 오선택, ~16x 손해 가능). (2) **장비 종속** — 상수가 특정 머신(A100/PCIe)에 굳어 다른 배포(통합메모리 등)에서 오라우팅.
+
+**결정**:
+
+### 1. 코스트 = 데이터-이동 물리 분해 (행 수 아님)
+```
+cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk(m,k) + fetch(k)
+```
+`m` = WHERE 선택도 적용 후 행. detoast(저장 의존)·move(하드웨어 의존)가 현 상수에 숨은 핵심 항. 엔진별 인스턴스:
+- **A1 상주**: scan0+detoast0+move0+compute(N·dim/`hbm_bw`) → ~1ms (읽기 압승).
+- **CPU seqscan**: scan(N)+detoast(m,storage)+compute(m·dim/`cpu_mem_bw`)+sort. TOAST면 detoast 지배.
+- **B transient**: scan(N)+detoast(m)+move(m·dim/`link_bw`)+compute(HBM). `link_bw`가 PCIe면 짐·NVLink면 이김.
+- **cagra/ivfpq**: 근사 = sublinear + `ipc_rtt` + k-bound, recall<1.
+
+### 2. 파라미터 3계층
+- **하드웨어(측정·포터블)**: `link_bw`(CPU↔GPU), `hbm_bw`, `gpu_bf_tput`, `ipc_rtt`, `cpu_mem_bw`/`detoast_rate`.
+- **저장(카탈로그)**: `pg_attribute.attstorage`+typmod → 이 dim에서 TOAST 여부 → detoast 항 (plan-time relcache).
+- **워크로드(플랜)**: N(`rel->tuples`), m(선택도), dim(typmod), k(LIMIT).
+
+### 3. 하드웨어-포터블 계수 — "교차점이 아니라 물리 상수를 측정"
+교차점은 테이블 물리+하드웨어가 섞여 이전 안 됨; **대역폭/지연 상수는 순수 장비 속성이라 모든 테이블/쿼리에 이전**된다.
+- **데몬이 startup에 1회 측정**(CUDA warm, ~ms): `link_bw`(cudaMemcpy pinned/pageable 타이밍 → PCIe vs NVLink 자동 구분), `hbm_bw`(d2d/props), `gpu_bf_tput`(합성 상주 코퍼스 BF 1회), `ipc_rtt`(no-op IPC+tiny search). CPU측 `detoast_rate`는 확장이 1회 측정.
+- **저장**: 데몬이 `index_dir/hw_profile`에 **고정포맷+magic+version+CRC**로 기록(`.tids` 패턴). **env tag**(`gpu_name`+`system_identifier`) 포함.
+- **플래너 read**: cost 함수가 plan당 싸게 fread(기존 `.stale`/`.tids` 헤더 게이트와 동일, CUDA/IPC 금지 준수). 캐시 함정 회피(plan당 재읽기, ~100B).
+- **폴백**: 없거나 invalid(CRC/version/정체성 불일치) → **보수적 DEFAULT 상수** → cost 모델 어디서나 동작. probe는 정밀화일 뿐.
+- **장비 변경 감지**: profile.env_tag vs 데몬-정체성 sidecar 비교(클론/rsync는 mtime 보존하므로 **mtime 의존 금지** — 정체성 태그가 방어). 불일치 → DEFAULT + 다음 데몬 startup 재측정.
+- **magic 상수 대체**: `STARTUP=1000`→`ipc_rtt`, `FLAT_STARTUP=50`→유도, seqscan `0.189·N`→`m·dim/detoast_rate` 등. 공식엔 baked 숫자 0; 모든 장비 숫자는 probe(있으면)/default(없으면).
+
+### 4. 플래너 아키텍처
+- **인덱스 AM(A1/cagra/ivfpq) → `amcostestimate`** (blessed·안정, 유지). 각 인덱스가 후보 path; PG가 seqscan 후보도 항상 생성 → `add_path`가 싼 쪽.
+- **무인덱스 B + seqscan 보정 → `set_rel_pathlist` 훅**: 여기서 **detoast-aware base-rel 비용**을 물리 항으로 계산해 cagra/flat 후보와 같은 단위로 비교 → "cagra 있어도 seqscan/B가 진짜 싸면 그쪽" 이 정확히 됨(결함 1 해소).
+- **recall은 cost로 거래 안 함 — exact-우선 단방향 규칙**: exact(A1/B/seqscan) vs approx(cagra)는 결과 품질이 달라 비용 직접 비교 불가. 규칙: *exact가 더 싸거나 같으면 exact로(싸고 정확 → 무조건 이득); exact가 더 비싸면 cagra 유지(사용자가 DDL로 속도-위해-recall 선택).* 절대 "더 정확하니 느려도 exact"로 자동 강등 안 함. "flat 생성 여부 = W2 스위치" 멘탈모델 유지.
+- **B-vs-인덱스 경쟁**: 현재 `cuvs_rel_has_vector_index` 가드로 인덱스 있으면 B skip. 통합메모리에서 B가 cagra/seqscan을 이길 수 있을 때 가드 완화(후속) — `link_bw`가 자동 판정.
+
+**기각**: (architect 검토) 합성 wall-clock **교차점 fit** — 테이블 물리를 굽고 default를 재유도하는 over-build, 이전 안 됨. → 대역폭/지연 **물리 상수만** 측정. / 코스트 함수 내 CUDA/IPC(plan당 100ms 컨텍스트 init) — sidecar read로 회피.
+
+**빌드 전략**: v1 = 물리 공식 + 보수적 DEFAULT(장비-독립, probe 없음, 오늘 충분). v2 = 데몬 probe + CRC sidecar + 플래너 read(트리거 시). default 덕에 v1→v2는 리라이트 아닌 계수 채우기. **규율**: 다음에 cost를 만지면 STARTUP 상수를 더 쌓지 말고 물리 분해 골격으로 리팩터.
+
+**검증(v2 시)**: probe가 PCIe/NVLink를 옳게 구분(`link_bw`), DEFAULT 폴백 시 현 동작과 동일, env-tag 불일치 시 DEFAULT로 안전 강등, detoast-aware 교차점이 dim/저장별로 옳게 이동(EXPLAIN 스윕 + Tier-2 실측 cross-check, ADR-069 물리/판단 분리).
+
+관련: ADR-074(특성화·전제), ADR-069(cost-correction loop·물리/판단 분리), ADR-073(A1/B/flat AM), ADR-070(시스템 정체성 스탬프 패턴), ADR-044(프로파일링).
+
+### Phase 2 구현 (2026-06-15, IMPLEMENTED — `feat/hw-profile`)
+
+설계(위)를 단계적으로 구현·VM 검증. **핵심 단순화 결정**: PG 코어가 경쟁 CPU seqscan+Sort를 짜고 거리 연산자를 **flat(dim-blind) per-call**로 매긴다. 코어 seqscan 비용은 못 바꾸므로(우리 path 비용만 설정 가능), GPU 비용을 **코어와 같은 PG cost-unit 기준**으로 환산해야 한다. 그 환산 앵커:
+```
+κ = cpu_operator_cost · cpu_dist_tput / dim     (PG cost-units per microsecond)
+```
+κ는 GPU 마이크로초를 코어 기준으로 옮긴다. κ ∝ 1/dim 은 옳다 — 코어가 고차원 CPU 작업을 저평가하므로 dim이 클수록 GPU가 더 일찍 이겨야 한다.
+
+**물리 공식(측정 시)**, `bytes(N)=N·dim·4`:
+- **cagra**(graph): `startup = κ·(ipc_rtt + gpu_cagra_lat_us)`, `total = startup·(1 + cuvs_k/100)`. N-독립 — 레거시 tiny-N 항 제거(N→0에서 ~공짜 CPU 스캔이 자동 승). brute_force search_mode 분기는 레거시 유지(그건 N-스케일).
+- **flat**(상주): `startup = κ·ipc_rtt`, `total = startup + κ·bytes(N)/hbm_bw`(HBM 스트림). 레거시(50+1e-5·N)보다 단조 저렴 → 라벨 안 바뀜.
+- **transient B**: 공식 설계만, **구현 보류**(`auto`/Phase 3 소관; `on`은 강제 1.0 유지).
+
+**무회귀 게이팅**: 각 actor가 `enable_cuvs_phys_cost`(GUC `cuvs.enable_phys_cost`, 기본 on) ∧ `cuvs_hw_profile_load` 성공 ∧ `(probe_status & 필요비트)==필요비트`일 때만 물리; 아니면 **레거시 상수 그대로**. cagra 필요비트=IPC_RTT|CAGRA_LAT|CPU_DIST, flat=IPC_RTT|HBM_BW|CPU_DIST. Tier-1 shim은 GPU 계수를 미프로브(호스트측 ipc_rtt/cpu_dist 비트만 셋, GPU 비트 미충족) → 필요비트 불충족 → 레거시 → **바이트 동일**. dim은 plan-time syscache typmod(`get_atttypetypmodcoll`, `table_open` 없음).
+
+**probe 확장(CuvsHwProfile v1→v2, 136→152B, 버전 조건부 read)**: 신규 `cpu_dist_tput`(CPU L2 마이크로벤치, 타당범위 클램프 else 비트 drop), `gpu_cagra_lat_us`(소형 합성 CAGRA 빌드+warm 단일쿼리 실측 — `gpu_bf_tput`는 N-스케일이라 cagra에 부적합). `ipc_rtt`는 기존 DEFAULT 자리표시자였던 것을 **AF_UNIX socketpair 왕복 실측으로 승격**(게이팅 전제). A100 실측: ipc_rtt≈3.4µs, cpu_dist≈700 (vec·dim)/µs, cagra_lat≈590µs, probe_status=0x3f.
+
+**검증(A100, fence `test/sql/routing_golden{,_measured}.sql`)**:
+- 라우팅 fence를 Tier-portable(토글 강제 케이스) + Tier-2 measured(코스트 결정 케이스)로 분리.
+- **판별 플립**: dim=8에서 N=10000이면 **레거시 상수는 seqscan**(startup 1000)을, **물리 모델은 cagra**를 고른다(이 장비의 실제 per-query 지연이 10k행 CPU 스캔을 이미 이김). 이것이 baked 상수가 배포별로 틀렸던 교차점.
+- **anti-flip**: N=2000은 물리·레거시 둘 다 seqscan(GPU를 부당하게 강제하지 않음).
+- **레거시 복귀(안전 증명, 3경로 동일)**: `cuvs.enable_phys_cost=off` / 사이드카 부재 / Tier-1(GPU 비트 미충족) → 모두 레거시 = N=10000에서 seqscan으로 복귀. installcheck 35/35 + isolation 6/6 GREEN, un-probed 바이트 동일.
+
+**남은 것**: transient B 물리 공식 활성화 + `auto`(Phase 3, GH200/MI300A급 통합메모리 필요); cpu_dist 클램프 밴드 재조정; bf_tput probe가 end-to-end(업로드 포함)라 transient용으론 후속 정밀화 필요.
