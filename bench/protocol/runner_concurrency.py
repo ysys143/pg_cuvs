@@ -167,6 +167,7 @@ def main():
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     if is_cuvs:
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+        conn.execute("ALTER EXTENSION pg_cuvs UPDATE")   # pull flat AM / hw cost
     if is_seq:                            # force the CPU brute-force scan (no index)
         conn.execute("SET enable_indexscan = off")
         conn.execute("SET enable_bitmapscan = off")

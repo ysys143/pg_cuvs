@@ -290,8 +290,11 @@ def main():
 
     conn = psycopg.connect(dbname=a.dbname, autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    if a.config in ("forced-cuvs",):
+    if a.config in ("forced-cuvs", "forced-flat", "forced-transient-bf"):
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+        # build=true reinstalls the .so/.sql but the DB keeps the old extension
+        # version; UPDATE pulls in newer objects (flat AM = 0.4.0, hw cost = 0.5.0).
+        conn.execute("ALTER EXTENSION pg_cuvs UPDATE")
 
     # Session-level plan forcing. A 'forced' config measures THAT engine's path
     # even where the planner would pick another at small N (e.g. at N=1k the cuvs

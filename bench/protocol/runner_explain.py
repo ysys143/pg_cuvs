@@ -87,6 +87,7 @@ def main():
     conn = psycopg.connect(dbname=a.dbname, autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+    conn.execute("ALTER EXTENSION pg_cuvs UPDATE")   # pull flat AM / hw cost
     conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
     runner.setup_table(conn, table, a.corpus, n, dim)
     if not runner_index_present(conn, f"{table}_cagra"):
