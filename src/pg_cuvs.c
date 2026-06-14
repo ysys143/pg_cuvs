@@ -857,12 +857,15 @@ _PG_init(void)
 
     DefineCustomEnumVariable(
         "cuvs.gpu_bruteforce",
-        "Route no-index vector ORDER BY ... LIMIT to a transient GPU exact brute force: off (default), auto, or on.",
-        "ADR-073 (B). on: the planner adds a transient GPU brute-force CustomScan for a "
-        "single-table top-k over a relation with NO vector index (always fresh, exact, "
-        "recall=1.0). off: never fires (plans unchanged). auto: reserved for cost-based "
-        "routing — behaves as off until Tier-2 calibration. Create a flat index instead "
-        "for a stable read-heavy corpus.",
+        "EXPERIMENTAL: route no-index vector ORDER BY ... LIMIT to a transient GPU exact brute force: off (default), auto, or on.",
+        "ADR-073/ADR-074 (B). EXPERIMENTAL, hardware-dependent: on a PCIe-attached GPU "
+        "transient BF does NOT beat CPU pgvector (it is memory-bound + pays per-query H2D) "
+        "— NOT recommended there; use a flat index (USING flat) for read-heavy or plain "
+        "pgvector (no index) for write-heavy. It becomes a first-class W1 path only on "
+        "unified-memory hardware (Grace Hopper / MI300A) where the H2D penalty collapses. "
+        "on: force the transient CustomScan for a single-table top-k over a NO-index "
+        "relation (always fresh, exact, recall=1.0). off: never fires. auto: reserved "
+        "(behaves as off) until hardware-portable cost calibration auto-enables it where it wins.",
         &cuvs_gpu_bruteforce,
         0,
         cuvs_gpu_bruteforce_options,
