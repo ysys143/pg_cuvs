@@ -11,10 +11,14 @@
 -- baked constant, and must NOT bias it toward the GPU:
 --   * small N (2000): a tiny CPU seqscan+sort is cheaper than cagra's fixed GPU
 --     per-query latency floor (κ·(ipc_rtt + gpu_cagra_lat_us)) → seqscan WINS
---     (anti-flip — the model does not force the GPU to win where it shouldn't).
---   * large N (50000): the CPU scan now exceeds that fixed floor (cagra is
---     ~N-independent) → cagra WINS (the flip the heuristic constant could not
---     locate per hardware).
+--     under BOTH the physical and the legacy model (anti-flip — the model does
+--     not force the GPU to win where it shouldn't).
+--   * N=10000: here the models DISAGREE — the legacy constant (startup 1000)
+--     still picks seqscan, but the hardware-anchored physical cost (κ-scaled
+--     ~hundreds, cagra ~N-independent) correctly picks cagra: on this GPU the
+--     real per-query latency already beats a 10k-row CPU scan. THIS is the
+--     crossover the baked constant got wrong per deployment. (Verified: with
+--     cuvs.enable_phys_cost=off the same query reverts to seqscan.)
 -- flat stays flat (resident HBM stream, low fixed cost); the no-index default
 -- stays seqscan.
 --
@@ -49,8 +53,8 @@ BEGIN
                   sin(g * 0.30)::numeric(12,6), cos(g * 0.23)::numeric(12,6))::vector
     FROM generate_series(1, %s) g$f$, tbl, nrows);
 END$$ LANGUAGE plpgsql;
-CREATE TABLE rg_small (id int, embedding vector(8));   -- N=2000  → anti-flip
-CREATE TABLE rg_large (id int, embedding vector(8));   -- N=50000 → flip
+CREATE TABLE rg_small (id int, embedding vector(8));   -- N=2000  → anti-flip (both seqscan)
+CREATE TABLE rg_large (id int, embedding vector(8));   -- N=10000 → physical flips to cagra (legacy: seqscan)
 CREATE TABLE rg_flat_tbl (id int, embedding vector(8));
 CREATE TABLE rg_noidx_tbl (id int, embedding vector(8));
 SELECT rg_fill('rg_small', 2000);
@@ -59,7 +63,7 @@ SELECT rg_fill('rg_small', 2000);
  
 (1 row)
 
-SELECT rg_fill('rg_large', 50000);
+SELECT rg_fill('rg_large', 10000);
  rg_fill 
 ---------
  
@@ -86,9 +90,11 @@ ANALYZE rg_flat_tbl;
 ANALYZE rg_noidx_tbl;
 -- ============================================================ Cost-driven routing
 SELECT
-  -- (1) cagra present, small N: seqscan wins (GPU latency floor > tiny CPU scan).
+  -- (1) cagra present, N=2000: seqscan wins (GPU latency floor > tiny CPU scan) —
+  -- same under legacy and physical (anti-flip).
   plan_scan('SELECT id FROM rg_small ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5')  AS cagra_small_n,
-  -- (2) cagra present, large N: cagra wins (CPU scan now exceeds the GPU floor).
+  -- (2) cagra present, N=10000: physical picks cagra where the LEGACY constant
+  -- would pick seqscan — the per-deployment crossover the constant got wrong.
   plan_scan('SELECT id FROM rg_large ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5')  AS cagra_large_n,
   -- (3) flat present, small N: flat wins (resident HBM stream).
   plan_scan('SELECT id FROM rg_flat_tbl ORDER BY embedding <-> ''[0.5,0.3,0.1,0.7,0.2,0.4,0.6,0.15]'' LIMIT 5')  AS flat_present,

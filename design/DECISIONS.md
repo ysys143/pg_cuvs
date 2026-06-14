@@ -3010,3 +3010,28 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 **검증(v2 시)**: probe가 PCIe/NVLink를 옳게 구분(`link_bw`), DEFAULT 폴백 시 현 동작과 동일, env-tag 불일치 시 DEFAULT로 안전 강등, detoast-aware 교차점이 dim/저장별로 옳게 이동(EXPLAIN 스윕 + Tier-2 실측 cross-check, ADR-069 물리/판단 분리).
 
 관련: ADR-074(특성화·전제), ADR-069(cost-correction loop·물리/판단 분리), ADR-073(A1/B/flat AM), ADR-070(시스템 정체성 스탬프 패턴), ADR-044(프로파일링).
+
+### Phase 2 구현 (2026-06-15, IMPLEMENTED — `feat/hw-profile`)
+
+설계(위)를 단계적으로 구현·VM 검증. **핵심 단순화 결정**: PG 코어가 경쟁 CPU seqscan+Sort를 짜고 거리 연산자를 **flat(dim-blind) per-call**로 매긴다. 코어 seqscan 비용은 못 바꾸므로(우리 path 비용만 설정 가능), GPU 비용을 **코어와 같은 PG cost-unit 기준**으로 환산해야 한다. 그 환산 앵커:
+```
+κ = cpu_operator_cost · cpu_dist_tput / dim     (PG cost-units per microsecond)
+```
+κ는 GPU 마이크로초를 코어 기준으로 옮긴다. κ ∝ 1/dim 은 옳다 — 코어가 고차원 CPU 작업을 저평가하므로 dim이 클수록 GPU가 더 일찍 이겨야 한다.
+
+**물리 공식(측정 시)**, `bytes(N)=N·dim·4`:
+- **cagra**(graph): `startup = κ·(ipc_rtt + gpu_cagra_lat_us)`, `total = startup·(1 + cuvs_k/100)`. N-독립 — 레거시 tiny-N 항 제거(N→0에서 ~공짜 CPU 스캔이 자동 승). brute_force search_mode 분기는 레거시 유지(그건 N-스케일).
+- **flat**(상주): `startup = κ·ipc_rtt`, `total = startup + κ·bytes(N)/hbm_bw`(HBM 스트림). 레거시(50+1e-5·N)보다 단조 저렴 → 라벨 안 바뀜.
+- **transient B**: 공식 설계만, **구현 보류**(`auto`/Phase 3 소관; `on`은 강제 1.0 유지).
+
+**무회귀 게이팅**: 각 actor가 `enable_cuvs_phys_cost`(GUC `cuvs.enable_phys_cost`, 기본 on) ∧ `cuvs_hw_profile_load` 성공 ∧ `(probe_status & 필요비트)==필요비트`일 때만 물리; 아니면 **레거시 상수 그대로**. cagra 필요비트=IPC_RTT|CAGRA_LAT|CPU_DIST, flat=IPC_RTT|HBM_BW|CPU_DIST. Tier-1 shim은 probe_status=0 → 레거시 → **바이트 동일**. dim은 plan-time syscache typmod(`get_atttypetypmodcoll`, `table_open` 없음).
+
+**probe 확장(CuvsHwProfile v1→v2, 136→152B, 버전 조건부 read)**: 신규 `cpu_dist_tput`(CPU L2 마이크로벤치, 타당범위 클램프 else 비트 drop), `gpu_cagra_lat_us`(소형 합성 CAGRA 빌드+warm 단일쿼리 실측 — `gpu_bf_tput`는 N-스케일이라 cagra에 부적합). `ipc_rtt`는 기존 DEFAULT 자리표시자였던 것을 **AF_UNIX socketpair 왕복 실측으로 승격**(게이팅 전제). A100 실측: ipc_rtt≈3.4µs, cpu_dist≈700 (vec·dim)/µs, cagra_lat≈590µs, probe_status=0x3f.
+
+**검증(A100, fence `test/sql/routing_golden{,_measured}.sql`)**:
+- 라우팅 fence를 Tier-portable(토글 강제 케이스) + Tier-2 measured(코스트 결정 케이스)로 분리.
+- **판별 플립**: dim=8에서 N=10000이면 **레거시 상수는 seqscan**(startup 1000)을, **물리 모델은 cagra**를 고른다(이 장비의 실제 per-query 지연이 10k행 CPU 스캔을 이미 이김). 이것이 baked 상수가 배포별로 틀렸던 교차점.
+- **anti-flip**: N=2000은 물리·레거시 둘 다 seqscan(GPU를 부당하게 강제하지 않음).
+- **레거시 복귀(안전 증명, 3경로 동일)**: `cuvs.enable_phys_cost=off` / 사이드카 부재 / Tier-1(probe_status=0) → 모두 레거시 = N=10000에서 seqscan으로 복귀. installcheck 35/35 + isolation 6/6 GREEN, un-probed 바이트 동일.
+
+**남은 것**: transient B 물리 공식 활성화 + `auto`(Phase 3, GH200/MI300A급 통합메모리 필요); cpu_dist 클램프 밴드 재조정; bf_tput probe가 end-to-end(업로드 포함)라 transient용으론 후속 정밀화 필요.
