@@ -3024,7 +3024,7 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 - **flat**(상주): `startup = κ·ipc_rtt`, `total = startup + κ·bytes(N)/hbm_bw`(HBM 스트림). 레거시(50+1e-5·N)보다 단조 저렴 → 라벨 안 바뀜.
 - **transient B**: 공식 설계만, **구현 보류**(`auto`/Phase 3 소관; `on`은 강제 1.0 유지).
 
-**무회귀 게이팅**: 각 actor가 `enable_cuvs_phys_cost`(GUC `cuvs.enable_phys_cost`, 기본 on) ∧ `cuvs_hw_profile_load` 성공 ∧ `(probe_status & 필요비트)==필요비트`일 때만 물리; 아니면 **레거시 상수 그대로**. cagra 필요비트=IPC_RTT|CAGRA_LAT|CPU_DIST, flat=IPC_RTT|HBM_BW|CPU_DIST. Tier-1 shim은 probe_status=0 → 레거시 → **바이트 동일**. dim은 plan-time syscache typmod(`get_atttypetypmodcoll`, `table_open` 없음).
+**무회귀 게이팅**: 각 actor가 `enable_cuvs_phys_cost`(GUC `cuvs.enable_phys_cost`, 기본 on) ∧ `cuvs_hw_profile_load` 성공 ∧ `(probe_status & 필요비트)==필요비트`일 때만 물리; 아니면 **레거시 상수 그대로**. cagra 필요비트=IPC_RTT|CAGRA_LAT|CPU_DIST, flat=IPC_RTT|HBM_BW|CPU_DIST. Tier-1 shim은 GPU 계수를 미프로브(호스트측 ipc_rtt/cpu_dist 비트만 셋, GPU 비트 미충족) → 필요비트 불충족 → 레거시 → **바이트 동일**. dim은 plan-time syscache typmod(`get_atttypetypmodcoll`, `table_open` 없음).
 
 **probe 확장(CuvsHwProfile v1→v2, 136→152B, 버전 조건부 read)**: 신규 `cpu_dist_tput`(CPU L2 마이크로벤치, 타당범위 클램프 else 비트 drop), `gpu_cagra_lat_us`(소형 합성 CAGRA 빌드+warm 단일쿼리 실측 — `gpu_bf_tput`는 N-스케일이라 cagra에 부적합). `ipc_rtt`는 기존 DEFAULT 자리표시자였던 것을 **AF_UNIX socketpair 왕복 실측으로 승격**(게이팅 전제). A100 실측: ipc_rtt≈3.4µs, cpu_dist≈700 (vec·dim)/µs, cagra_lat≈590µs, probe_status=0x3f.
 
@@ -3032,6 +3032,6 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 - 라우팅 fence를 Tier-portable(토글 강제 케이스) + Tier-2 measured(코스트 결정 케이스)로 분리.
 - **판별 플립**: dim=8에서 N=10000이면 **레거시 상수는 seqscan**(startup 1000)을, **물리 모델은 cagra**를 고른다(이 장비의 실제 per-query 지연이 10k행 CPU 스캔을 이미 이김). 이것이 baked 상수가 배포별로 틀렸던 교차점.
 - **anti-flip**: N=2000은 물리·레거시 둘 다 seqscan(GPU를 부당하게 강제하지 않음).
-- **레거시 복귀(안전 증명, 3경로 동일)**: `cuvs.enable_phys_cost=off` / 사이드카 부재 / Tier-1(probe_status=0) → 모두 레거시 = N=10000에서 seqscan으로 복귀. installcheck 35/35 + isolation 6/6 GREEN, un-probed 바이트 동일.
+- **레거시 복귀(안전 증명, 3경로 동일)**: `cuvs.enable_phys_cost=off` / 사이드카 부재 / Tier-1(GPU 비트 미충족) → 모두 레거시 = N=10000에서 seqscan으로 복귀. installcheck 35/35 + isolation 6/6 GREEN, un-probed 바이트 동일.
 
 **남은 것**: transient B 물리 공식 활성화 + `auto`(Phase 3, GH200/MI300A급 통합메모리 필요); cpu_dist 클램프 밴드 재조정; bf_tput probe가 end-to-end(업로드 포함)라 transient용으론 후속 정밀화 필요.

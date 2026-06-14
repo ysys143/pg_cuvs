@@ -100,8 +100,9 @@ The planner decides between a GPU index (`cagra`/`flat`) and a CPU seqscan by **
   `flat ≈ κ·ipc_rtt + κ·(N·dim·4 / hbm_bw)`. The GPU-vs-seqscan crossover is therefore located by
   the deployment's hardware and the query's dimension, not a baked constant.
 - **Legacy fallback (byte-identical to pre-0.5.0)** — when `cuvs.enable_phys_cost = off`, the
-  profile is missing/partial/corrupt, or the build is the Tier-1 CPU shim (`probe_status = 0`), the
-  planner uses the legacy heuristic constants (`CUVS_STARTUP_COST=1000`, `CUVS_FLAT_STARTUP_COST=50`,
+  profile is missing/partial/corrupt, or the build is the Tier-1 CPU shim (which leaves the GPU
+  coefficients unprobed — only the host-side `ipc_rtt`/`cpu_dist` bits get set, so the required GPU
+  probe bits are never satisfied), the planner uses the legacy heuristic constants (`CUVS_STARTUP_COST=1000`, `CUVS_FLAT_STARTUP_COST=50`,
   k-dominant). Routing is unchanged from prior versions in this regime.
 
 Inspect the active profile with `pg_cuvs_hw_profile()` (§5): `source = measured` confirms the
