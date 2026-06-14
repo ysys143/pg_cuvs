@@ -2961,3 +2961,52 @@ load-dependent `bf_batch_wait` 라우팅과 `CUVS_STARTUP_COST` 재보정은 이
 **교훈**: 정확성(FATAL)은 빌드 전 적대검증했으나 **"빠른가"라는 가치 가설은 빌드 후에야 측정**했다. 작은 spike(재스캔+GPU vs CPU)를 빌드 전에 했으면 B의 잉여성을 일찍 잡았다. → 성능 가치 가설도 빌드 전 측정을 절차로.
 
 관련: ADR-073(수정 대상), ADR-069(cost-correction loop), ADR-047(delta/tombstone MVCC), ADR-061(filtered wedge), ADR-044(프로파일링).
+
+---
+
+## ADR-075 (잠정, 번호 머지 시 확정) — 벡터 라우팅 코스트 모델: 데이터-이동 물리 분해 + 하드웨어-포터블 계수
+
+**날짜**: 2026-06-14
+**상태**: ACCEPTED (설계). 구현은 **게으르게** — v1은 보수적 DEFAULT 상수, v2(물리 probe)는 트리거 시(B 통합메모리 auto / 실측 오보정). ADR-074 특성화 + ADR-069 cost-loop 위에 세움.
+
+**문제**: 현 코스트는 행 수 휴리스틱(`CUVS_STARTUP_COST=1000`·`FLAT_STARTUP=50`·seqscan `~0.189·N`)인데, ADR-074 측정이 보여준 실제 동인은 전부 **데이터 이동**(detoast·H2D·상주·memory-bound 연산)이다. 두 결함: (1) **detoast-blind** — PG 네이티브 seqscan cost에 detoast 항이 없어 cagra/flat-vs-seqscan 교차점이 dim/저장에 따라 틀림(768-dim TOAST면 seqscan을 cagra 위로 오선택, ~16x 손해 가능). (2) **장비 종속** — 상수가 특정 머신(A100/PCIe)에 굳어 다른 배포(통합메모리 등)에서 오라우팅.
+
+**결정**:
+
+### 1. 코스트 = 데이터-이동 물리 분해 (행 수 아님)
+```
+cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk(m,k) + fetch(k)
+```
+`m` = WHERE 선택도 적용 후 행. detoast(저장 의존)·move(하드웨어 의존)가 현 상수에 숨은 핵심 항. 엔진별 인스턴스:
+- **A1 상주**: scan0+detoast0+move0+compute(N·dim/`hbm_bw`) → ~1ms (읽기 압승).
+- **CPU seqscan**: scan(N)+detoast(m,storage)+compute(m·dim/`cpu_mem_bw`)+sort. TOAST면 detoast 지배.
+- **B transient**: scan(N)+detoast(m)+move(m·dim/`link_bw`)+compute(HBM). `link_bw`가 PCIe면 짐·NVLink면 이김.
+- **cagra/ivfpq**: 근사 = sublinear + `ipc_rtt` + k-bound, recall<1.
+
+### 2. 파라미터 3계층
+- **하드웨어(측정·포터블)**: `link_bw`(CPU↔GPU), `hbm_bw`, `gpu_bf_tput`, `ipc_rtt`, `cpu_mem_bw`/`detoast_rate`.
+- **저장(카탈로그)**: `pg_attribute.attstorage`+typmod → 이 dim에서 TOAST 여부 → detoast 항 (plan-time relcache).
+- **워크로드(플랜)**: N(`rel->tuples`), m(선택도), dim(typmod), k(LIMIT).
+
+### 3. 하드웨어-포터블 계수 — "교차점이 아니라 물리 상수를 측정"
+교차점은 테이블 물리+하드웨어가 섞여 이전 안 됨; **대역폭/지연 상수는 순수 장비 속성이라 모든 테이블/쿼리에 이전**된다.
+- **데몬이 startup에 1회 측정**(CUDA warm, ~ms): `link_bw`(cudaMemcpy pinned/pageable 타이밍 → PCIe vs NVLink 자동 구분), `hbm_bw`(d2d/props), `gpu_bf_tput`(합성 상주 코퍼스 BF 1회), `ipc_rtt`(no-op IPC+tiny search). CPU측 `detoast_rate`는 확장이 1회 측정.
+- **저장**: 데몬이 `index_dir/hw_profile`에 **고정포맷+magic+version+CRC**로 기록(`.tids` 패턴). **env tag**(`gpu_name`+`system_identifier`) 포함.
+- **플래너 read**: cost 함수가 plan당 싸게 fread(기존 `.stale`/`.tids` 헤더 게이트와 동일, CUDA/IPC 금지 준수). 캐시 함정 회피(plan당 재읽기, ~100B).
+- **폴백**: 없거나 invalid(CRC/version/정체성 불일치) → **보수적 DEFAULT 상수** → cost 모델 어디서나 동작. probe는 정밀화일 뿐.
+- **장비 변경 감지**: profile.env_tag vs 데몬-정체성 sidecar 비교(클론/rsync는 mtime 보존하므로 **mtime 의존 금지** — 정체성 태그가 방어). 불일치 → DEFAULT + 다음 데몬 startup 재측정.
+- **magic 상수 대체**: `STARTUP=1000`→`ipc_rtt`, `FLAT_STARTUP=50`→유도, seqscan `0.189·N`→`m·dim/detoast_rate` 등. 공식엔 baked 숫자 0; 모든 장비 숫자는 probe(있으면)/default(없으면).
+
+### 4. 플래너 아키텍처
+- **인덱스 AM(A1/cagra/ivfpq) → `amcostestimate`** (blessed·안정, 유지). 각 인덱스가 후보 path; PG가 seqscan 후보도 항상 생성 → `add_path`가 싼 쪽.
+- **무인덱스 B + seqscan 보정 → `set_rel_pathlist` 훅**: 여기서 **detoast-aware base-rel 비용**을 물리 항으로 계산해 cagra/flat 후보와 같은 단위로 비교 → "cagra 있어도 seqscan/B가 진짜 싸면 그쪽" 이 정확히 됨(결함 1 해소).
+- **recall은 cost로 거래 안 함 — exact-우선 단방향 규칙**: exact(A1/B/seqscan) vs approx(cagra)는 결과 품질이 달라 비용 직접 비교 불가. 규칙: *exact가 더 싸거나 같으면 exact로(싸고 정확 → 무조건 이득); exact가 더 비싸면 cagra 유지(사용자가 DDL로 속도-위해-recall 선택).* 절대 "더 정확하니 느려도 exact"로 자동 강등 안 함. "flat 생성 여부 = W2 스위치" 멘탈모델 유지.
+- **B-vs-인덱스 경쟁**: 현재 `cuvs_rel_has_vector_index` 가드로 인덱스 있으면 B skip. 통합메모리에서 B가 cagra/seqscan을 이길 수 있을 때 가드 완화(후속) — `link_bw`가 자동 판정.
+
+**기각**: (architect 검토) 합성 wall-clock **교차점 fit** — 테이블 물리를 굽고 default를 재유도하는 over-build, 이전 안 됨. → 대역폭/지연 **물리 상수만** 측정. / 코스트 함수 내 CUDA/IPC(plan당 100ms 컨텍스트 init) — sidecar read로 회피.
+
+**빌드 전략**: v1 = 물리 공식 + 보수적 DEFAULT(장비-독립, probe 없음, 오늘 충분). v2 = 데몬 probe + CRC sidecar + 플래너 read(트리거 시). default 덕에 v1→v2는 리라이트 아닌 계수 채우기. **규율**: 다음에 cost를 만지면 STARTUP 상수를 더 쌓지 말고 물리 분해 골격으로 리팩터.
+
+**검증(v2 시)**: probe가 PCIe/NVLink를 옳게 구분(`link_bw`), DEFAULT 폴백 시 현 동작과 동일, env-tag 불일치 시 DEFAULT로 안전 강등, detoast-aware 교차점이 dim/저장별로 옳게 이동(EXPLAIN 스윕 + Tier-2 실측 cross-check, ADR-069 물리/판단 분리).
+
+관련: ADR-074(특성화·전제), ADR-069(cost-correction loop·물리/판단 분리), ADR-073(A1/B/flat AM), ADR-070(시스템 정체성 스탬프 패턴), ADR-044(프로파일링).
