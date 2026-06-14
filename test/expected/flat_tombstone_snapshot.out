@@ -1,0 +1,24 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_snap s2_del s2_vac s1_again s1_commit s3_read
+step s1_snap: SELECT id FROM isof ORDER BY embedding <-> '[9,9,9,9]'::vector LIMIT 1;
+id
+--
+42
+(1 row)
+
+step s2_del: DELETE FROM isof WHERE id = 42;
+step s2_vac: VACUUM isof;
+step s1_again: SELECT id FROM isof ORDER BY embedding <-> '[9,9,9,9]'::vector LIMIT 1;
+id
+--
+42
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_read: SELECT id FROM isof ORDER BY embedding <-> '[9,9,9,9]'::vector LIMIT 1;
+id
+--
+ 9
+(1 row)
+
