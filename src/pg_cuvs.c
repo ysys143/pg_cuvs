@@ -4751,7 +4751,7 @@ pg_cuvs_batch_search(PG_FUNCTION_ARGS)
  * daemon-identity sidecar's, so a stale profile after a GPU swap is visible.
  * NOT consumed by any cost decision yet (Phase 2).
  * ---------------------------------------------------------------- */
-#define HWPROFILE_NCOLS 11
+#define HWPROFILE_NCOLS 13
 
 PG_FUNCTION_INFO_V1(pg_cuvs_hw_profile);
 Datum
@@ -4792,10 +4792,12 @@ pg_cuvs_hw_profile(PG_FUNCTION_ARGS)
     if (!measured)
     {
         memset(&p, 0, sizeof(p));
-        p.link_bw_bpus = CUVS_HWP_DEFAULT_LINK_BW;
-        p.hbm_bw_bpus  = CUVS_HWP_DEFAULT_HBM_BW;
-        p.gpu_bf_tput  = CUVS_HWP_DEFAULT_BF_TPUT;
-        p.ipc_rtt_us   = CUVS_HWP_DEFAULT_IPC_RTT;
+        p.link_bw_bpus     = CUVS_HWP_DEFAULT_LINK_BW;
+        p.hbm_bw_bpus      = CUVS_HWP_DEFAULT_HBM_BW;
+        p.gpu_bf_tput      = CUVS_HWP_DEFAULT_BF_TPUT;
+        p.ipc_rtt_us       = CUVS_HWP_DEFAULT_IPC_RTT;
+        p.cpu_dist_tput    = CUVS_HWP_DEFAULT_CPU_DIST;
+        p.gpu_cagra_lat_us = CUVS_HWP_DEFAULT_CAGRA_LAT;
     }
     else
     {
@@ -4831,6 +4833,8 @@ pg_cuvs_hw_profile(PG_FUNCTION_ARGS)
     values[8]  = Int32GetDatum((int32) p.probe_status);
     values[9]  = CStringGetTextDatum(measured ? "measured" : "default");
     values[10] = BoolGetDatum(matches);
+    values[11] = Float8GetDatum(p.cpu_dist_tput);     /* v2 */
+    values[12] = Float8GetDatum(p.gpu_cagra_lat_us);  /* v2 */
 
     tuplestore_putvalues(tupstore, tupdesc, values, nulls);
     return (Datum) 0;

@@ -17,5 +17,7 @@ SELECT source = 'measured'            AS profile_present,
        hbm_bw_bytes_per_us  > 0       AS hbm_bw_pos,
        gpu_bf_tput          > 0       AS bf_tput_pos,
        ipc_rtt_us           > 0       AS ipc_pos,
+       cpu_dist_tput        > 0       AS cpu_dist_pos,
+       gpu_cagra_lat_us     > 0       AS cagra_lat_pos,
        matches_running_daemon         AS matches
 FROM pg_cuvs_hw_profile();

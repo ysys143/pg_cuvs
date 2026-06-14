@@ -605,7 +605,9 @@ CREATE FUNCTION pg_cuvs_hw_profile(
     OUT measured_at_epoch       bigint,
     OUT probe_status            integer,
     OUT source                  text,
-    OUT matches_running_daemon  boolean
+    OUT matches_running_daemon  boolean,
+    OUT cpu_dist_tput           double precision,
+    OUT gpu_cagra_lat_us        double precision
 )
 RETURNS SETOF record
 AS '$libdir/pg_cuvs', 'pg_cuvs_hw_profile'

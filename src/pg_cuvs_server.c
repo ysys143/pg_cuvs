@@ -7405,11 +7405,13 @@ write_hw_profile(void)
     p.n_gpus      = (uint32_t) g_n_gpus;
     p.measured_at = (int64_t) time(NULL);
     /* Conservative DEFAULTs (shared with the planner fallback); probes overwrite. */
-    p.link_bw_bpus = CUVS_HWP_DEFAULT_LINK_BW;
-    p.hbm_bw_bpus  = CUVS_HWP_DEFAULT_HBM_BW;
-    p.gpu_bf_tput  = CUVS_HWP_DEFAULT_BF_TPUT;
-    p.ipc_rtt_us   = CUVS_HWP_DEFAULT_IPC_RTT;   /* not probed in v1 */
-    p.probe_status = 0;
+    p.link_bw_bpus    = CUVS_HWP_DEFAULT_LINK_BW;
+    p.hbm_bw_bpus     = CUVS_HWP_DEFAULT_HBM_BW;
+    p.gpu_bf_tput     = CUVS_HWP_DEFAULT_BF_TPUT;
+    p.ipc_rtt_us      = CUVS_HWP_DEFAULT_IPC_RTT;
+    p.cpu_dist_tput   = CUVS_HWP_DEFAULT_CPU_DIST;   /* v2; probed in Stage 3 */
+    p.gpu_cagra_lat_us = CUVS_HWP_DEFAULT_CAGRA_LAT; /* v2; probed in Stage 3 */
+    p.probe_status    = 0;
 
     cuvs_probe_hw(dev, &p.link_bw_bpus, &p.hbm_bw_bpus, &p.gpu_bf_tput, &p.probe_status);
 

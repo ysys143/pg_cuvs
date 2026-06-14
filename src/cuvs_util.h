@@ -196,13 +196,19 @@ int cuvs_vectors_read(FILE *f, CuvsVectorsHeader *hdr_out, float **vecs_out);
  * cheaply at plan time (no CUDA/IPC); any mismatch -> caller uses compiled DEFAULTs.
  * ---------------------------------------------------------------- */
 #define CUVS_HWPROFILE_MAGIC   0x46505748u   /* 'HWPF' little-endian */
-#define CUVS_HWPROFILE_VERSION 1u
+/* v1: link_bw/hbm_bw/gpu_bf_tput/ipc_rtt (136 bytes).
+ * v2: + cpu_dist_tput + gpu_cagra_lat_us (152 bytes) for the physical cost model
+ *     (ADR-075 Phase 2). The reader accepts v1 (older daemon) and zero-fills the
+ *     v2 tail with DEFAULTs + clear bits, so the planner falls back to legacy. */
+#define CUVS_HWPROFILE_VERSION 2u
 
 /* probe_status bits: set = field measured on this hardware; clear = compiled DEFAULT. */
 #define CUVS_HWPROBE_LINK_BW   0x1u
 #define CUVS_HWPROBE_HBM_BW    0x2u
 #define CUVS_HWPROBE_BF_TPUT   0x4u
 #define CUVS_HWPROBE_IPC_RTT   0x8u
+#define CUVS_HWPROBE_CPU_DIST  0x10u  /* v2: CPU L2-distance throughput measured */
+#define CUVS_HWPROBE_CAGRA_LAT 0x20u  /* v2: CAGRA per-query graph-search latency measured */
 
 typedef struct CuvsHwProfile {
     uint32_t magic;
@@ -219,7 +225,14 @@ typedef struct CuvsHwProfile {
     double   hbm_bw_bpus;      /* GPU device memory bandwidth, bytes per microsecond */
     double   gpu_bf_tput;      /* brute-force throughput, (vectors*dim) per microsecond */
     double   ipc_rtt_us;       /* loopback IPC round-trip, microseconds */
+    /* --- v2 tail (ADR-075 Phase 2); v1 readers/files treat these as DEFAULT --- */
+    double   cpu_dist_tput;    /* CPU L2-distance throughput, (vectors*dim) per microsecond */
+    double   gpu_cagra_lat_us; /* CAGRA per-query graph-search latency floor, microseconds */
 } CuvsHwProfile;               /* fixed-size POD, naturally aligned, LE-only */
+
+/* Byte sizes of each on-disk version (for the version-conditional read). */
+#define CUVS_HWPROFILE_SZ_V1   (offsetof(CuvsHwProfile, cpu_dist_tput))
+#define CUVS_HWPROFILE_SZ_V2   (sizeof(CuvsHwProfile))
 
 /* Stamp magic/version + body_crc32 on *p (body fields already filled) and fwrite
  * it. Returns 0 / -1. Caller does fflush/fsync/rename. */
@@ -237,6 +250,8 @@ int cuvs_hw_profile_read(FILE *f, CuvsHwProfile *out);
 #define CUVS_HWP_DEFAULT_HBM_BW    1000000.0    /* ~1 TB/s floor */
 #define CUVS_HWP_DEFAULT_BF_TPUT   1000.0       /* (vectors*dim) per microsecond */
 #define CUVS_HWP_DEFAULT_IPC_RTT   500.0        /* microseconds */
+#define CUVS_HWP_DEFAULT_CPU_DIST  200.0        /* CPU (vectors*dim) per microsecond */
+#define CUVS_HWP_DEFAULT_CAGRA_LAT 1000.0       /* CAGRA graph-search latency, microseconds */
 
 /* ----------------------------------------------------------------
  * Versioned, checksummed .shards manifest (Phase 3F multi-GPU sharding).

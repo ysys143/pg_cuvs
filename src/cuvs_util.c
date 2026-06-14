@@ -397,16 +397,34 @@ cuvs_hw_profile_read(FILE *f, CuvsHwProfile *out)
 {
     CuvsHwProfile p;
     size_t        off = offsetof(CuvsHwProfile, probe_status);
+    size_t        total_sz, body_sz;
+    uint32_t      hdr[3];   /* magic, version, body_crc32 — the pre-CRC header */
 
-    if (fread(&p, sizeof(p), 1, f) != 1)
+    /* Seed DEFAULTs so reading a v1 file leaves the v2 tail (cpu_dist_tput,
+     * gpu_cagra_lat_us) at compiled DEFAULT with their probe bits clear → the
+     * planner falls back to the legacy cost path for those coefficients. */
+    memset(&p, 0, sizeof(p));
+    p.cpu_dist_tput    = CUVS_HWP_DEFAULT_CPU_DIST;
+    p.gpu_cagra_lat_us = CUVS_HWP_DEFAULT_CAGRA_LAT;
+
+    if (fread(hdr, sizeof(hdr), 1, f) != 1)   /* off == sizeof(hdr) == 12 */
         return -1;
-    if (p.magic != CUVS_HWPROFILE_MAGIC)
+    if (hdr[0] != CUVS_HWPROFILE_MAGIC)
         return -1;
-    if (p.version != CUVS_HWPROFILE_VERSION)
+    if (hdr[1] == 1u)
+        total_sz = CUVS_HWPROFILE_SZ_V1;
+    else if (hdr[1] == 2u)
+        total_sz = CUVS_HWPROFILE_SZ_V2;
+    else
+        return -1;                            /* unknown version */
+    p.magic = hdr[0]; p.version = hdr[1]; p.body_crc32 = hdr[2];
+
+    body_sz = total_sz - off;                 /* probe_status..end for this version */
+    if (fread((char *) &p + off, body_sz, 1, f) != 1)
         return -1;
     if (p.reserved != 0)
         return -1;
-    if (cuvs_crc32((const char *)&p + off, sizeof(p) - off) != p.body_crc32)
+    if (cuvs_crc32((const char *) &p + off, body_sz) != p.body_crc32)
         return -1;
 
     if (out)
