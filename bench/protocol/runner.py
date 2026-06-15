@@ -367,14 +367,24 @@ def main():
     set_sql, knob, _, met = choose_iso_recall(conn, table, queries[:qcap_sweep],
                                               gt[:qcap_sweep], k, target,
                                               a.config, a.index_dir)
-    # ── measured query point: reps × full query set → median + dispersion ────
-    qcap = min(10000, len(queries))
+    # ── measured query point: reps × query set → median + dispersion ─────────
+    # Slow EXACT paths (cpu seqscan ~0.1-1s/q, transient-BF ~0.1-1s/q) would take
+    # hours over 10k queries × reps; cap them (PGCUVS_SLOW_QCAP, default 300) and
+    # trim warmup. Resident GPU paths (cagra/flat ~ms) keep the full set.
+    SLOW = ("forced-seqscan", "forced-transient-bf")
+    if a.config in SLOW:
+        cap_max = int(os.environ.get("PGCUVS_SLOW_QCAP", "300"))
+        warmup = 20
+    else:
+        cap_max, warmup = 10000, 200
+    qcap = min(cap_max, len(queries))
     qfin, gtfin = queries[:qcap], gt[:qcap]
     per_rep, per_qps, last_ids = [], [], None
     with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=dpid) as s:
         for _ in range(max(1, a.reps)):
             ids, qps, lat = run_queries(conn, table, qfin, k, set_sql,
-                                        a.index_dir, a.config, lat_cap=qcap)
+                                        a.index_dir, a.config, warmup=warmup,
+                                        lat_cap=qcap)
             per_rep.append(_pctls_us(lat))
             per_qps.append(qps)
             last_ids = ids
