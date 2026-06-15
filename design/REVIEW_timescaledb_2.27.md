@@ -61,14 +61,32 @@
 ### (C) CAgg 재작성 → **비적용**
 벡터 검색엔 머티리얼라이즈드 집계 개념이 없다. 유사물 없음. 제외.
 
-### (B) Vectorized filter → **이미 흡수됨, 저가치**
-GPU 자체가 궁극의 벡터화 실행기이고, 3O **BITSET prefilter가 곧 GPU validity 비트맵**의
-등가물이다. CPU-스칼라로 남은 지점(데몬 rev-map 이진탐색, post-filter 루프)을 SIMD로
-배치화할 여지는 있으나:
-- ADR-044: 검색은 **GPU-bound**(GPU:IPC≈2:1).
-- ADR-074: flat 읽기 병목은 **TOAST detoast(~535ms)**, 거리계산≈0(memory-bound).
+### (B) Columnar + Vectorized filter → **이미 있음(핫 컬럼) / 의도적 위임, 저가치**
 
-즉 CPU 필터 평가는 핫패스가 아니다 → 한계가치 낮음. 추격할 이유 없음.
+세 TSDB 설계 중 **가장 가치 낮음**. 단 이유는 "GPU가 빨라서"가 아니라 아래 셋이다.
+
+**Columnar storage는 이미 핫 컬럼에 실현됨.** TSDB columnar의 핵심 = 컬럼을 행저장소에서
+빼내 압축 연속 배치로. pg_cuvs `.vectors` 사이드카 = 임베딩 컬럼의 dense `N×dim` columnar
+projection(row-major, `offset=header+item_id*dim*4`), CAGRA/IVF-PQ = 그 컬럼의 압축 표현
+(IVF-PQ는 문자 그대로 PQ 압축 10–100×). 스칼라 메타데이터 컬럼만 PG heap에 남기는데, 그건
+PG 인덱스가 처리하므로 갭 아님.
+
+**Vectorized filter는 두 층으로 갈라 봐야 한다.**
+1. *스칼라 술어 평가*(`tenant_id=42`): pg_cuvs는 **의도적으로 PG executor에 위임**
+   (데몬 value-agnostic, 백엔드가 통과 TID→BITSET 변환 전달). 건전한 경계 — B-tree가
+   빠르고 선택적. 여기 재벡터화 = executor 재발명이고 필터평가는 병목도 아님
+   (ADR-044 GPU-bound, ADR-074 병목=detoast).
+2. *다운스트림 소비자 부재*: TSDB에서 vectorized filter가 값을 발하는 건 그 비트맵이
+   **vectorized aggregation**(OLAP)으로 흐르기 때문. pg_cuvs 쿼리는 top-k라 그 "집계"
+   등가물(top-k 머지)을 이미 GPU에서 함 → 비트맵을 먹일 소비자가 없음.
+3. *유일한 새 변종 — GPU-fused filter*: 스칼라 컬럼을 GPU 상주시켜 술어평가+거리계산을
+   한 커널에 융합(BITSET 마샬링 제거). pg_cuvs가 **명시적으로 비선택**한 설계(데몬 단순성·
+   on-device 타입시스템·payload VRAM 회피). 이기는 구간 = **저선택성 + 벡터 상주**인데,
+   pg_cuvs 표적(ADR-061)은 정반대 **고선택성 멀티테넌트**라 regime이 어긋남. 저선택성에선
+   거리계산이 지배 → 마샬링 절약 marginal. 재평가 트리거 = 저선택성 filtered 워크로드 실수요.
+
+3O **BITSET prefilter가 곧 GPU validity 비트맵**의 등가물이라는 점은 유효하나, 위 (1)~(3)이
+"왜 추격 안 하나"의 정확한 근거다.
 
 ### (A) Bloom 배치 프루닝 → **유일한 진짜 이식 후보**
 
@@ -116,7 +134,7 @@ per-chunk bloom이 더할 게 없다(**잉여**).
 | 설계 | 판정 | 근거 |
 |------|------|------|
 | (C) CAgg 재작성 | 비적용 | 벡터 DB에 집계 머티리얼라이즈 없음 |
-| (B) Vectorized filter | 이미흡수·저가치 | GPU=벡터화 실행기, BITSET=validity 비트맵; 병목은 detoast(ADR-074) |
+| (B) Columnar + Vectorized filter | 이미있음/위임·저가치 | columnar는 `.vectors`+IVF-PQ로 이미 실현(핫 컬럼); 스칼라 필터는 PG 위임이 옳은 경계; agg 소비자 부재; GPU-fused는 표적과 반대 regime |
 | (A) Bloom 배치 프루닝 | **이식 후보(샤딩 fanout 한정)** | 매치 0 샤드를 검색 전 스킵; 단 기질은 이미 구현됨 → 남은 건 페이오프 *측정* |
 
 **권고**: (A)를 **지금 구현하지 말 것**. 단 이유는 "기질이 없어서"가 아니다(샤딩·
