@@ -1,0 +1,8 @@
+{
+  "run_id": "gha-27529305463-1", "stage": "A", "module": "physics",
+  "baseline": "same-box", "dataset": "cohere-1m", "reps": 1,
+  "cpu_shim": 0,
+  "cost_model_version": "v3-phys",
+  "runtime_routing_version": "v3",
+  "csv": "/home/ubuntu/actions-runner/_work/pg_cuvs/pg_cuvs/results/protocol/A.csv", "started": "2026-06-15T06:55:42Z", "total": 2
+}
