@@ -4661,19 +4661,26 @@ handle_build(int client_fd, const CuvsCmdFrame *cmd)
                                                  (int)cmd->graph_degree,
                                                  (int)cmd->intermediate_graph_degree,
                                                  cmd->build_algo, target_gpu);
-    if (!new_handle && cuvs_last_build_was_oom())
+    /* ADR-070 Bug #3: the build hit a VRAM OOM (estimate_vram_bytes excludes
+     * CAGRA build-time scratch, so admission can pass yet the build OOM).
+     * Evict-to-fit: under heavy residency one eviction may not free enough, so
+     * keep evicting the LRU and retrying until the build fits — or there is
+     * nothing left to evict, in which case it is a genuine OOM and we fail with a
+     * clear error rather than aborting after a single retry. evict_lru persists
+     * each victim (it reloads lazily on next use) and safely handles
+     * IVF-PQ/sharded LRUs. Bounded: each round evicts one resident index. */
     {
-        /* ADR-070 Bug #3: the build hit a VRAM OOM (estimate_vram_bytes excludes
-         * CAGRA build-time scratch, so admission can pass yet the build OOM).
-         * Briefly retake the lock to evict an LRU index, then retry once (only if
-         * eviction freed VRAM). evict_lru now safely handles IVF-PQ/sharded LRUs. */
-        pthread_mutex_lock(&g_index_mutex);
-        int evicted = (evict_lru(target_gpu) > 0);
-        pthread_mutex_unlock(&g_index_mutex);
-        if (evicted)
+        int round = 0;
+        while (!new_handle && cuvs_last_build_was_oom())
         {
-            LOG_WARN("[handle_build] build OOM on GPU %d; evicted LRU, retrying once\n",
-                     target_gpu);
+            size_t freed;
+            pthread_mutex_lock(&g_index_mutex);
+            freed = evict_lru(target_gpu);
+            pthread_mutex_unlock(&g_index_mutex);
+            if (freed == 0)
+                break;   /* nothing left to evict — real OOM, fall through to error */
+            LOG_WARN("[handle_build] build OOM on GPU %d; evicted LRU (round %d), retrying\n",
+                     target_gpu, ++round);
             new_handle = cuvs_cagra_build(vecs, cmd->n_vecs, (int)cmd->dim, cmd->metric,
                                           (int)cmd->graph_degree,
                                           (int)cmd->intermediate_graph_degree,
@@ -5275,17 +5282,22 @@ handle_build_multi(int client_fd, const CuvsCmdFrame *cmd, const char *index_dir
                                             (int)cmd->graph_degree,
                                             (int)cmd->intermediate_graph_degree,
                                             cmd->build_algo, target_gpu);
-        if (!new_handle && cuvs_last_build_was_oom())
+        /* ADR-070 Bug #3: VRAM OOM (scratch not covered by ensure_vram). Evict-to-fit:
+         * keep evicting the LRU and retrying until the build fits or nothing is left
+         * to evict (then a genuine OOM → clear error, not a one-retry abort). Mirrors
+         * handle_build. Bounded: one resident index evicted per round. */
         {
-            /* ADR-070 Bug #3: VRAM OOM (scratch not covered by ensure_vram) —
-             * briefly retake the lock to evict an LRU index, then retry once. */
-            pthread_mutex_lock(&g_index_mutex);
-            int evicted = (evict_lru(target_gpu) > 0);
-            pthread_mutex_unlock(&g_index_mutex);
-            if (evicted)
+            int round = 0;
+            while (!new_handle && cuvs_last_build_was_oom())
             {
-                LOG_WARN("[handle_build_multi] build OOM on GPU %d; evicted LRU, retrying once\n",
-                         target_gpu);
+                size_t freed;
+                pthread_mutex_lock(&g_index_mutex);
+                freed = evict_lru(target_gpu);
+                pthread_mutex_unlock(&g_index_mutex);
+                if (freed == 0)
+                    break;   /* nothing left to evict — real OOM */
+                LOG_WARN("[handle_build_multi] build OOM on GPU %d; evicted LRU (round %d), retrying\n",
+                         target_gpu, ++round);
                 new_handle = cuvs_cagra_build_multi(part_vecs, n_each, nmapped, total,
                                                     (int)cmd->dim, cmd->metric,
                                                     (int)cmd->graph_degree,

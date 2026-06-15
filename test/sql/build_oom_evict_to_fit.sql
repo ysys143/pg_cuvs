@@ -1,0 +1,73 @@
+-- build_oom_evict_to_fit.sql — a build VRAM OOM that needs MORE THAN ONE eviction
+-- must keep evicting the LRU and retrying until it fits, not abort after a single
+-- retry. The old behaviour ("evict one LRU, retry once") hard-failed with
+-- BUILD failed (status 5) under VRAM pressure when one eviction did not free
+-- enough — observed on the 40GB single-GPU VM in full-suite runs. evict-to-fit
+-- (handle_build + handle_build_multi) loops the evict+retry until success or
+-- nothing is left to evict (then a genuine OOM → clear error).
+--
+-- pg_cuvs_inject_build_oom(2) arms TWO consecutive build OOMs, so the build OOMs
+-- twice: evict-to-fit evicts the LRU twice and the third attempt succeeds. The
+-- old evict-once path would still be OOM-armed on its single retry → hard fail.
+-- Each scenario creates its OWN >=2 resident victims so it holds standalone.
+--
+-- REQUIRES: pg_cuvs_server running; cuvs.index_dir writable. Tier-1 CI (CPU shim).
+\set ON_ERROR_STOP on
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_cuvs;
+SET cuvs.index_dir = '/tmp/cuvs_indexes';
+
+-- ============================================================ single-process path
+-- handle_build (max_parallel_maintenance_workers = 0). Two fresh resident victims.
+SET max_parallel_maintenance_workers = 0;
+CREATE TABLE sv1 (id int, embedding vector(8));
+INSERT INTO sv1 SELECT g, format('[%s,0,0,0,0,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
+CREATE INDEX sv1_idx ON sv1 USING cagra (embedding vector_l2_ops);
+CREATE TABLE sv2 (id int, embedding vector(8));
+INSERT INTO sv2 SELECT g, format('[0,%s,0,0,0,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
+CREATE INDEX sv2_idx ON sv2 USING cagra (embedding vector_l2_ops);
+
+SELECT evictions AS e0 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+SELECT pg_cuvs_inject_build_oom(2);   -- two OOMs → needs two evictions
+CREATE TABLE st (id int, embedding vector(8));
+INSERT INTO st SELECT g, format('[0,0,%s,0,0,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
+CREATE INDEX st_idx ON st USING cagra (embedding vector_l2_ops);   -- must SUCCEED
+SELECT pg_cuvs_inject_build_oom(0);
+
+SET cuvs.search_mode = 'brute_force';
+SELECT id AS single_proc_top1 FROM st
+  ORDER BY embedding <-> (SELECT embedding FROM st WHERE id = 7) LIMIT 1;
+RESET cuvs.search_mode;
+SELECT evictions >= :e0 + 2 AS single_proc_evicted_to_fit
+FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
+
+-- ============================================================ parallel-worker path
+-- handle_build_multi (parallel maintenance workers, ADR-058/059). Fresh victims.
+SET max_parallel_maintenance_workers = 2;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+CREATE TABLE pv1 (id int, embedding vector(8));
+INSERT INTO pv1 SELECT g, format('[0,0,0,%s,0,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
+CREATE INDEX pv1_idx ON pv1 USING cagra (embedding vector_l2_ops);
+CREATE TABLE pv2 (id int, embedding vector(8));
+INSERT INTO pv2 SELECT g, format('[0,0,0,0,%s,0,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
+CREATE INDEX pv2_idx ON pv2 USING cagra (embedding vector_l2_ops);
+
+SELECT evictions AS e1 FROM pg_stat_gpu_cache WHERE gpu_device_id = 0 \gset
+SELECT pg_cuvs_inject_build_oom(2);
+CREATE TABLE pt (id int, embedding vector(8));
+INSERT INTO pt SELECT g, format('[0,0,0,0,0,%s,0,0]', (g*0.1)::numeric(8,3))::vector FROM generate_series(1,1000) g;
+CREATE INDEX pt_idx ON pt USING cagra (embedding vector_l2_ops);   -- must SUCCEED
+SELECT pg_cuvs_inject_build_oom(0);
+
+SET cuvs.search_mode = 'brute_force';
+SELECT id AS parallel_top1 FROM pt
+  ORDER BY embedding <-> (SELECT embedding FROM pt WHERE id = 7) LIMIT 1;
+RESET cuvs.search_mode;
+SELECT evictions >= :e1 + 2 AS parallel_evicted_to_fit
+FROM pg_stat_gpu_cache WHERE gpu_device_id = 0;
+
+DROP TABLE sv1; DROP TABLE sv2; DROP TABLE st;
+DROP TABLE pv1; DROP TABLE pv2; DROP TABLE pt;
