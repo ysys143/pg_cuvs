@@ -140,6 +140,20 @@
 
 스펙: [design/PLAN.md — Phase 3C, 3D](design/PLAN.md) | ADR-013
 
+#### 클라우드 스토리지 전송 최적화 (트리거)
+
+> **상태(2026-06-15 감사)**: 3C/3D는 *기능 완성·인증*됐으나(위), 전송 경로는 `src/cuvs_objstore.c`에서 **파일당 `curl_easy_perform` 단발**이라 효율/견고성 최적화가 미착수다. 정확성·fail-closed에 투자가 집중됐고(ADR-066), 효율은 미제기 상태였음. 타깃이 1B+ 초대규모가 아니라(ADR-061) 스냅샷 빈도가 낮아 우선순위에서 밀렸다. 아래는 전부 **트리거 대기**(순차 경로 아님). 상위 노트의 S3 provider·emulator CI 회귀와 별개 항목.
+
+| 항목 | 근거 | 성격 | 트리거 |
+|------|------|------|--------|
+| **retry/backoff** | 업로드가 `curl_easy_perform` 단발 — transient 5xx/네트워크 끊김에 실패(detached라 빌드는 살지만 **스냅샷 누락** → replica가 REINDEX로 회귀). 멱등 PUT + 지수 백오프면 저비용 견고성. | 코드(objstore upload/download 루프) | 스냅샷 누락 실측 또는 운영 배포 시 (1순위) |
+| **아티팩트 압축 (zstd)** | `.cagra`/`.tids`/`.vectors`를 raw로 업로드 → 전송량·GCS 스토리지 비용 그대로. 매니페스트에 `compression`/원본 SHA 필드 추가, 다운로드 시 검증 후 해제. | 코드(objstore + manifest 계약 + load 게이트) | 스냅샷 스토리지/이그레스 비용 실측 시 (1순위) |
+| **병렬/멀티파트 업로드** | 파일 순차 whole-object PUT → 대형/sharded 인덱스 업로드 wall-clock 김. 샤드/파일 병렬 + GCS resumable composite. | 코드(objstore 전송 스케줄러) | 대형 인덱스 업로드 지연 실측 시 |
+| **증분/델타 업로드** | 매 스냅샷이 풀 재업로드. `base_generation`(=`.tids` CRC)이 *식별*에만 쓰이고 변경없는 샤드 skip엔 미사용 → sharded에서 1샤드 변경에도 전량 재전송. | 코드(manifest diff + 샤드 단위 skip) | 잦은 재스냅샷(streaming 빌드) 운영 패턴 시 |
+| **resumable upload** | 대형 단일 객체 업로드 중단 시 처음부터. GCS resumable session. | 코드(objstore upload) | 대형 객체 + 불안정 네트워크 환경 시 |
+
+스펙 근거: `src/cuvs_objstore.c` | ADR-013/ADR-066 | (신규 ADR은 착수 시 — 매니페스트 계약 변경 동반하므로 압축/증분은 ADR 선행 권장)
+
 ### 운영 하드닝 잔여 (트리거별)
 
 2026-06-05 스펙 무결성 감사(`docs/spec-audit-2026-06-05.md`) + AI council 논의에서 누적. **운영자 대면 절차의 단일 산출물은 `design/OPS_GPU_PLAYBOOK.md`**. release급 emit(TOAST NOTICE / index_dir WARNING / pgvector 가드)은 Release-hardening으로 **완료됨**(완료 표 참조). 아래는 트리거 대기분.
