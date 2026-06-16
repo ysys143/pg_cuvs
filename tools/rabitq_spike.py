@@ -144,11 +144,14 @@ def main():
                      - 2 * queries @ corpus.T
                      + (corpus * corpus).sum(1)[None, :]), axis=1)[:, :a.k]
 
-    # ── probe ALL lists to isolate the quantizer (not IVF miss) ──────────────
+    # ── recall: realistic IVF probing (top-n_probes lists) × rerank budget ──
+    # Probing a SUBSET of lists adds the real IVF-miss that "probe all" hides;
+    # small budgets (0.1/0.5%) find where reranking stops recovering recall.
     z = 2.576                                        # 99% normal two-sided
-    BUDGETS = (0.01, 0.02, 0.05, 0.10)
+    BUDGETS = (0.001, 0.005, 0.01, 0.02, 0.05)
+    NPROBES = sorted({n_lists} | {p for p in (64, 32, 16, 8) if p < n_lists}, reverse=True)
+    recall_grid = {(p, b): [] for p in NPROBES for b in BUDGETS}
     std_errs = []
-    recalls_by_budget = {b: [] for b in BUDGETS}     # RaBitQ recall@rerank-budget
     bias_acc = []
     cov_hits = cov_tot = 0
 
@@ -181,17 +184,21 @@ def main():
         cov_hits += int((np.abs(se) <= z).sum())
         cov_tot += int(good.sum())
 
-        # --- RaBitQ estimated distance for ranking + rerank ---
+        # --- RaBitQ estimated distance, then realistic IVF probing + rerank ---
         sres = q - centroids[assign]                 # (N,D) query residual per vec
         s_norm_all = np.linalg.norm(sres, axis=1)
         est_d2 = s_norm_all ** 2 + r_norm ** 2 - 2 * s_norm_all * r_norm * est_cos
-        order_rq = np.argsort(est_d2)
-        for budget in BUDGETS:                        # rerank top-(budget%) exactly
-            R = max(a.k, int(N * budget))
-            cand = order_rq[:R]
-            exact = ((queries[qi] - corpus[cand]) ** 2).sum(1)
-            top = cand[np.argsort(exact)[:a.k]]
-            recalls_by_budget[budget].append(len(set(top) & set(gt[qi])) / a.k)
+        order_rq = np.argsort(est_d2)                 # est-ranked, all N
+        cprobe = np.argsort(((centroids - q) ** 2).sum(1))   # nearest centroids first
+        for nprobe in NPROBES:
+            keep = np.isin(assign, cprobe[:nprobe])   # vectors in the probed lists
+            cand = order_rq[keep[order_rq]]           # est-ranked ∩ probed lists
+            for budget in BUDGETS:                    # rerank top-(budget% of retrieved)
+                R = max(a.k, int(len(cand) * budget))
+                rer = cand[:R]
+                exact = ((queries[qi] - corpus[rer]) ** 2).sum(1)
+                top = rer[np.argsort(exact)[:a.k]]
+                recall_grid[(nprobe, budget)].append(len(set(top) & set(gt[qi])) / a.k)
 
     se = np.concatenate(std_errs)
     bias = np.concatenate(bias_acc)
@@ -206,14 +213,21 @@ def main():
           f"{'PASS' if 0.85<=se.std()<=1.15 else 'FAIL'}")
     print(f"(b) bound coverage : P(|z|<=2.576) = {coverage:.4f}  "
           f"(>=0.99 ⇒ PASS)      -> {'PASS' if coverage>=0.99 else 'FAIL'}")
-    print(f"(c) recall@{a.k} vs rerank budget (probe=all lists):")
-    rec_pass = False
-    for b in sorted(BUDGETS):
-        r = float(np.mean(recalls_by_budget[b]))
-        hit = r >= 0.95
-        rec_pass = rec_pass or (hit and b <= 0.05)
-        print(f"      budget {b*100:4.0f}%  recall@{a.k} = {r:.4f}  {'>=0.95' if hit else ''}")
-    print(f"    -> {'PASS' if rec_pass else 'FAIL'} (>=0.95 at budget <=5%)")
+    print(f"(c) recall@{a.k} — rows = n_probes (of {n_lists} lists), "
+          f"cols = rerank budget (% of retrieved):")
+    print("      n_probes " + "".join(f"{b*100:7.2f}%" for b in BUDGETS))
+    for p in NPROBES:
+        row = "".join(f"{np.mean(recall_grid[(p, b)]):8.4f}" for b in BUDGETS)
+        label = f"{p} (all)" if p == n_lists else str(p)
+        print(f"      {label:>8} {row}")
+    # two distinct axes: probe-all isolates the QUANTIZER; n_probes is IVF tuning.
+    realistic = max((p for p in NPROBES if p != n_lists), default=n_lists)
+    pa = float(np.mean(recall_grid[(n_lists, 0.05)]))
+    rl = float(np.mean(recall_grid[(realistic, 0.05)]))
+    print(f"    quantizer (probe-all) recall@5% = {pa:.4f}  -> "
+          f"{'PASS >=0.95' if pa >= 0.95 else 'FAIL <0.95'}  (is RaBitQ ranking good?)")
+    print(f"    realistic n_probes={realistic} recall@5% = {rl:.4f}  "
+          f"(IVF miss, not a RaBitQ fault — raise n_probes; 136 B codes make probes cheap)")
     pq_bytes = D // 2 + 8                              # ivfpq pq_dim/2 codes + scalars
     print(f"(d) storage  : RaBitQ {bytes_per_vec:.0f} B/vec  vs  ivfpq(pq_dim/2) "
           f"~{pq_bytes} B  vs  raw f32 {D*4} B  -> {D*4/bytes_per_vec:.1f}x vs raw, "
