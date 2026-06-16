@@ -1,0 +1,4 @@
+N100k_d1024_k10_r0.95|forced-hnsw
+N100k_d1024_k10_r0.95|forced-cuvs
+N100k_d1024_k10_r0.95|forced-flat
+N100k_d1024_k10_r0.95|forced-ivfpq
