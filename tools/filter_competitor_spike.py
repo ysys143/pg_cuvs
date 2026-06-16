@@ -72,7 +72,7 @@ def main():
     print("# hnsw built")
 
     rng = np.random.default_rng(0)
-    SELS = (0.01, 0.05, 0.10, 0.50)
+    SELS = (0.01, 0.05, 0.10)          # the off-cliff/relaxed-tail show at low sel
     MODES = ("off", "strict_order", "relaxed_order")
 
     # does this pgvector support iterative_scan?
@@ -89,7 +89,7 @@ def main():
     for sel in SELS:
         nf = max(a.k, int(N * sel))
         fset = np.sort(rng.choice(N, nf, replace=False))          # tenant subset
-        fset_l = fset.tolist()
+        fset_l = fset.tolist()                                    # <=10k → cheap ANY()
         # exact-filtered GT per query (numpy over the filtered rows)
         sub = corpus[fset]
         gt = []
@@ -102,6 +102,8 @@ def main():
             lat, recs, short = [], [], 0
             for qi in range(nq):
                 t = time.perf_counter()
+                # WHERE id = ANY(filter): the predicate that triggers HNSW
+                # iterative_scan (filter applied during the index scan).
                 cur.execute(
                     "SELECT id FROM fbench WHERE id = ANY(%s) "
                     "ORDER BY embedding <-> %s LIMIT %s",
