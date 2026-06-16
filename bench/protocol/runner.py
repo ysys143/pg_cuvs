@@ -66,6 +66,36 @@ def parse_cell(cell_id):
                 recall_target=float(r))
 
 
+def ensure_synth_corpus(dim, n, cache_dir, seed=1234):
+    """For dim-sweep cells whose dim differs from the real (cohere-1024) corpus,
+    generate + cache a synthetic clustered corpus/queries at that dim. Recall
+    quality is irrelevant here — these cells test cost-model ROUTING (the
+    discriminating flip dim=8: N small→seqscan, N large→cagra), not recall.
+    Returns (corpus_path, queries_path)."""
+    import numpy as np
+    pool = max(n, 100000)                 # reusable across N cells at this dim
+    d = os.path.join(cache_dir, f"syn_d{dim}_n{pool}")
+    cpath = os.path.join(d, "corpus.fbin")
+    qpath = os.path.join(d, "queries.fbin")
+    if os.path.exists(cpath) and os.path.exists(qpath):
+        return cpath, qpath
+    os.makedirs(d, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    nclust = max(16, int(pool ** 0.5) // 4)
+    centers = rng.standard_normal((nclust, dim)).astype(np.float32)
+    corpus = (centers[rng.integers(0, nclust, pool)]
+              + 0.35 * rng.standard_normal((pool, dim)).astype(np.float32))
+    queries = (centers[rng.integers(0, nclust, 1000)]
+               + 0.35 * rng.standard_normal((1000, dim)).astype(np.float32))
+    for path, arr in ((cpath, corpus), (qpath, queries)):
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        with open(path, "wb") as f:
+            np.array(arr.shape, dtype=np.int32).tofile(f)
+            arr.tofile(f)
+    log(f"generated synthetic corpus dim={dim} n={pool} → {d}")
+    return cpath, qpath
+
+
 # ── table setup (per-engine table; idempotent reuse if N rows already loaded) ─
 
 def storage_of(conn, table):
@@ -338,12 +368,23 @@ def main():
     if table is None:
         raise NotImplementedError(f"config {a.config} not implemented")
 
+    # dim-sweep: if the cell dim differs from the real corpus, swap in a synthetic
+    # corpus at that dim (the discriminating-flip routing test). GT is keyed by
+    # dim too so synthetic and cohere GTs at the same N never collide.
+    import struct
+    with open(a.corpus, "rb") as _cf:
+        _cn, corpus_dim = struct.unpack("<ii", _cf.read(8))
+    gt_suffix = ""
+    if corpus_dim != dim:
+        a.corpus, a.queries = ensure_synth_corpus(dim, n, a.gt_dir)
+        gt_suffix = f"_d{dim}"
+
     # Build a RUNNER-OWNED GT keyed to (corpus, queries, N) rather than trusting the
     # pre-built gt_<N>.npy of uncertain provenance — those gave random recall (=k/N)
     # at N=100k because their neighbor ids did not match the first-N corpus id space
     # this runner loads (issue #56). build_gt.py is the same GPU brute force that
     # produced the proven §16 GT, so a runner-built GT is exact by construction.
-    gt_path = os.path.join(a.gt_dir, f"gt_runner_{n}.npy")
+    gt_path = os.path.join(a.gt_dir, f"gt_runner_{n}{gt_suffix}.npy")
     if not os.path.exists(gt_path):
         log(f"GT {gt_path} missing — building via build_gt.py (N={n}, k=100)")
         import subprocess
