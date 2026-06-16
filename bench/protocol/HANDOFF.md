@@ -21,7 +21,7 @@ Last updated: 2026-06-15 (after #68 v3 protocol/calibration + #69 harness merged
 | **Measured data** (`docs/data/`) | `stageA_exact_v3.csv` (exact-tier), `concurrency_consolidated.csv` (150 rows) |
 | **Stage A** (physics curves) | **partial** — exact-tier @10k/100k (TOAST, dim=1024) + concurrency @1k–1M done; full N×dim×storage sweep NOT done |
 | **Stage C** (freeze) | done (the calibration report is the freeze) |
-| **Stage D** (filter/incremental/Pareto/concurrency/storage) | **NOT started** — this is the next work |
+| **Stage D** (filter/incremental/Pareto/concurrency/storage) | **re-audited 2026-06-16** — most modules already exist or are small deltas; only D3 (incremental perf) is genuinely new. See §5. |
 
 **Engines implemented in main 0.5.0** (what the harness drives): `flat` AM (A1, resident exact GPU BF), `cagra` (GPU ANN), `ivfpq` (GPU PQ), transient-B (`cuvs.gpu_bruteforce=on`, indexless), pgvector HNSW, cpu-seqscan. Cost model = data-movement physics + `pg_cuvs_hw_profile()` probe (ADR-073/074/075).
 
@@ -89,38 +89,58 @@ stage=D module=concurrency ref=main build=false \
 
 ---
 
-## 5. Next work — Stage D suite (priority order)
+## 5. Next work — Stage D suite (RE-AUDITED 2026-06-16)
 
-> Per the protocol, Stage D runs on the **frozen** cost model (done). Each module
-> below lists what it measures + the **harness gap** to fill first.
+> **Re-audit correction.** The earlier "Stage D NOT started" framing was wrong. A
+> full sweep of existing assets (`tools/`, `infra/anbench/`, `docs/`, `test/`) shows
+> **most of Stage D already exists or is a small delta** — only **D3 (incremental
+> perf)** is a genuinely new harness. Two parallel harnesses exist and are **not
+> integrated**: **`bench/protocol/`** (this campaign — physics/concurrency/explain,
+> writes the `observe.py` CSV) and **`infra/anbench/`** (an older competitor suite —
+> `run_pg.py`/`run_cuvs.py`/`run_faiss.py`/`run_cagra_hnsw.py`, JSONL, `aggregate.py`
+> Pareto plots, `run_all.sh`). **Reuse `infra/anbench/` for Ring A/B instead of rebuilding.**
 
-### D-prep · harness gaps (do these first; mostly no GPU)
-- **`auto` engine in `runner.py`** — currently `NotImplementedError`. Wire planner-auto (no GUC forcing; assert the chosen plan matches the forced-best). Needed for the "auto-envelope" claim.
-- **`PGCUVS_STORAGE` as a `bench.yml` input** — to dispatch the TOAST/PLAIN contrast (D8). One-line workflow edit + env map.
-- **`dim` synthetic corpus** — `infra/anbench/fetch_dataset.py` / a small generator for dim ∈ {8, 384, 768} to run the **discriminating-flip** sweep (dim=8 N=10000 legacy→seqscan vs physics→cagra). Currently only the unit fence proves it.
-- **observe.py formal columns** — `storage`, `detoast_ms`, `build_kind`, `sla_bounded_qps`, hw_profile fields are in `params_json` now; promote to first-class columns if you want clean aggregation.
-- **time-bounded exact path** — to measure cpu-seq/transient-B at large N without the AdminShutdown flakiness (use the concurrency/pgbench `-T` path, or a hard wall-clock cap per cell).
+### Status legend (audit evidence)
 
-### D1 · Resource–performance Pareto + $ (P1 body)
-Reuse Stage A cells + **`baseline=iso-$`** (a CPU-only instance at the same $/hr). Output: `$/1M`, `$/QPS@p99` Pareto (same-box + iso-$), crossover coords. Needs `observe.py` energy/$, already present (`price_usd_hr`, `usd_per_1m_queries`).
+| Module | Status | Already exists (evidence) | Real remaining delta |
+|--------|--------|---------------------------|----------------------|
+| **D8 storage** | ✅ near-done | `docs/profiling-results.md §4`: TOAST vs PLAIN measured (PLAIN build +8%, search storage-independent); `runner.py setup_table` honors `PGCUVS_STORAGE=plain` | `bench.yml` `storage` input (~2 lines) + republish; *optional* one PLAIN run at dim≤768 |
+| **D4 concurrency** | 🟡 ~80% | `runner_concurrency.py` + `docs/data/concurrency_consolidated.csv` (150 rows: cagra/hnsw/bf/bf-batch/seqscan, N 1k–1M); `observe.sla_bounded_qps` column exists | add `forced-flat`/`forced-transient-bf` configs (~5 lines) + emit `sla_bounded_qps` as headline + rerun |
+| **D1 Pareto $** | 🟡 partial | cost/energy fields populated (`observe.price_usd_hr`, `usd_per_1m_queries`, `energy_j`); `aggregate.py` already plots Pareto; Stage A data | small aggregator over the protocol CSV (reuse `aggregate.py` logic) + **one** `baseline=iso-$` CPU dispatch |
+| **D2 filter** | 🟡 partial | `tools/bench_filter_sweep.py` + `docs/filter-threshold-experiment.md`: pg_cuvs D-wedge sel×corr measured → `auto_threshold=0.05` | add **pgvector `iterative_scan` competitor + explicit p99 tail**; the pg_cuvs side is done |
+| **Ring A competitors** | 🟡 partial | `infra/anbench/run_pg.py` (pgvector hnsw/ivfflat/exact) | add `run_pgvectorscale.py`/`run_vectorchord.py` on the `run_pg.py` skeleton; pgvector `iterative_scan` mode |
+| **Ring B anchors** | ✅ exists | `run_cuvs.py` (raw CAGRA), `run_faiss.py` (gpu/cpu), `run_cagra_hnsw.py`, `aggregate.py`, `run_all.sh` | none new — just run + consolidate into `docs/data/` |
+| **D3 incremental** | 🔴 missing (perf) | **correctness only** (`test/sql/cagra_streaming.sql`, `delta_recall.sql`, `auto_compact.sql`); ADR-074 1.77ms/row is a single non-repeatable point | **`runner_incremental.py` — the one genuinely new harness** |
+| **D6 ceiling/multi-GPU** | 🔴 out / escalate | terraform `gpu_count>1` path ready; 50M CAGRA OOM documented (ADR-025) | 10M = high $; **multi-GPU sharding is NOT implemented in the product** (no daemon shard routing) → engineering, not a benchmark; 50M = Ring-D record-as-N/A |
 
-### D2 · Filter (selectivity × correlation) — **differentiation core**
-`module=filter` (NOT yet implemented — write `runner_filter.py`). Axes: selectivity {0.1,1,5,10,50%} × correlation {random,mixed,spatial}, N=1M/100k. pgvector `hnsw.iterative_scan ∈ {off,strict,relaxed}`; pg_cuvs auto (D-wedge/3O/stream-bf) + flat-filtered + **transient-B filter-first**. Measure recall@k, QPS, p99 tail. The **B filtered crossover** (filter-first vs CPU exact-filtered) is the ADR-073 carry-forward and the live-`auto` prerequisite.
+> **Schema note**: `observe.PROTOCOL_FIELDS` already has first-class `selectivity`,
+> `correlation`, `filter_mode`, `stream_op`, `ops_done`, `delta_rows`,
+> `sla_bounded_qps`, `detoast_ms`, `build_kind` — it was designed for D2/D3/D4.
+> **No schema gap.** The old D-prep "promote columns to first-class" item is already done.
 
-### D3 · Incremental (insert/upsert/FIFO)
-`module=incremental` (write `runner_incremental.py`). Scenarios: append, FIFO window (head INSERT + tail DELETE), upsert mix. **ADR-074 reality**: flat write = 1.77ms/row (13× no-index) + HOT-disable + compaction-via-REINDEX (flat has no in-place compact). Frame: **write-heavy(W1) → pgvector no-index; read-heavy(W2) → flat**. Time-series: ingest throughput, recall drift (window GT recompute), concurrent-query QPS during ingest, VRAM growth.
+### Priority order (value / effort)
 
-### D4 · Concurrency · tail under load (partially done)
-`module=concurrency` works (`runner_concurrency.py`). Done at 1k–1M for cagra/hnsw/bf/bf-batch. **Remaining**: add `forced-flat`/`forced-transient-bf` to the concurrency configs; report SLA-bounded QPS as the headline (not peak). Single-daemon ceiling vs CPU-core scaling crossover.
+**Tier 0 — enablers & small deltas (cheap, mostly no GPU)**
+- **`PGCUVS_STORAGE` → `bench.yml` input** (~2 lines + env map). Unblocks D8 dispatch (§3.8).
+- **`auto` engine in `runner.py`** — still `NotImplementedError` (build_index/knob_sweep). Wire planner-auto (no GUC forcing; assert the chosen plan = forced-best). `runner_explain.py` already auto-routes — copy that path. Needed for the auto-envelope claim.
+- **D4 configs** — add `forced-flat`/`forced-transient-bf` to `runner_concurrency.py` (`CUVS_SEARCH`/`KNOB_GUC`); emit `sla_bounded_qps` as the headline; rerun the protocol cells and merge into `concurrency_consolidated.csv`.
+- **`dim` synthetic integration** — `bench/gen_dataset.py` already has a `--dim` knob; wire it into the cell parser for dim ∈ {8,384,768} (the discriminating-flip sweep: dim=8 N=10000 legacy→seqscan vs physics→cagra). `infra/anbench/fetch_dataset.py` is 1024-only.
+- **time-bounded exact path** — measure cpu-seq/transient-B at large N without the AdminShutdown flakiness (concurrency/pgbench `-T` path, or a hard per-cell wall-clock cap).
 
-### D8 · Storage layout (TOAST vs PLAIN)
-After the `PGCUVS_STORAGE` input lands: contrast at dim≤768. ADR-074: PLAIN removes the detoast wall (CPU kNN 539→147ms) but **GPU win stays resident-only**. Output: storage×dim×engine matrix.
+**Tier 1 — analysis / republish (reuse existing, no new measurement)**
+- **D8** — republish `docs/profiling-results.md §4` (TOAST vs PLAIN) into the benchmark doc as the storage result. Optionally one PLAIN run at dim≤768 to confirm the 8% holds where detoast is a bigger share.
+- **D1 Pareto** — write a small aggregator (reuse `aggregate.py` Pareto logic) over the protocol CSV's existing cost/energy fields; dispatch **one** `baseline=iso-$` CPU instance for the iso-$ arm; emit `$/1M` + `$/QPS@p99` curves + crossover coords.
 
-### D6 · Ceiling (Ring D) + multi-GPU
-50M×384(/1024): competitor ceiling + pg_cuvs N/A (VRAM ceiling) recorded as-is. multi-GPU sharding scale (`gpu_count>1` terraform path) moves the single-daemon ceiling. **High-cost — escalate before running.**
+**Tier 2 — differentiation deltas (small new code)**
+- **D2** — extend the filter measurement with the **pgvector `iterative_scan ∈ {off,strict,relaxed}` competitor** and explicit **p99 tail** (the pg_cuvs D-wedge side is already measured in `bench_filter_sweep.py`). Either extend that script or a thin `runner_filter.py`. The B filtered crossover (filter-first vs CPU exact-filtered) is the ADR-073 carry-forward and the live-`auto` prerequisite.
+- **Ring A competitors** — `run_pgvectorscale.py` / `run_vectorchord.py` on the `run_pg.py` skeleton (in-PG; identical load/build/query pattern).
 
-### Track 2 (competitor, separate)
-Ring A iso-recall (pgvector/pgvectorscale/vchord) + Ring B anchors (raw cuVS/faiss) + Ring C external DBs (separate doc). These are the "which to deploy" comparison, distinct from the planner study.
+**Tier 3 — genuinely new harness (the only big build)**
+- **D3** — `runner_incremental.py`: scenarios append / FIFO window (head INSERT + tail DELETE) / upsert mix. Metrics: ingest throughput (rows/s), p50/p95/p99 per-row, VRAM growth, concurrent-query QPS during ingest, recall drift (window GT recompute). Frame **W1→pgvector no-index vs W2→flat** (ADR-074: flat write 1.77ms/row, HOT-disabled, compaction-via-REINDEX). The correctness tests above are prerequisites, **not** reusable for perf.
+
+**Out of scope / escalate**
+- **D6** — 10M (high $), 50M (known OOM → Ring-D record-as-N/A, ADR-025), multi-GPU sharding (**product feature not implemented** — no shard routing in the daemon; this is engineering, not benchmarking). Escalate before spending.
+- **Ring C** (Milvus/Qdrant/LanceDB) — separate system-level doc, deprioritized.
 
 ---
 
