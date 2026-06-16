@@ -33,7 +33,7 @@ PROTOCOL_FIELDS = [
     "N", "dim", "k", "recall_target", "dataset", "query_set_id", "seed",
     "clients", "warm_state",
     "build_s", "qps", "p50_us", "p95_us", "p99_us", "p999_us",
-    "avg_latency_us", "recall_at_k",
+    "avg_latency_us", "sla_bounded_qps", "recall_at_k",
     "peak_vram_mb", "peak_rss_mb", "cpu_core_s", "gpu_s", "energy_j",
     "disk_bytes_written", "wal_bytes",
     "index_bytes_vram", "index_bytes_host", "index_bytes_disk",
