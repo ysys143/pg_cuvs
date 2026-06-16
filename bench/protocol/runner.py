@@ -13,7 +13,8 @@ latency. So forced-cuvs / auto BOTH `SET cuvs.index_dir` AND assert the query
 plan uses the cagra index before any latency row is trusted.
 
 Implemented configs: forced-hnsw, forced-cuvs, forced-flat (ADR-073 A1 resident
-exact GPU BF), forced-transient-bf (ADR-073 B indexless), forced-seqscan.
+exact GPU BF), forced-ivfpq (ADR-049 PQ-compressed resident GPU, VRAM-budget
+axis), forced-transient-bf (ADR-073 B indexless), forced-seqscan.
 (auto is a follow-up — it raises loudly rather than mis-measure.)
 """
 import argparse
@@ -37,11 +38,13 @@ MULT = {"": 1, "k": 1000, "m": 1_000_000, "g": 1_000_000_000}
 # iso-recall knob sweeps (ascending → pick the minimum value meeting target)
 HNSW_EF = [10, 20, 40, 80, 120, 200, 400]
 CUVS_K = [50, 100, 200, 400, 800]
+IVFPQ_NPROBES = [16, 32, 64, 128, 256, 512]   # ADR-049 cuvs.ivfpq_n_probes (recall knob)
 
 TABLES = {
     "forced-hnsw": "t_hnsw",
     "forced-cuvs": "t_cuvs",
     "forced-flat": "t_flat",            # ADR-073 A1: resident exact GPU BF (USING flat)
+    "forced-ivfpq": "t_ivfpq",          # ADR-049: PQ-compressed resident GPU (VRAM-budget axis)
     "forced-transient-bf": "t_tbf",     # ADR-073 B: indexless GPU exact BF (CustomScan)
     "forced-seqscan": "t_seq",
 }
@@ -140,6 +143,16 @@ def build_index(conn, config, table, n, index_dir):
             sql = (f"CREATE INDEX {name} ON {table} USING flat "
                    f"(embedding vector_l2_ops)")   # vectors-only build, no graph
             index_type = "flat"
+        elif config == "forced-ivfpq":
+            cur.execute(f"SET cuvs.index_dir = '{index_dir}'")  # CRITICAL
+            name = f"{table}_ivfpq"
+            # n_lists scaled to N so small cells don't get near-empty clusters
+            # (cuVS trains each list from the corpus); pq_bits/pq_dim keep the AM
+            # defaults (8 bits, dim/2 subspaces). n_probes is the query-time knob.
+            nlists = max(16, min(2048, int(n ** 0.5)))
+            sql = (f"CREATE INDEX {name} ON {table} USING ivfpq "
+                   f"(embedding vector_l2_ops) WITH (n_lists={nlists})")
+            index_type = "ivfpq"
         elif config == "forced-seqscan":
             return None, "none", 0.0, 0
         elif config == "forced-transient-bf":
@@ -230,6 +243,8 @@ def knob_sweep(config):
         return [(f"SET hnsw.ef_search={v}", v) for v in HNSW_EF]
     if config == "forced-cuvs":
         return [(f"SET cuvs.k={v}", v) for v in CUVS_K]
+    if config == "forced-ivfpq":
+        return [(f"SET cuvs.ivfpq_n_probes={v}", v) for v in IVFPQ_NPROBES]
     if config in ("forced-seqscan", "forced-flat", "forced-transient-bf"):
         return [(None, None)]  # exact, single point (recall=1.0, no recall knob)
     raise NotImplementedError(config)
@@ -306,7 +321,7 @@ def main():
 
     conn = psycopg.connect(dbname=a.dbname, autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    if a.config in ("forced-cuvs", "forced-flat", "forced-transient-bf"):
+    if a.config in ("forced-cuvs", "forced-flat", "forced-ivfpq", "forced-transient-bf"):
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
         # build=true reinstalls the .so/.sql but the DB keeps the old extension
         # version; UPDATE pulls in newer objects (flat AM = 0.4.0, hw cost = 0.5.0).
@@ -316,10 +331,10 @@ def main():
     # even where the planner would pick another at small N (e.g. at N=1k the cuvs
     # startup cost > a 1k-row seq scan, so without this the planner seq-scans and
     # the cuvs guard fails). Stage B measures the planner's actual choice separately.
-    if a.config in ("forced-hnsw", "forced-cuvs", "forced-flat"):
+    if a.config in ("forced-hnsw", "forced-cuvs", "forced-flat", "forced-ivfpq"):
         conn.execute("SET enable_seqscan = off")
         conn.execute("SET enable_bitmapscan = off")
-    if a.config in ("forced-cuvs", "forced-flat"):
+    if a.config in ("forced-cuvs", "forced-flat", "forced-ivfpq"):
         conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
     if a.config == "forced-transient-bf":
         # ADR-073 B: no index — cuvs.gpu_bruteforce=on routes ORDER BY to the
@@ -368,6 +383,8 @@ def main():
                                                         ("none", "transient_bf")
                                                         else "graph" if index_type
                                                         in ("hnsw", "cagra")
+                                                        else "pq" if index_type
+                                                        == "ivfpq"
                                                         else "vectors_only")},
                             **sizes, **s.as_dict()))
 
@@ -375,7 +392,7 @@ def main():
     # forced-cuvs→cagra Index Scan, forced-flat→flat Index Scan,
     # forced-transient-bf→CuvsTransientBF CustomScan (ADR-073).
     GUARD = {"forced-cuvs": "cagra", "forced-flat": "flat",
-             "forced-transient-bf": "CuvsTransientBF"}
+             "forced-ivfpq": "ivfpq", "forced-transient-bf": "CuvsTransientBF"}
     if a.config in GUARD:
         substr = GUARD[a.config]
         ok, plan = explain_uses_index(conn, table, queries[0], substr)
@@ -436,6 +453,8 @@ def _selfcheck():
         N=1000, dim=1024, k=10, recall_target=0.95)
     assert parse_cell("N1m_d1024_k100_r0.99")["N"] == 1_000_000
     assert [kn for _, kn in knob_sweep("forced-hnsw")] == HNSW_EF
+    assert [kn for _, kn in knob_sweep("forced-ivfpq")] == IVFPQ_NPROBES
+    assert knob_sweep("forced-ivfpq")[0][0] == "SET cuvs.ivfpq_n_probes=16"
     assert knob_sweep("forced-seqscan") == [(None, None)]
     print("SELFCHECK OK")
 

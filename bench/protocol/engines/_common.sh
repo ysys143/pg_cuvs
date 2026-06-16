@@ -19,7 +19,7 @@ run_engine(){
   # daemon pid so ResourceSampler folds pg-cuvs-server host RSS in (CONTRACT §4)
   local dpid=""
   case "$config" in
-    forced-cuvs*|forced-flat|forced-transient-bf|auto)   # all GPU/daemon paths
+    forced-cuvs*|forced-flat|forced-ivfpq|forced-transient-bf|auto)   # all GPU/daemon paths
       dpid="$(systemctl show -p MainPID --value pg-cuvs-server 2>/dev/null || true)"
       [ "$dpid" = "0" ] && dpid="" ;;
   esac
