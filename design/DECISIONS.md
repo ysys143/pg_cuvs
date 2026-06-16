@@ -3035,3 +3035,45 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 - **레거시 복귀(안전 증명, 3경로 동일)**: `cuvs.enable_phys_cost=off` / 사이드카 부재 / Tier-1(GPU 비트 미충족) → 모두 레거시 = N=10000에서 seqscan으로 복귀. installcheck 35/35 + isolation 6/6 GREEN, un-probed 바이트 동일.
 
 **남은 것**: transient B 물리 공식 활성화 + `auto`(Phase 3, GH200/MI300A급 통합메모리 필요); cpu_dist 클램프 밴드 재조정; bf_tput probe가 end-to-end(업로드 포함)라 transient용으론 후속 정밀화 필요.
+
+---
+
+## ADR-076 — Native RaBitQ 양자화기(`rabitq` AM): 저VRAM + 고recall 동시 달성
+
+**날짜**: 2026-06-16
+**상태**: PROPOSED — numpy 스파이크 GREEN(cohere 실측). **CUDA 구현은 별도 go 필요**(수 주 규모, 첫 자작 ANN 수치).
+
+**문제/배경**:
+- ivfpq(ADR-049)는 압축으로 VRAM을 줄이지만 **recall이 PQ 양자화 오차에 천장**이 있다. cohere-1024 100k 실측(벤치 run #30/#31): 기본 pq_dim=dim/2는 recall@10=0.937(<0.95), iso-recall 0.95에 도달하려면 **pq_dim=1024(=1024 B/vec)까지 재빌드**해야 했다. 즉 "압축으로 VRAM 절감"이라는 본래 이점을 recall을 위해 상당 부분 반납한다.
+- vchordrq는 50M×384에서 recall **0.9991**(ADR-025)을 낸다. 그 핵심은 **RaBitQ**(Gao & Long, SIGMOD'24): 1비트 압축 + **무편향 추정 + 이론적 오차 상한**으로, 압축 표현만으로 "버려도 되는 후보"를 판별하고 소수만 정밀 보정(rerank)한다 → 원본 f32 상주 없이 저VRAM·고recall 동시 달성.
+- pg_cuvs 포지셔닝(GPU hot tier, **VRAM working-set 천장 밀기** — ADR-049/3P)에 정확히 부합. cuVS는 RaBitQ를 제공하지 않는다(26.04 기준).
+
+**결정**: RaBitQ 양자화기를 **자작**해 새 PG access method `rabitq`로 등록한다(`CREATE INDEX USING rabitq`). IVF coarse(ivfpq에서 재사용) + RaBitQ 코드 + 쿼리타임 rerank. cagra/ivfpq와 독립 경로, 동일 UDS+shm IPC·index_dir 영속화·사이드카 직렬화 인프라 재사용.
+
+**증거(numpy 스파이크 `tools/rabitq_spike.py`, 합성 + cohere VM 실측 run #32→#33)**:
+- **수학 정확**(데이터 무관): 추정 무편향(표준화 std=**1.000** — 이론 분산식이 경험분포와 일치), 오차 상한 coverage **0.9901**.
+- **양자화기 품질**(probe-all, cohere): recall@10 = **0.9995 @ 0.1% rerank** → 랭킹이 거의 완벽.
+- **현실 IVF 설정**: n_probes=64(316 lists의 20%)에서 recall@10 = **0.9675 ≥ 0.95**, 그것도 0.5% rerank에서 천장 도달. 각 n_probes의 천장은 IVF miss(양자화기 무관)이며 n_probes를 키우면 상승 — 136 B 코드라 probe 증설이 싸다.
+- **저장**: **136 B/vec**(D비트 코드 + 스칼라 2개) = raw f32의 **30×**, **같은 recall에 ivfpq가 필요로 한 1024 B의 ~7.5× 작다**.
+
+**구현 방향**:
+- 인코더(GPU): IVF centroid residual → 랜덤 직교 회전(고차원은 Hadamard/FJLT로 O(D²) 회피) → 1비트 부호 코드 + 스칼라(`‖r‖`, `dot_xo=⟨x̄,ō⟩`) 저장.
+- 추정기/bound 커널(GPU): bit dot-product(popcount) 기반 무편향 `⟨q̄,ō⟩` 추정 + 분산식 기반 오차 상한 → 거리 하한으로 rerank 후보 가지치기.
+- rerank: 후보를 원본/고비트 residual로 정밀 거리 재계산 후 top-k. GUC `cuvs.rabitq_n_probes`, `cuvs.rabitq_rerank`(budget).
+- AM: `pg_cuvs_rabitq_handler`, `CUVS_OP_BUILD_RABITQ`/`CUVS_OP_SEARCH_RABITQ`. reloption(`n_lists`, 회전 seed 등).
+- 검증 하네스(비협상): 무편향·bound coverage·recall@(n_probes×budget) 그리드를 GT 대조로 게이트(스파이크 기준 재사용).
+
+**대안 기각**:
+- **(B) cuVS `refine()`로 ivfpq에 rerank 부착** — recall은 복구하나 refine이 원본 f32를 요구 → VRAM 상주(압축 이점 상쇄) 또는 host→device per-query 전송(detoast/PCIe 지연, ADR-074의 535ms 벽 재등장). RaBitQ가 푸는 트레이드오프를 그대로 떠안음. **보류**(경로는 기록: `refine_ratio`를 `ivfpq_n_probes`와 같은 GUC→IPC→wrapper 체인에 추가).
+- **ivfpq pq_dim 상향만** — run #31처럼 0.95 도달하나 1024 B/vec(7.5× 더 큼) + 재빌드 비용. 압축 축에서 RaBitQ에 열위.
+- **cuVS 업스트림 대기** — bit/scalar quantization이 로드맵에 있으나 시점·형태 불확실. DiskANN(ADR-026/072)과 달리 본 건의 블로커는 **우리가 통제하는 유한한 수치 작업**이지 불안정한 외부 API가 아니라, 자작이 tractable(아래 리스크 참조).
+
+**트레이드오프/리스크**:
+- **첫 자작 ANN 수치**: 지금까지는 cuVS 프리미티브 래핑 + PG 배관이었고, 본 건은 처음으로 알고리즘을 직접 저술. 무편향·bound 상수가 틀리면 **recall이 조용히 손상**(issue #56류 최악 모드) → 검증 하네스가 게이트.
+- **업스트림 중복 가능성**: cuVS가 RaBitQ류를 추가하면 자작이 tech debt. → AM 경계를 깨끗이 두어 추후 교체 가능하게.
+- **고차원 회전 비용**: dim=1024 회전을 hot path에서 빠른 변환으로 처리해야(FJLT/Hadamard) — 구현 까다로움.
+- **효용 근거**: 시스템 통합은 ~40% 기성(IVF·AM·데몬·직렬화 재사용), 위험은 60%(GPU 수치+검증)에 집중. numpy 스파이크로 그 60%의 핵심(수치)을 선소각 완료.
+
+**구현 비용(스파이크 할인 반영)**: numpy 스파이크 S(완료) → CUDA 인코더/추정기/bound M–L → `rabitq` AM 통합 M(flat/ivfpq 템플릿) → 검증 하네스 M.
+
+**관련**: ADR-049(ivfpq·VRAM 절감, 본 건의 recall-천장 동기), ADR-025(50M·vchordrq 0.9991), ADR-026/072(DiskANN no-go — 대조: 블로커가 외부 API였음), ADR-073(AM-per-algo 하우스 스타일), ADR-010(VRAM OOM 정책). 스파이크: `tools/rabitq_spike.py`, 벤치 핸드오프 `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`(run #30–#33).
