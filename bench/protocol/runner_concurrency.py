@@ -220,9 +220,15 @@ def main():
     # BF/flat/transient-B are exact (recall≈1.0); the knob sweep just picks the
     # cuvs.k count for cuvs/hnsw. The search_mode GUC set above makes
     # choose_iso_recall measure the BF path. Exact paths → single point (knob=None).
+    # CAP the sweep for SLOW heap-detoast paths: transient-B/seqscan are ~0.5s/query
+    # at 100k TOAST (ADR-074 detoast wall), so 2000 queries would hang ~16min. 100
+    # is plenty to confirm recall (exact ⇒ 1.0); resident paths keep the full set.
+    SLOW = ("forced-seqscan", "forced-transient-bf")
+    qcap_sweep = min(100 if a.config in SLOW else 2000, len(queries))
     sweep_cfg = "forced-cuvs" if is_cuvs else a.config
     set_sql, knob, _, met = runner.choose_iso_recall(
-        conn, table, queries[:2000], gt[:2000], k, target, sweep_cfg, a.index_dir)
+        conn, table, queries[:qcap_sweep], gt[:qcap_sweep], k, target,
+        sweep_cfg, a.index_dir)
     load_query_table(conn, queries, dim)
     conn.close()
 
