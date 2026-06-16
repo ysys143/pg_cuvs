@@ -111,7 +111,7 @@ stage=D module=concurrency ref=main build=false \
 | **Ring A competitors** | 🟡 partial | `infra/anbench/run_pg.py` (pgvector hnsw/ivfflat/exact) | add `run_pgvectorscale.py`/`run_vectorchord.py` on the `run_pg.py` skeleton; pgvector `iterative_scan` mode |
 | **Ring B anchors** | ✅ exists | `run_cuvs.py` (raw CAGRA), `run_faiss.py` (gpu/cpu), `run_cagra_hnsw.py`, `aggregate.py`, `run_all.sh` | none new — just run + consolidate into `docs/data/` |
 | **D3 incremental** | 🔴 missing (perf) | **correctness only** (`test/sql/cagra_streaming.sql`, `delta_recall.sql`, `auto_compact.sql`); ADR-074 1.77ms/row is a single non-repeatable point | **`runner_incremental.py` — the one genuinely new harness** |
-| **D6 ceiling/multi-GPU** | 🔴 out / escalate | terraform `gpu_count>1` path ready; 50M CAGRA OOM documented (ADR-025) | 10M = high $; **multi-GPU sharding is NOT implemented in the product** (no daemon shard routing) → engineering, not a benchmark; 50M = Ring-D record-as-N/A |
+| **D6 ceiling/multi-GPU** | 🔴 out / escalate | terraform `gpu_count>1` path ready; **50M×384 already measured (ADR-025): CAGRA shard=2 & shard=4 both OOM on A100-40GB×2** (73.24 GiB raw > 80 GB VRAM); competitor numbers (HNSW/vchordrq) recorded there too | 10M = high $; **multi-GPU sharding is NOT implemented in the product** (no daemon shard routing) → engineering, not a benchmark; **50M = cite ADR-025, do NOT re-run** (same OOM, A100-80GB×2 needed) |
 
 > **Schema note**: `observe.PROTOCOL_FIELDS` already has first-class `selectivity`,
 > `correlation`, `filter_mode`, `stream_op`, `ops_done`, `delta_rows`,
@@ -139,7 +139,7 @@ stage=D module=concurrency ref=main build=false \
 - **D3** — `runner_incremental.py`: scenarios append / FIFO window (head INSERT + tail DELETE) / upsert mix. Metrics: ingest throughput (rows/s), p50/p95/p99 per-row, VRAM growth, concurrent-query QPS during ingest, recall drift (window GT recompute). Frame **W1→pgvector no-index vs W2→flat** (ADR-074: flat write 1.77ms/row, HOT-disabled, compaction-via-REINDEX). The correctness tests above are prerequisites, **not** reusable for perf.
 
 **Out of scope / escalate**
-- **D6** — 10M (high $), 50M (known OOM → Ring-D record-as-N/A, ADR-025), multi-GPU sharding (**product feature not implemented** — no shard routing in the daemon; this is engineering, not benchmarking). Escalate before spending.
+- **D6** — 10M (high $); **50M = already measured in ADR-025 (CAGRA OOM on A100-40GB×2). Do NOT re-run — cite the table and record the pg_cuvs cell as "N/A — VRAM ceiling, A100-80GB×2 needed". Re-running only burns GPU time for the same OOM.** Multi-GPU sharding (**product feature not implemented** — no shard routing in the daemon; this is engineering, not benchmarking). Escalate before spending.
 - **Ring C** (Milvus/Qdrant/LanceDB) — separate system-level doc, deprioritized.
 
 ---
