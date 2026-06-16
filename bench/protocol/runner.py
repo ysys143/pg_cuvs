@@ -14,8 +14,10 @@ plan uses the cagra index before any latency row is trusted.
 
 Implemented configs: forced-hnsw, forced-cuvs, forced-flat (ADR-073 A1 resident
 exact GPU BF), forced-ivfpq (ADR-049 PQ-compressed resident GPU, VRAM-budget
-axis), forced-transient-bf (ADR-073 B indexless), forced-seqscan.
-(auto is a follow-up — it raises loudly rather than mis-measure.)
+axis), forced-transient-bf (ADR-073 B indexless), forced-seqscan, and `auto`
+(builds the cagra index but does NOT force the plan — the ADR-075 physical cost
+model routes seqscan↔cagra per query; the chosen path is recorded in params_json
+`chosen_plan`, not asserted). This is the auto-envelope = what users actually get.
 """
 import argparse
 import json
@@ -47,6 +49,7 @@ TABLES = {
     "forced-ivfpq": "t_ivfpq",          # ADR-049: PQ-compressed resident GPU (VRAM-budget axis)
     "forced-transient-bf": "t_tbf",     # ADR-073 B: indexless GPU exact BF (CustomScan)
     "forced-seqscan": "t_seq",
+    "auto": "t_auto",                   # planner decides seqscan↔cagra via the ADR-075 cost model
 }
 
 
@@ -157,6 +160,15 @@ def build_index(conn, config, table, n, index_dir, build_params=None):
             sql = (f"CREATE INDEX {name} ON {table} USING ivfpq "
                    f"(embedding vector_l2_ops) WITH ({', '.join(opts)})")
             index_type = "ivfpq"
+        elif config == "auto":
+            # Build the deployment's GPU index (cagra); the planner then routes
+            # seqscan↔cagra per-query via the ADR-075 physical cost model (no
+            # plan forcing). This measures the auto-envelope (= what users get).
+            cur.execute(f"SET cuvs.index_dir = '{index_dir}'")  # CRITICAL
+            name = f"{table}_cagra"
+            sql = (f"CREATE INDEX {name} ON {table} USING cagra "
+                   f"(embedding vector_l2_ops)")
+            index_type = "cagra"
         elif config == "forced-seqscan":
             return None, "none", 0.0, 0
         elif config == "forced-transient-bf":
@@ -249,6 +261,10 @@ def knob_sweep(config):
         return [(f"SET cuvs.k={v}", v) for v in CUVS_K]
     if config == "forced-ivfpq":
         return [(f"SET cuvs.ivfpq_n_probes={v}", v) for v in IVFPQ_NPROBES]
+    if config == "auto":
+        # If the planner routes to cagra, cuvs.k is the recall knob; if it routes
+        # to seqscan, the GUC is inert and recall=1.0 at any value (sweep picks min).
+        return [(f"SET cuvs.k={v}", v) for v in CUVS_K]
     if config in ("forced-seqscan", "forced-flat", "forced-transient-bf"):
         return [(None, None)]  # exact, single point (recall=1.0, no recall knob)
     raise NotImplementedError(config)
@@ -344,7 +360,8 @@ def main():
 
     conn = psycopg.connect(dbname=a.dbname, autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    if a.config in ("forced-cuvs", "forced-flat", "forced-ivfpq", "forced-transient-bf"):
+    if a.config in ("forced-cuvs", "forced-flat", "forced-ivfpq",
+                    "forced-transient-bf", "auto"):
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
         # build=true reinstalls the .so/.sql but the DB keeps the old extension
         # version; UPDATE pulls in newer objects (flat AM = 0.4.0, hw cost = 0.5.0).
@@ -357,7 +374,8 @@ def main():
     if a.config in ("forced-hnsw", "forced-cuvs", "forced-flat", "forced-ivfpq"):
         conn.execute("SET enable_seqscan = off")
         conn.execute("SET enable_bitmapscan = off")
-    if a.config in ("forced-cuvs", "forced-flat", "forced-ivfpq"):
+    # 'auto' deliberately does NOT force the plan — the ADR-075 cost model routes.
+    if a.config in ("forced-cuvs", "forced-flat", "forced-ivfpq", "auto"):
         conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
     if a.config == "forced-transient-bf":
         # ADR-073 B: no index — cuvs.gpu_bruteforce=on routes ORDER BY to the
@@ -403,6 +421,7 @@ def main():
     ladder = build_knob_sweep(a.config, dim)
     nlists = max(16, min(2048, int(n ** 0.5)))
     chosen = None
+    auto_plan = None
     for bi, bp in enumerate(ladder):
         before_lsn = observe.wal_lsn(conn)
         with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=dpid) as s:
@@ -418,6 +437,12 @@ def main():
                          f"{GUARD[a.config]} (fallback — check cuvs.index_dir / "
                          f"daemon / gpu_bruteforce). plan:\n{plan}")
             log(f"plan guard OK — {GUARD[a.config]} in use")
+        if a.config == "auto":
+            # No forcing: record which path the cost model actually chose.
+            _ok, plan = explain_uses_index(conn, table, queries[0], "cagra")
+            auto_plan = ("cagra" if ("cagra" in plan and "Seq Scan" not in plan)
+                         else "seqscan" if "Seq Scan" in plan else "other")
+            log(f"auto: planner chose {auto_plan} (ADR-075 cost routing)")
         set_sql, knob, rec_sweep, met = choose_iso_recall(
             conn, table, queries[:qcap_sweep], gt[:qcap_sweep], k, target,
             a.config, a.index_dir)
@@ -440,6 +465,8 @@ def main():
     if bp:
         build_pj.update(pq_dim=bp["pq_dim"], pq_bits=bp["pq_bits"], n_lists=nlists,
                         builds_tried=ladder.index(bp) + 1)
+    if auto_plan:
+        build_pj["chosen_plan"] = auto_plan
     observe.write_protocol_row(
         a.csv, **common_row(phase="build", index_type=index_type,
                             build_s=round(bt, 3), wal_bytes=wal_b,
@@ -474,8 +501,10 @@ def main():
             p99_us=round(p99, 1), p999_us=round(p999, 1),
             recall_at_k=round(rec, 4), dispersion=disp,
             params_json={"knob": knob, "iso_recall_met": met, "n_queries": qcap,
-                          "storage": tbl_storage},
-            notes="" if met else "recall target NOT met at sweep ceiling",
+                          "storage": tbl_storage,
+                          **({"chosen_plan": auto_plan} if auto_plan else {})},
+            notes=(f"auto→{auto_plan}" if auto_plan else
+                   "" if met else "recall target NOT met at sweep ceiling"),
             **s.as_dict()))
     conn.close()
     log(f"done {a.cell} {a.config}: recall={rec:.4f} qps={qps:.0f} "
@@ -489,6 +518,8 @@ def _selfcheck():
     assert [kn for _, kn in knob_sweep("forced-hnsw")] == HNSW_EF
     assert [kn for _, kn in knob_sweep("forced-ivfpq")] == IVFPQ_NPROBES
     assert knob_sweep("forced-ivfpq")[0][0] == "SET cuvs.ivfpq_n_probes=16"
+    assert [kn for _, kn in knob_sweep("auto")] == CUVS_K
+    assert build_knob_sweep("auto", 1024) == [None]   # auto builds once (cagra)
     assert knob_sweep("forced-seqscan") == [(None, None)]
     assert build_knob_sweep("forced-hnsw", 1024) == [None]
     assert build_knob_sweep("forced-cuvs", 1024) == [None]
