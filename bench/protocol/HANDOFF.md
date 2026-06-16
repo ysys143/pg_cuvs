@@ -168,7 +168,17 @@ stage=D module=concurrency ref=main build=false \
 > the *full* RaBitQ win needs the quantizer itself.
 
 - **numpy feasibility spike — ✅ GREEN** (`tools/rabitq_spike.py`, `268b05b`). On synthetic clustered dim=1024 (N=20k/50k, 2 seeds): unbiased (standardized std=**1.001** — theoretical variance form matches), error-bound coverage **0.9901**, recall@10 **0.966 @ 5% rerank** / 0.994 @ 10%, storage **136 B/vec = 30× vs raw, 3.8× smaller than ivfpq**. The math checks (unbiased + bound) are data-agnostic → estimator is correct.
-- **cohere VM validation — ✅ GREEN** (run #32, `engines/spike-rabitq.sh`, real `corpus.fbin` 100k×1024): math identical to synthetic (unbiased std=**1.000**, coverage **0.9901**) — the data-agnostic checks hold on cohere. recall@10 = **1.0000 at every budget (1/2/5/10%)** → gate (≥0.95 @ ≤5%) passed decisively. **Caveat**: this is the *probe-all-lists* upper bound (no IVF miss) and the perfect 1.0 is suspiciously clean — a cheap follow-up should push rerank budget down to 0.1–0.5% to find the recall knee and use realistic `n_probes` for a production number. But feasibility is confirmed.
+- **cohere VM validation — ✅ GREEN, knee characterized** (runs #32→#33, `engines/spike-rabitq.sh`, real `corpus.fbin` 100k×1024). Math identical to synthetic (unbiased std=**1.000**, coverage **0.9901**). Recall grid (rows=n_probes of 316 lists, cols=rerank budget):
+
+  | n_probes | 0.1% | 0.5% | 1% | 2% | 5% |
+  |---|---|---|---|---|---|
+  | 316 (all) | 0.9995 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+  | 64 | 0.8875 | **0.9675** | 0.9675 | 0.9675 | 0.9675 |
+  | 32 | 0.6980 | 0.9165 | 0.9185 | 0.9185 | 0.9185 |
+  | 16 | 0.6540 | 0.8310 | 0.8510 | 0.8510 | 0.8510 |
+  | 8 | 0.6140 | 0.6770 | 0.7660 | 0.7660 | 0.7660 |
+
+  Resolves the run #32 "suspicious 1.0": the **quantizer is genuinely excellent** (probe-all = 0.9995 at just 0.1% rerank → RaBitQ ranks cohere near-perfectly, not a bug). The per-row ceiling is **IVF miss** (fraction of true-NN clusters probed), not a RaBitQ fault — and a tiny 0.5% rerank already reaches it. Gate met at a realistic **n_probes=64 → 0.9675 ≥ 0.95**; raise n_probes to lift the ceiling (cheap — 136 B codes). Storage **136 B/vec = 30× vs raw, 3.8× < ivfpq's 1024 B needed for the same recall**.
 - **If cohere holds** → write an ADR (like ADR-049 for ivfpq) + port to a CUDA kernel + `rabitq` AM. Effort: spike S (done) → CUDA encoder/estimator/bound M–L (first self-authored ANN numerics, correctness-sensitive) → AM integration M (flat/ivfpq template) → validation harness M (non-negotiable). Tractable *because the blocker is our own bounded numerics, not an unstable upstream API* (unlike DiskANN, ADR-026) — and it extends the hot-tier value prop (more vectors/GPU at high recall), which is in-segment.
 - **Deferred**: option B (real cuVS `refine()` for ivfpq) — plumbing path known (`refine_ratio` via the `ivfpq_n_probes` GUC→IPC→wrapper chain), revisit after the RaBitQ gate.
 
