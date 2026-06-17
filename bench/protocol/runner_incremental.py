@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """runner_incremental.py — D3 incremental ingest (PGCUVS_MODULE=incremental).
 
-Scope v1: the headline ADR-074 write claim, measured — append ingest throughput
-+ per-row INSERT latency for the two write regimes:
-  - forced-flat     (W2, read-heavy): each INSERT triggers the GPU index path
-                    (cuvsCagraExtend), ADR-074 ~1.77ms/row, HOT-disabled.
-  - forced-noindex  (W1, write-heavy = pgvector no-index): plain heap insert.
-Frame: write-heavy → no-index, read-heavy → flat. The crossover is the result.
-
-Emits one `phase=maint` row per config: qps = rows/s, p50/p95/p99 = per-row
-INSERT latency (µs), dispersion = per-rep spread, params_json.ops_done = rows
-appended. VRAM growth from the ResourceSampler. FIFO/upsert/recall-drift/
-concurrent-query-during-ingest are follow-ups (noted in HANDOFF).
+Engines (PGCUVS_INC_SCENARIO ∈ append/fifo/upsert/concurrent):
+  - forced-noindex (W1 write-heavy = pgvector no vector index): plain heap insert.
+  - forced-flat    (W2 read-heavy): flat has NO GPU streaming write — its INSERTs
+                   are rejected by the daemon's CAGRA-only EXTEND and fall to the
+                   CPU `.delta` cache (ADR-074); concurrent insert+search degrades
+                   it to delta/stale/CPU.
+  - forced-cuvs    (cagra): the streaming GPU engine — INSERT → cuvsCagraExtend
+                   (real in-VRAM extend), the engine for the concurrent-ingest test.
+Per-op scenarios emit a `phase=maint` row (qps=ops/s, p50/95/99=per-op µs);
+append/fifo also emit a recall-drift `phase=query` row; concurrent emits a
+query-QPS-under-ingest row (a single g_index_mutex serialises extend vs search).
 """
 import argparse
 import os
@@ -24,7 +24,8 @@ sys.path.insert(0, ANBENCH)
 import observe  # noqa: E402
 import runner   # noqa: E402
 
-TABLES = {"forced-flat": "t_inc_flat", "forced-noindex": "t_inc_noidx"}
+TABLES = {"forced-flat": "t_inc_flat", "forced-noindex": "t_inc_noidx",
+          "forced-cuvs": "t_inc_cuvs"}
 
 
 def main():
@@ -58,6 +59,9 @@ def main():
     if table is None:
         raise NotImplementedError(f"incremental config {a.config} not supported")
     is_flat = a.config == "forced-flat"
+    is_cuvs = a.config == "forced-cuvs"        # cagra — supports GPU extend (cuvsCagraExtend)
+    is_gpu = is_flat or is_cuvs
+    itype = "flat" if is_flat else "cagra" if is_cuvs else "none"
 
     # base = first n_base rows; append the next n_app rows one at a time.
     n_app = min(int(os.environ.get("PGCUVS_INC_APPEND", "2000")), n // 2)
@@ -71,7 +75,7 @@ def main():
     conn = psycopg.connect(dbname=a.dbname, autocommit=True)
     conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     register_vector(conn)
-    if is_flat:
+    if is_gpu:
         conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
         conn.execute("ALTER EXTENSION pg_cuvs UPDATE")
         conn.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
@@ -88,12 +92,13 @@ def main():
         cp.set_types(["int8", "vector"])
         for i in range(n_base):
             cp.write_row((i, Vector(corpus[i])))
-    if is_flat:                                   # W2: resident exact GPU index
-        cur.execute(f"CREATE INDEX {table}_flat ON {table} USING flat "
+    if is_gpu:                                    # resident GPU index
+        am, sub = ("flat", "flat") if is_flat else ("cagra", "cagra")
+        cur.execute(f"CREATE INDEX {table}_{am} ON {table} USING {am} "
                     f"(embedding vector_l2_ops)")
-        ok, plan = runner.explain_uses_index(conn, table, corpus[0], "flat")
+        ok, plan = runner.explain_uses_index(conn, table, corpus[0], sub)
         if not ok:
-            sys.exit(f"[incremental] FAIL: flat not used. plan:\n{plan}")
+            sys.exit(f"[incremental] FAIL: {am} not used. plan:\n{plan}")
     scenario = os.environ.get("PGCUVS_INC_SCENARIO", "append")
     runner.log(f"base {n_base} rows loaded ({a.config}); scenario={scenario} ops={n_app}")
 
@@ -117,7 +122,7 @@ def main():
                 ic = psycopg.connect(dbname=a.dbname, autocommit=True)
                 from pgvector.psycopg import register_vector as _rv
                 _rv(ic)
-                if is_flat:
+                if is_gpu:
                     ic.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
                     ic.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
                 icur = ic.cursor(); jj = 0
@@ -145,7 +150,7 @@ def main():
             observe.write_protocol_row(
                 a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"),
                 stage=a.stage, phase="query", cell_id=a.cell, config=a.config,
-                system=a.config, index_type=("flat" if is_flat else "none"),
+                system=a.config, index_type=itype,
                 N=n, dim=dim, k=k, recall_target=target, dataset=a.dataset,
                 query_set_id=os.path.basename(a.queries), clients=1,
                 warm_state="warm", qps=round(conc_qps, 1), reps=1,
@@ -161,6 +166,22 @@ def main():
                       f"({degr:.0f}% degradation)", **s.as_dict())
         except Exception as e:
             runner.log(f"concurrent {a.config} FAILED: {e!r}")
+            # surface the error into the CSV (not just the artifact file log)
+            try:
+                observe.write_protocol_row(
+                    a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"),
+                    stage=a.stage, phase="query", cell_id=a.cell, config=a.config,
+                    system=a.config, index_type=itype, N=n, dim=dim, k=k,
+                    recall_target=target, dataset=a.dataset,
+                    query_set_id=os.path.basename(a.queries), clients=1,
+                    warm_state="warm", qps=0, reps=1, agg_method="qps-under-ingest",
+                    gt_method="n/a", stream_op="concurrent",
+                    cost_model_version=a.cost_model_version,
+                    runtime_routing_version=a.runtime_routing_version,
+                    params_json={"error": str(e)[:300]},
+                    notes=f"concurrent FAILED: {e!r}"[:300])
+            except Exception:
+                pass
         try:
             cur.execute(f"DROP TABLE {table} CASCADE")     # next run drops anyway
         except Exception as e:
@@ -215,7 +236,7 @@ def main():
     observe.write_protocol_row(
         a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"), stage=a.stage,
         phase="maint", cell_id=a.cell, config=a.config, system=a.config,
-        index_type=("flat" if is_flat else "none"), N=n, dim=dim, k=k,
+        index_type=itype, N=n, dim=dim, k=k,
         recall_target=target, dataset=a.dataset,
         query_set_id=os.path.basename(a.queries), clients=1, warm_state="warm",
         qps=round(rows_per_s, 1), p50_us=round(p50, 1), p95_us=round(p95, 1),
@@ -226,7 +247,7 @@ def main():
         cost_model_version=a.cost_model_version,
         runtime_routing_version=a.runtime_routing_version,
         params_json={"n_base": n_base, "scenario": scenario,
-                     "regime": "W2-read-heavy" if is_flat else "W1-write-heavy",
+                     "regime": "W2-read-heavy" if is_gpu else "W1-write-heavy",
                      "ops_per_s": round(rows_per_s, 1)},
         notes=f"{scenario} {ops} ops: {rows_per_s:.0f} ops/s, p99={p99/1000:.2f}ms/op",
         **s.as_dict())
@@ -257,7 +278,7 @@ def main():
             observe.write_protocol_row(
                 a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"),
                 stage=a.stage, phase="query", cell_id=a.cell, config=a.config,
-                system=a.config, index_type=("flat" if is_flat else "none"),
+                system=a.config, index_type=itype,
                 N=len(live), dim=dim, k=k, recall_target=target, dataset=a.dataset,
                 query_set_id=os.path.basename(a.queries), clients=1,
                 warm_state="warm", recall_at_k=round(rdrift, 4), reps=1,
