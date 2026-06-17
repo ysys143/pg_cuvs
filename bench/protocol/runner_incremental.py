@@ -63,6 +63,7 @@ def main():
     n_app = min(int(os.environ.get("PGCUVS_INC_APPEND", "2000")), n // 2)
     n_base = n - n_app
     corpus = np.ascontiguousarray(read_fbin(a.corpus, count=n))
+    queries = np.ascontiguousarray(read_fbin(a.queries))   # for recall-drift
 
     import psycopg
     from pgvector.psycopg import register_vector
