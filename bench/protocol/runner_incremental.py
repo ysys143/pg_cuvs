@@ -103,6 +103,7 @@ def main():
     import random as _rnd
     _rnd.seed(0)
     lat, ops = [], 0
+    live = set(range(n_base))                        # current id set (for recall-drift)
     with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=a.daemon_pid) as s:
         t0 = time.perf_counter()
         for j in range(n_app):
@@ -112,14 +113,17 @@ def main():
             if scenario == "append":
                 cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
                             (newid, v))
+                live.add(newid)
             elif scenario == "fifo":
                 cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
                             (newid, v))
                 cur.execute(f"DELETE FROM {table} WHERE id = %s", (j,))   # tail
+                live.add(newid); live.discard(j)
             elif scenario == "upsert":
                 if j % 2 == 0:
                     cur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
                                 (newid, v))
+                    live.add(newid)
                 else:
                     cur.execute(f"UPDATE {table} SET embedding = %s WHERE id = %s",
                                 (v, _rnd.randrange(n_base)))
@@ -154,6 +158,46 @@ def main():
                      "ops_per_s": round(rows_per_s, 1)},
         notes=f"{scenario} {ops} ops: {rows_per_s:.0f} ops/s, p99={p99/1000:.2f}ms/op",
         **s.as_dict())
+
+    # ── recall-drift: does the index stay correct after the mutations? ───────
+    # append/fifo have a deterministic current embedding (corpus[id % n]); upsert
+    # remaps embeddings non-deterministically → skip. Exact GT over the LIVE id
+    # set vs the index result: high recall ⇒ inserts searchable + deletes (fifo)
+    # excluded. no-index = seqscan = exact (1.0 baseline confirming the GT).
+    if scenario in ("append", "fifo"):
+        if is_flat:
+            cur.execute("SET enable_seqscan = off")        # force the flat index
+            cur.execute("SET enable_bitmapscan = off")
+        ids = np.array(sorted(live), dtype=np.int64)
+        emb = corpus[ids % n]
+        nqd = min(100, len(queries))
+        drift, leaked = [], 0
+        for qi in range(nqd):
+            d = ((emb - queries[qi]) ** 2).sum(1)
+            gtset = set(ids[np.argsort(d)[:k]].tolist())
+            cur.execute(f"SELECT id FROM {table} ORDER BY embedding <-> %s LIMIT {k}",
+                        (Vector(queries[qi]),))
+            got = [r[0] for r in cur.fetchall()]
+            leaked += sum(1 for g in got if g not in live)   # deleted/absent ids
+            drift.append(len(set(got) & gtset) / k)
+        rdrift = float(np.mean(drift))
+        runner.log(f"recall-drift {scenario} {a.config} = {rdrift:.4f} over "
+                   f"{len(live)} live rows, leaked={leaked}")
+        observe.write_protocol_row(
+            a.csv, run_id=a.run_id, date=time.strftime("%Y-%m-%d"), stage=a.stage,
+            phase="query", cell_id=a.cell, config=a.config, system=a.config,
+            index_type=("flat" if is_flat else "none"), N=len(live), dim=dim, k=k,
+            recall_target=target, dataset=a.dataset,
+            query_set_id=os.path.basename(a.queries), clients=1, warm_state="warm",
+            recall_at_k=round(rdrift, 4), reps=1, agg_method="recall-drift",
+            gt_method="exact-live", stream_op=scenario, ops_done=ops,
+            instance_type=a.instance_type, price_usd_hr=a.price_usd_hr,
+            cost_model_version=a.cost_model_version,
+            runtime_routing_version=a.runtime_routing_version,
+            params_json={"scenario": scenario, "live_rows": len(live),
+                         "leaked_ids": leaked, "n_queries": nqd},
+            notes=f"recall-drift after {scenario}: {rdrift:.4f}, leaked={leaked}")
+
     cur.execute(f"DROP TABLE {table} CASCADE")
     conn.close()
     runner.log(f"incremental {a.config} N={n}: {rows_per_s:.0f} rows/s "
