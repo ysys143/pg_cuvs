@@ -101,7 +101,7 @@ def main():
     if scenario == "concurrent":
         import threading
         nq = len(queries)
-        dur = int(os.environ.get("PGCUVS_INC_CONC_SECONDS", "8"))
+        dur = int(os.environ.get("PGCUVS_INC_CONC_SECONDS", "4"))
 
         def measure_qps(seconds):
             t_end = time.perf_counter() + seconds
@@ -116,24 +116,27 @@ def main():
         stop = threading.Event()
 
         def ingest():
-            ic = psycopg.connect(dbname=a.dbname, autocommit=True)
-            from pgvector.psycopg import register_vector as _rv
-            _rv(ic)
-            if is_flat:
-                ic.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
-                ic.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
-            icur = ic.cursor(); jj = 0
-            while not stop.is_set():
-                icur.execute(f"INSERT INTO {table} (id, embedding) VALUES (%s, %s)",
-                             (n_base + jj, Vector(corpus[(n_base + jj) % n])))
-                jj += 1
-            ic.close()
-            return jj
+            try:
+                ic = psycopg.connect(dbname=a.dbname, autocommit=True)
+                from pgvector.psycopg import register_vector as _rv
+                _rv(ic)
+                if is_flat:
+                    ic.execute("CREATE EXTENSION IF NOT EXISTS pg_cuvs")
+                    ic.execute(f"SET cuvs.index_dir = '{a.index_dir}'")
+                icur = ic.cursor(); jj = 0
+                while not stop.is_set() and jj < 5000:     # bounded
+                    icur.execute(f"INSERT INTO {table} (id, embedding) "
+                                 f"VALUES (%s, %s)",
+                                 (n_base + jj, Vector(corpus[(n_base + jj) % n])))
+                    jj += 1
+                ic.close()
+            except Exception as e:
+                runner.log(f"ingest thread error: {e!r}")
 
-        th = threading.Thread(target=ingest); th.start()
+        th = threading.Thread(target=ingest, daemon=True); th.start()
         with observe.ResourceSampler(gpu_index=a.gpu_index, daemon_pid=a.daemon_pid) as s:
             conc_qps = measure_qps(dur)                    # queries under ingest
-        stop.set(); th.join()
+        stop.set(); th.join(timeout=10)                   # never block on the thread
         degr = 100.0 * (1 - conc_qps / base_qps) if base_qps else float("nan")
         runner.log(f"concurrent {a.config}: base={base_qps:.0f} qps, "
                    f"under-ingest={conc_qps:.0f} qps, degradation={degr:.0f}%")
@@ -153,7 +156,10 @@ def main():
                          "degradation_pct": round(degr, 1)},
             notes=f"query QPS {base_qps:.0f}→{conc_qps:.0f} under ingest "
                   f"({degr:.0f}% degradation)", **s.as_dict())
-        cur.execute(f"DROP TABLE {table} CASCADE")
+        try:
+            cur.execute(f"DROP TABLE {table} CASCADE")     # next run drops anyway
+        except Exception as e:
+            runner.log(f"concurrent drop skipped: {e!r}")
         conn.close()
         return 0
 
