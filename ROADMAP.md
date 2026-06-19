@@ -127,6 +127,16 @@
 
 스펙: ADR-075(Phase 2 구현절·Phase 3 설계), ADR-074(B 거취), ADR-073(transient B).
 
+### flat 동시-쓰기 정합성 — `.delta` reader 공유 락 (트리거 없음 — 착수 가능)
+
+> **D3 concurrent 노출(2026-06-17, run #57 `gha-27665874191`)**: `forced-flat`이 동시 insert+query에서 `delta sidecar unusable mid-scan`으로 FAILED(cagra는 98.7% 저하지만 생존, no-index 0%). 근본원인 = writer(`cuvs_delta_append`)는 `flock LOCK_EX`인데 scan-time delta reader가 **무락**이라 append 중간 상태를 torn-read. delta 머지 정확성은 이미 입증(ADR-047 isolation 2/2 + D3 recall-drift 1.0) — **가용성/race 버그**다.
+
+- **트리거**: 없음(릴리스 후 순차로 승격 가능, 소규모).
+- **작업**: (1) scan-time delta reader(`pg_cuvs.c:3101`)에 `flock(fd, LOCK_SH)` 추가 → 에러 대신 짧은 대기 후 정합 read("느려도 증분 굴러감"). delta 아키텍처·cap/세대 fail-closed 분기 불변. (2) pg_isolation_regress에 동시 INSERT+scan 정합 top-k 케이스(flat) 추가, flat 회귀펜스 GREEN 유지.
+- **검증**: D3 concurrent 재측정에서 flat이 FAILED→degradation%(slow-but-OK)로 전환. **resident-corpus 직접 append는 기각**(MVCC/rollback 오염 + `g_index_mutex` 직렬화 재도입 + 내구성 상실 — ADR-077 대안 기각).
+
+스펙: ADR-077(결정), ADR-047(delta/tombstone MVCC 토대), ADR-073(flat AM), ADR-074(write-heavy 라우팅 불변). 보고서: `docs/reports/2026-06-17-stage-d3-concurrent.md`.
+
 ### 분산 운영 — 3C/3D (완료·인증 — 완료 표 참조)
 
 > **완료 (2026-06-10, ADR-013/ADR-066)**: 아래 스펙은 모두 구현·인증됐다. 실 GCS round-trip + fail-closed가 A100에서 `make gpu-test-objstore`로 검증됐고(installcheck 25/25 + isolation 3/3), SSOT는 완료 표로 이전됐다. 이 절은 원 스펙 기록으로 보존한다. 잔여 후속(트리거): emulator 기반 CI 회귀(`STORAGE_EMULATOR_HOST` + fake-gcs-server), S3 provider.

@@ -3079,3 +3079,32 @@ cost = scan(N) + detoast(m, storage) + move(m, link) + compute(m, engine) + topk
 **구현 비용(스파이크 할인 반영)**: numpy 스파이크 S(완료) → CUDA 인코더/추정기/bound M–L → `rabitq` AM 통합 M(flat/ivfpq 템플릿) → 검증 하네스 M.
 
 **관련**: ADR-049(ivfpq·VRAM 절감, 본 건의 recall-천장 동기), ADR-025(50M·vchordrq 0.9991), ADR-026/072(DiskANN no-go — 대조: 블로커가 외부 API였음), ADR-073(AM-per-algo 하우스 스타일), ADR-010(VRAM OOM 정책). 스파이크: `tools/rabitq_spike.py`, 벤치 핸드오프 `bench/protocol/HANDOFF.md §5 RaBitQ 트랙`(run #30–#33).
+
+---
+
+## ADR-077 — flat 동시-쓰기 정합성: `.delta` reader 공유 락 (torn-read 제거)
+
+**날짜**: 2026-06-17
+**상태**: ACCEPTED (설계, 측정 기반). 구현은 후속(소규모, 트리거 없음 — 착수 가능). D3 concurrent 벤치(run #57, `gha-27665874191`)가 노출한 국소 동시성 버그를 수정한다. ADR-047(delta/tombstone MVCC) 위에 선다 — **delta 아키텍처는 유지**하고 reader 락 비대칭만 고친다.
+
+**문제**: Stage D3 concurrent 셀(query QPS under background ingest, A100 real cuVS)에서 `forced-flat`이 동시 insert+query 시 **`pg_cuvs: delta sidecar unusable mid-scan; retry will replan to CPU`** 로 FAILED. 같은 워크로드에서 cagra는 757.8→9.8 qps(98.7% 저하)지만 **생존**, no-index는 0% 저하. 즉 flat만 "느려짐"이 아니라 "끊김"으로 떨어진다.
+
+**근본원인 (torn read, 락 비대칭)**:
+- **Writer** `cuvs_delta_append`(`pg_cuvs.c:3918`)는 `flock(fd, LOCK_EX)`로 다른 backend의 append와 직렬화하며, 레코드 바디를 먼저 쓰고(① 파일 확장) → 헤더 `n_rows`를 나중에 갱신한다(②).
+- **Reader** scan-time delta 머지(`pg_cuvs.c:3101`)는 `OpenTransientFile(O_RDONLY)` 후 **flock 없이** `fsize`와 `hdr.n_rows`를 읽어 `cuvs_delta_validate`로 크기↔카운트 정합을 검사한다.
+- writer의 ①과 ② 사이(바디는 썼으나 헤더 카운트 미갱신)에 reader가 끼면 `fsize=(n+1)*rec` vs `hdr.n_rows=n` 불일치 → `ereport(ERROR, OBJECT_NOT_IN_PREREQUISITE_STATE)`. **reader가 writer의 배타 락에 참여하지 않아** append 중간 상태를 관측한다.
+- **cagra가 미발현인 이유**(`pg_cuvs.c:4022`): cagra aminsert는 `cuvs_ipc_extend`(GPU `cuvsCagraExtend`) 경로라 `.delta`가 churn하지 않는다(저하는 `g_index_mutex`의 extend↔search 직렬화). flat/ivfpq는 extend가 없어 매 INSERT가 `.delta` append → 동시 스캔과 torn-read 충돌.
+
+**결정**: scan-time delta reader에 **공유 락(`flock(fd, LOCK_SH)`)** 을 추가한다. reader는 writer의 `LOCK_EX`가 끝날 때까지 대기 → append 중간 상태를 절대 관측하지 않음 → **에러 대신 잠깐 대기 후 정합한 delta를 읽는다**("락 걸려 느려도 증분은 굴러간다"). delta MVCC 설계(ADR-047: 후보 TID + 힙 recheck 가시성)는 그대로 유지. cap 초과(`cuvs_max_delta_rows`)·base 세대 변경(REINDEX) 분기는 의도된 fail-closed로 보존(동시쓰기 race와 무관).
+
+**대안 기각**:
+- **resident 코퍼스 직접 append (delta 폐기)** — flat은 그래프가 없어 append가 싸 보이나, (1) `aminsert`는 커밋 전 발화 → 미커밋 행이 공유 GPU 인덱스에 즉시 박혀 **abort/rollback 오염**(CAGRA 그래프/flat 코퍼스에서 점 제거 불가), (2) 매 쓰기를 `g_index_mutex`에 올려 **cagra의 98.7% 직렬화 프로필을 flat에도 도입**, (3) fsync `.delta`의 **재시작 내구성 상실**(ADR-047 e2e). ADR-047이 delta로 피한 문제 3종을 모두 재발 → 거의 모든 축에서 열위.
+- **`cuvs_max_delta_rows` 하향으로 회피** — race는 카운트와 무관(낮춰도 torn read 발생), stale 빈도만 증가 → 미해결.
+- **reader의 validate 실패를 무에러 재시도로만** — 락 없이 재시도하면 부하 시 라이브락 위험. 정공법은 reader 락(짧고 결정적 대기).
+
+**검증 (설계 단계 근거 + 구현 후 게이트)**:
+- 측정 근거: run #57 `gha-27665874191`(A100, real cuVS) — cagra 757.8→9.8(생존), **flat FAILED(delta unusable mid-scan)**, no-index 0%. 보고서 `docs/reports/2026-06-17-stage-d3-concurrent.md`.
+- delta 머지 **정확성은 이미 입증**(이번 버그는 가용성/race이지 정확성 아님): ADR-047 isolation 2/2 GREEN + D3 recall-drift `recall@10=1.0, 0 leaked`(순차 2000 ins+del).
+- 구현 후 게이트(비협상): pg_isolation_regress에 **동시 INSERT+scan에서 에러 없이 정합 top-k** 케이스 추가(flat), flat 회귀펜스 GREEN 유지. D3 concurrent 재측정에서 flat이 "slow-but-OK"로 전환(FAILED→degradation%)됨을 확인.
+
+**관련**: ADR-047(delta/tombstone MVCC freshness — 본 결정의 토대), ADR-073(flat AM A1), ADR-074(포지셔닝: 쓰기多→pgvector-무인덱스; 본 수정은 동시-읽기-중-간헐쓰기 정합을 보장하되 write-heavy 라우팅은 불변), ADR-051(3Q cagra streaming extend — cagra가 delta를 우회하는 경로). 측정: `bench/protocol/HANDOFF.md §D3`, 보고서 `docs/reports/2026-06-17-stage-d3-concurrent.md`. 코드: writer `pg_cuvs.c:3918`(flock), reader `pg_cuvs.c:3101`(락 누락 지점).
