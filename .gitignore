@@ -8,6 +8,9 @@
 # Local-only access/runbook notes (connection info; never commit)
 VM_ACCESS.local.md
 *.local.md
+
+# Local-only meeting-prep materials (private strategy/notes; never commit)
+*.local/
 node_modules/
 __pycache__/
 *.pyc
